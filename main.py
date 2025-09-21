@@ -1,69 +1,47 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Dict, Any
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-# Input schema for a single player row
-class PlayerRow(BaseModel):
-    Player: str
-    SP: int
-    QP: int
-    Rank: int
-
-# Input schema for the full payload
-class TradePayload(BaseModel):
-    easystreet31: List[PlayerRow]
-    finkleiseinhorn: List[PlayerRow]
-    dustercrusher: List[PlayerRow]
-    leaderboard: List[Dict[str, Any]]
-    the_collection: List[Dict[str, Any]]
-    trade_file: List[Dict[str, Any]]
-
 @app.post("/evaluate_trade_json")
-def evaluate_trade_json(payload: TradePayload):
+async def evaluate_trade_json(request: Request):
     try:
-        # Convert Pydantic models to dict
-        data = payload.dict()
+        data = await request.json()
 
-        # TODO: Replace with your actual trade evaluation logic
-        # For now, just return a dummy JSON structure
-        result = {
-            "session_state": {
-                "holdings": [
-                    "holdings_easystreet31.json",
-                    "holdings_FinkleIsEinhorn.json",
-                    "holdings_DusterCrusher.json"
-                ],
-                "leaderboard": "leaderboard.json",
-                "the_collection": "The Collection.json",
-                "trade": "trade.json"
-            },
-            "per_account": [
-                {
-                    "account": "Easystreet31",
-                    "player_lines": [
-                        {
-                            "player": "Claude Giroux",
-                            "before_sp": 9,
-                            "after_sp": 7,
-                            "delta_sp": -2,
-                            "before_rank": 5,
-                            "after_rank": 99,
-                            "before_qp": 0,
-                            "after_qp": 0,
-                            "delta_qp": 0
-                        }
-                    ],
-                    "net_delta_sp": 0,
-                    "net_delta_qp": 0,
-                    "fragile": []
-                }
-            ],
-            "overall_qp_summary": 0
+        required_keys = [
+            "easystreet31",
+            "finkleiseinhorn",
+            "dustercrusher",
+            "leaderboard",
+            "the_collection",
+            "trade"
+        ]
+
+        missing = [k for k in required_keys if k not in data]
+
+        # 🔍 Debug: Echo back what was actually received
+        response = {
+            "received_keys": list(data.keys()),
+            "missing_keys": missing
         }
 
-        return result
+        if missing:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "Missing required keys",
+                    **response
+                }
+            )
+
+        # ✅ Placeholder for real evaluation logic
+        return {
+            "message": "Trade evaluation placeholder",
+            **response
+        }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
