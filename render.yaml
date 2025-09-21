@@ -1,7 +1,7 @@
 services:
   - type: web
     name: ultimate-quest-service
-    runtime: python
-    pythonVersion: 3.11.9
+    env: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
