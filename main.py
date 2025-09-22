@@ -36,7 +36,7 @@ async def evaluate_trade_json(request: Request):
 
         # ✅ Placeholder for real evaluation logic
         return {
-            "message": "Trade evaluation placeholder",
+            "message": "Trade evaluation placeholder (logic to be added here)",
             **response
         }
 
