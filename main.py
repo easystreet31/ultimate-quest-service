@@ -1,12 +1,14 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
+import json
 
 app = FastAPI()
 
 @app.post("/evaluate_trade_json")
-async def evaluate_trade_json(request: Request):
+async def evaluate_trade_json(file: UploadFile = File(...)):
     try:
-        data = await request.json()
+        contents = await file.read()
+        data = json.loads(contents.decode("utf-8"))
 
         required_keys = [
             "easystreet31",
@@ -19,7 +21,6 @@ async def evaluate_trade_json(request: Request):
 
         missing = [k for k in required_keys if k not in data]
 
-        # 🔍 Debug: Echo back what was actually received
         response = {
             "received_keys": list(data.keys()),
             "missing_keys": missing
@@ -34,14 +35,12 @@ async def evaluate_trade_json(request: Request):
                 }
             )
 
-        # ✅ Placeholder for real evaluation logic
         return {
-            "message": "Trade evaluation placeholder (logic to be added here)",
+            "message": "Trade evaluation placeholder",
             **response
         }
 
     except Exception as e:
         return JSONResponse(
             status_code=500,
-            content={"error": str(e)}
-        )
+            content={"error": str(e)})
