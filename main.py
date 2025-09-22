@@ -1,12 +1,10 @@
-# main.py — Ultimate Quest Service (E31 URL mode, robust Google Sheets + format sniffing)
-from typing import List, Literal, Dict, Any
+# main.py — Ultimate Quest Service (trade-scope by default + small JSON response)
+from typing import List, Literal, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, AnyUrl
 import pandas as pd
 import numpy as np
-import io
-import re
-import zipfile
+import io, re, zipfile
 
 # ---- Robust URL fetch (requests if present, else urllib fallback) ----
 try:
@@ -29,22 +27,27 @@ app = FastAPI(title="Ultimate Quest Service (E31 URL mode)")
 
 # -------------------- Models --------------------
 class TradeRow(BaseModel):
-    side: Literal["GET", "GIVE"]           # GET = receive (use Their Qty); GIVE = send (use My Qty)
-    players: str                           # e.g. "Ryan O'Reilly/Filip Forsberg"
-    sp: float                              # subject points on the card
+    side: Literal["GET", "GIVE"]      # GET = receive -> prefer Their Qty; GIVE = send -> prefer My Qty
+    players: str                      # e.g., "Ryan O'Reilly/Filip Forsberg"
+    sp: float                         # subject points printed on card
     my_qty: int = 0
     their_qty: int = 0
 
 class EvalByUrls(BaseModel):
-    leaderboard_url: AnyUrl                # CSV or XLSX URL (single table or multi-sheet)
-    holdings_url: AnyUrl                   # CSV or XLSX URL (Easystreet31 holdings)
+    leaderboard_url: AnyUrl
+    holdings_url: AnyUrl
     trade: List[TradeRow]
     multi_subject_rule: Literal["full_each_unique", "split_even"] = "full_each_unique"
-    defend_buffer: int = 20                # thin-lead threshold
+    defend_buffer: int = 20
+
+    # NEW knobs to keep responses small:
+    scope: Literal["trade_only", "portfolio_union"] = "trade_only"
+    max_return_players: int = 200
+    players_whitelist: Optional[List[str]] = None  # optional hard filter if needed
 
 # -------------------- Helpers --------------------
 def _normalize_gsheets_url(url: str, prefer_xlsx: bool = True) -> str:
-    """Convert Google Sheets /edit or /view links to a direct /export link."""
+    """Turn Google Sheets /edit|/view links into /export links."""
     if "docs.google.com/spreadsheets" not in url:
         return url
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
@@ -56,19 +59,13 @@ def _normalize_gsheets_url(url: str, prefer_xlsx: bool = True) -> str:
     return f"https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv"
 
 def _looks_like_xlsx(url: str, content_type: str, head: bytes) -> bool:
-    """Decide Excel vs CSV by URL suffix, content-type, or ZIP magic."""
     if url.lower().endswith((".xlsx", ".xls")):
         return True
     if "spreadsheetml" in content_type or "ms-excel" in content_type:
         return True
-    # XLSX is a ZIP container -> starts with 'PK'
-    return head[:2] == b"PK"
+    return head[:2] == b"PK"  # XLSX is a ZIP container
 
-def _load_table_from_url(url: str) -> pd.DataFrame:
-    """
-    Fetch CSV/XLSX; for XLSX, concatenate all sheets with __sheet__ column.
-    Robust to Google 'edit' links, odd encodings, and redirects.
-    """
+def _fetch_table(url: str) -> pd.DataFrame:
     url = _normalize_gsheets_url(url, prefer_xlsx=True)
     data, ctype, final = _fetch(url, timeout=25)
     buf = io.BytesIO(data)
@@ -88,27 +85,24 @@ def _load_table_from_url(url: str) -> pd.DataFrame:
                 raise HTTPException(status_code=400, detail="XLSX appears empty or unreadable.")
             return pd.concat(frames, ignore_index=True)
         except zipfile.BadZipFile:
-            # Sometimes Google sends CSV despite format=xlsx; fall through to CSV path
-            buf.seek(0)
+            buf.seek(0)  # fall through to CSV
 
-    # CSV path with encoding fallback
-    try:
-        buf.seek(0)
-        df = pd.read_csv(buf, on_bad_lines="skip")
-    except UnicodeDecodeError:
-        buf.seek(0)
-        df = pd.read_csv(buf, on_bad_lines="skip", encoding="latin1")
-    df = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed", na=False)]
-    return df
+    # CSV with encoding fallbacks
+    for enc in (None, "utf-8", "utf-8-sig", "latin1"):
+        try:
+            buf.seek(0)
+            df = pd.read_csv(buf, on_bad_lines="skip", encoding=enc) if enc else pd.read_csv(buf, on_bad_lines="skip")
+            df = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed", na=False)]
+            return df
+        except Exception:
+            continue
+    raise HTTPException(status_code=400, detail="Unable to parse CSV after multiple encoding attempts.")
 
 def _qp_from_rank(rank: int) -> int:
     return 5 if rank == 1 else 3 if rank == 2 else 1 if rank == 3 else 0
 
-def _normalize_leaderboard(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Standardize to: player,user,sp,rank  (keep top-5 per player).
-    If 'player' missing but __sheet__ exists (multi-tab export), use __sheet__ as player.
-    """
+def _norm_lb(df: pd.DataFrame) -> pd.DataFrame:
+    """Standardize leaderboard to: player, user, sp, rank (keep top-5)."""
     d = df.copy()
     d = d.dropna(how="all")
     d = d.loc[:, ~d.columns.astype(str).str.contains("^Unnamed", na=False)]
@@ -121,20 +115,17 @@ def _normalize_leaderboard(df: pd.DataFrame) -> pd.DataFrame:
     if player_col is None and "__sheet__" in d.columns:
         player_col = "__sheet__"
     if player_col is None:
-        obj_cols = [c for c in d.columns if d[c].dtype == object]
-        if not obj_cols:
-            raise HTTPException(status_code=400, detail="Leaderboard missing a 'player' column.")
-        player_col = obj_cols[0]
+        obj = [c for c in d.columns if d[c].dtype == object]
+        if not obj: raise HTTPException(status_code=400, detail="Leaderboard missing a 'player' column.")
+        player_col = obj[0]
     if user_col is None:
-        obj_cols = [c for c in d.columns if d[c].dtype == object and c != player_col]
-        if not obj_cols:
-            raise HTTPException(status_code=400, detail="Leaderboard missing a 'user' column.")
-        user_col = obj_cols[0]
+        obj = [c for c in d.columns if d[c].dtype == object and c != player_col]
+        if not obj: raise HTTPException(status_code=400, detail="Leaderboard missing a 'user' column.")
+        user_col = obj[0]
     if sp_col is None:
-        num_cols = [c for c in d.columns if pd.api.types.is_numeric_dtype(d[c])]
-        if not num_cols:
-            raise HTTPException(status_code=400, detail="Leaderboard missing SP/points column.")
-        sp_col = num_cols[0]
+        nums = [c for c in d.columns if pd.api.types.is_numeric_dtype(d[c])]
+        if not nums: raise HTTPException(status_code=400, detail="Leaderboard missing SP/points column.")
+        sp_col = nums[0]
 
     out = d[[player_col, user_col, sp_col]].copy()
     out.columns = ["player", "user", "sp"]
@@ -144,11 +135,10 @@ def _normalize_leaderboard(df: pd.DataFrame) -> pd.DataFrame:
 
     out = out.sort_values(["player", "sp"], ascending=[True, False])
     out["rank"] = out.groupby("player")["sp"].rank(method="first", ascending=False).astype(int)
-    out = out[out["rank"] <= 5][["player", "user", "sp", "rank"]]
-    return out
+    return out[out["rank"] <= 5][["player", "user", "sp", "rank"]]
 
-def _normalize_holdings(df: pd.DataFrame) -> pd.DataFrame:
-    """Standardize to: player, sp, rank, qp for Easystreet31. Deduplicate by max SP per player."""
+def _norm_holdings(df: pd.DataFrame) -> pd.DataFrame:
+    """Standardize holdings to: player, sp, rank, qp (dedupe max SP per player)."""
     d = df.copy()
     d = d.dropna(how="all")
     d = d.loc[:, ~d.columns.astype(str).str.contains("^Unnamed", na=False)]
@@ -160,106 +150,94 @@ def _normalize_holdings(df: pd.DataFrame) -> pd.DataFrame:
     qp_col     = lower.get("qp") or None
 
     if player_col is None:
-        obj_cols = [c for c in d.columns if d[c].dtype == object]
-        if not obj_cols:
-            raise HTTPException(status_code=400, detail="Holdings missing a 'player' column.")
-        player_col = obj_cols[0]
+        obj = [c for c in d.columns if d[c].dtype == object]
+        if not obj: raise HTTPException(status_code=400, detail="Holdings missing a 'player' column.")
+        player_col = obj[0]
     if sp_col is None:
-        num_cols = [c for c in d.columns if pd.api.types.is_numeric_dtype(d[c])]
-        if not num_cols:
-            raise HTTPException(status_code=400, detail="Holdings missing an SP column.")
-        sp_col = num_cols[0]
+        nums = [c for c in d.columns if pd.api.types.is_numeric_dtype(d[c])]
+        if not nums: raise HTTPException(status_code=400, detail="Holdings missing an SP column.")
+        sp_col = nums[0]
 
     out = d[[player_col, sp_col]].copy()
     out.columns = ["player", "sp"]
     out["player"] = out["player"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
     out["sp"]     = pd.to_numeric(out["sp"], errors="coerce").fillna(0).astype(int)
 
-    if rank_col and rank_col in d.columns:
-        out["rank"] = pd.to_numeric(d[rank_col], errors="coerce").fillna(99).astype(int)
-    else:
-        out["rank"] = 99
-    if qp_col and qp_col in d.columns:
-        out["qp"] = pd.to_numeric(d[qp_col], errors="coerce").fillna(0).astype(int)
-    else:
-        out["qp"] = out["rank"].map({1:5, 2:3, 3:1}).fillna(0).astype(int)
+    out["rank"] = pd.to_numeric(d.get(rank_col, 99), errors="coerce").fillna(99).astype(int) if rank_col in (d.columns if rank_col else []) else 99
+    out["qp"]   = pd.to_numeric(d.get(qp_col, out["rank"].map({1:5,2:3,3:1})), errors="coerce").fillna(0).astype(int) if qp_col in (d.columns if qp_col else []) else out["rank"].map({1:5,2:3,3:1}).fillna(0).astype(int)
 
     out = out.sort_values(["player", "sp"], ascending=[True, False]).drop_duplicates("player", keep="first")
     return out[["player", "sp", "rank", "qp"]]
 
-def _trade_to_deltas(trade_rows: List[TradeRow], rule: str = "full_each_unique") -> Dict[str, float]:
-    """
-    Convert trade rows into {player -> delta SP}.
-    - "full_each_unique": each unique listed player receives FULL SP per card. Same-player quad counts once per card.
-    - "split_even": SP split evenly across listed players.
-    Smart qty: for GET prefer their_qty (fallback to my_qty if 0); for GIVE prefer my_qty (fallback to their_qty if 0).
-    """
+def _trade_to_deltas(rows: List[TradeRow], rule: str = "full_each_unique") -> Dict[str, float]:
+    """Multi-subject rule: full SP to each unique listed player; same-player quads count once per card."""
     agg: Dict[str, float] = {}
-    for row in trade_rows:
-        # Clean player string (remove newlines / double spaces)
-        players_raw = re.sub(r"\s+", " ", row.players).strip()
-        players = [p.strip() for p in players_raw.split("/") if p.strip()]
-
+    for r in rows:
+        players_raw = re.sub(r"\s+", " ", r.players).strip()
+        names = [p.strip() for p in players_raw.split("/") if p.strip()]
         if rule == "full_each_unique":
-            players = list(dict.fromkeys(players))  # dedupe same-player quads
-            per_player_sp = float(row.sp)
+            names = list(dict.fromkeys(names))
+            per_player_sp = float(r.sp)
         else:
-            n = max(1, len(players))
-            per_player_sp = float(row.sp) / n
-
-        if row.side == "GET":
-            qty = int(row.their_qty) if row.their_qty else int(row.my_qty)
+            per_player_sp = float(r.sp) / max(1, len(names))
+        if r.side == "GET":
+            qty = int(r.their_qty) if r.their_qty else int(r.my_qty)
             sign = +1.0
-        else:  # GIVE
-            qty = int(row.my_qty) if row.my_qty else int(row.their_qty)
+        else:
+            qty = int(r.my_qty) if r.my_qty else int(r.their_qty)
             sign = -1.0
-
-        for p in players:
-            agg[p] = agg.get(p, 0.0) + sign * per_player_sp * float(qty)
+        for n in names:
+            agg[n] = agg.get(n, 0.0) + sign * per_player_sp * float(qty)
     return agg
 
-def _rank_with_me(leaderboard: pd.DataFrame, player: str, my_user: str, my_sp: int):
-    """Merge me into the leaderboard for a player and compute my rank & top-3 SPs."""
-    sub = leaderboard[leaderboard["player"] == player][["user", "sp"]].copy()
+def _rank_with_me(lb: pd.DataFrame, player: str, me: str, my_sp: int):
+    sub = lb[lb["player"] == player][["user", "sp"]].copy()
     if sub.empty:
-        sub = pd.DataFrame([{"user": my_user, "sp": int(my_sp)}])
+        sub = pd.DataFrame([{"user": me, "sp": int(my_sp)}])
     else:
-        mask_me = sub["user"].str.lower().eq(my_user.lower())
+        mask_me = sub["user"].str.lower().eq(me.lower())
         if mask_me.any():
             sub.loc[mask_me, "sp"] = int(my_sp)
         else:
-            sub = pd.concat([sub, pd.DataFrame([{"user": my_user, "sp": int(my_sp)}])], ignore_index=True)
-
+            sub = pd.concat([sub, pd.DataFrame([{"user": me, "sp": int(my_sp)}])], ignore_index=True)
     sub = sub.sort_values("sp", ascending=False).reset_index(drop=True)
-    my_idx = sub.index[sub["user"].str.lower() == my_user.lower()]
+    my_idx = sub.index[sub["user"].str.lower() == me.lower()]
     my_rank = int(my_idx[0] + 1) if len(my_idx) else 99
     first_sp  = int(sub.iloc[0]["sp"]) if len(sub) > 0 else 0
     second_sp = int(sub.iloc[1]["sp"]) if len(sub) > 1 else 0
     third_sp  = int(sub.iloc[2]["sp"]) if len(sub) > 2 else 0
     return my_rank, first_sp, second_sp, third_sp
 
-def _evaluate(leaderboard_df: pd.DataFrame,
-              holdings_df: pd.DataFrame,
+def _evaluate(lb_df: pd.DataFrame,
+              hold_df: pd.DataFrame,
               deltas: Dict[str, float],
-              my_user: str,
-              defend_buffer: int) -> Dict[str, Any]:
-    players_all = sorted(set(holdings_df["player"].tolist()) | set(deltas.keys()))
+              me: str,
+              defend_buffer: int,
+              scope: str,
+              max_return_players: int,
+              players_whitelist: Optional[List[str]]) -> Dict[str, Any]:
+
+    delta_keys = set(deltas.keys())
+    if scope == "trade_only":
+        players_all = sorted(delta_keys)  # ← **small**: evaluate only trade-affected players
+    else:
+        players_all = sorted(set(hold_df["player"].tolist()) | delta_keys)
+
+    if players_whitelist:
+        wl = {re.sub(r"\s+", " ", p).strip() for p in players_whitelist}
+        players_all = [p for p in players_all if p in wl]
+
     before_rows, after_rows = [], []
-
     for p in players_all:
-        your_sp_before = int(holdings_df.loc[holdings_df["player"] == p, "sp"].iloc[0]) if (holdings_df["player"] == p).any() else 0
-        r, f, s, t = _rank_with_me(leaderboard_df, p, my_user, your_sp_before)
-        before_rows.append({
-            "player": p, "you_sp": your_sp_before, "rank": r, "qp": _qp_from_rank(r),
-            "first_sp": f, "second_sp": s, "third_sp": t
-        })
+        you_sp_before = int(hold_df.loc[hold_df["player"] == p, "sp"].iloc[0]) if (hold_df["player"] == p).any() else 0
+        r, f, s, t = _rank_with_me(lb_df, p, me, you_sp_before)
+        before_rows.append({"player": p, "you_sp": you_sp_before, "rank": r, "qp": _qp_from_rank(r),
+                            "first_sp": f, "second_sp": s, "third_sp": t})
 
-        your_sp_after = int(your_sp_before + int(round(deltas.get(p, 0))))
-        r2, f2, s2, t2 = _rank_with_me(leaderboard_df, p, my_user, your_sp_after)
-        after_rows.append({
-            "player": p, "you_sp_after": your_sp_after, "rank_after": r2, "qp_after": _qp_from_rank(r2),
-            "first_sp": f2, "second_sp": s2, "third_sp": t2
-        })
+        you_sp_after = int(you_sp_before + int(round(deltas.get(p, 0))))
+        r2, f2, s2, t2 = _rank_with_me(lb_df, p, me, you_sp_after)
+        after_rows.append({"player": p, "you_sp_after": you_sp_after, "rank_after": r2, "qp_after": _qp_from_rank(r2),
+                           "first_sp": f2, "second_sp": s2, "third_sp": t2})
 
     before_df = pd.DataFrame(before_rows)
     after_df  = pd.DataFrame(after_rows)
@@ -267,40 +245,49 @@ def _evaluate(leaderboard_df: pd.DataFrame,
     cmp["qp_delta"] = cmp["qp_after"] - cmp["qp"]
     cmp["sp_delta"] = cmp["you_sp_after"] - cmp["you_sp"]
 
-    # Risks
+    # Risk flags
     cmp["margin_before"] = cmp.apply(lambda r: (r["you_sp"] - r["second_sp"]) if r["rank"] == 1 else None, axis=1)
     cmp["margin_after"]  = cmp.apply(lambda r: (r["you_sp_after"] - r["second_sp"]) if r["rank_after"] == 1 else None, axis=1)
     cmp["created_thin_lead"] = cmp.apply(
-        lambda r: 1 if (r["rank_after"] == 1 and r["margin_after"] is not None and r["margin_after"] <= defend_buffer
+        lambda r: 1 if (r["rank_after"] == 1 and (r["margin_after"] is not None) and (r["margin_after"] <= defend_buffer)
                         and (r["margin_before"] is None or r["margin_before"] > defend_buffer)) else 0, axis=1)
     cmp["lost_first_place"] = cmp.apply(lambda r: 1 if (r["rank"] == 1 and r["rank_after"] != 1) else 0, axis=1)
 
-    qp_total_before = int(before_df["qp"].sum())  # trade-scope totals
+    # Trade-scope QP totals
+    qp_total_before = int(before_df["qp"].sum())
     qp_total_after  = int(after_df["qp_after"].sum())
     qp_delta_total  = qp_total_after - qp_total_before
 
     verdict = "GREEN" if (qp_delta_total > 0 and cmp["lost_first_place"].sum() == 0 and cmp["created_thin_lead"].sum() == 0) \
               else ("AMBER" if qp_delta_total >= 0 else "RED")
 
-    per_player = cmp.sort_values(["qp_delta", "sp_delta"], ascending=[False, False])[
-        ["player","you_sp","you_sp_after","sp_delta","rank","rank_after","qp","qp_after","qp_delta",
-         "margin_before","margin_after","created_thin_lead","lost_first_place"]
-    ].to_dict(orient="records")
+    # Return only *touched* players to keep JSON small
+    touched = cmp[(cmp["sp_delta"] != 0) | (cmp["qp_delta"] != 0) |
+                  (cmp["created_thin_lead"] == 1) | (cmp["lost_first_place"] == 1) |
+                  (cmp["player"].isin(delta_keys))].copy()
+
+    touched = touched.sort_values(["qp_delta", "sp_delta"], ascending=[False, False])
+    per_player = touched[[
+        "player","you_sp","you_sp_after","sp_delta","rank","rank_after","qp","qp_after","qp_delta",
+        "margin_before","margin_after","created_thin_lead","lost_first_place"
+    ]]
+
+    omitted = 0
+    if len(per_player) > max_return_players:
+        omitted = len(per_player) - max_return_players
+        per_player = per_player.head(max_return_players)
 
     return {
-        "portfolio_qp_before": qp_total_before,
+        "portfolio_qp_before": qp_total_before,   # trade-scope total (used for Δ)
         "portfolio_qp_after":  qp_total_after,
         "portfolio_qp_delta":  qp_delta_total,
         "buffer_target":       defend_buffer,
         "risks": {
             "lost_firsts": int(cmp["lost_first_place"].sum()),
             "created_thin_leads": int(cmp["created_thin_lead"].sum()),
-            "created_thin_list": [
-                {"player": r["player"], "margin_after": r["margin_after"]}
-                for _, r in cmp[cmp["created_thin_lead"] == 1].iterrows()
-            ]
         },
-        "per_player": per_player,
+        "per_player": per_player.to_dict(orient="records"),
+        "omitted_players": omitted,
         "verdict": verdict
     }
 
@@ -313,21 +300,27 @@ def health():
 def evaluate_by_urls_easystreet31(payload: EvalByUrls):
     # Fetch inputs
     try:
-        lb_raw = _load_table_from_url(str(payload.leaderboard_url))
-        hd_raw = _load_table_from_url(str(payload.holdings_url))
+        lb_raw = _fetch_table(str(payload.leaderboard_url))
+        hd_raw = _fetch_table(str(payload.holdings_url))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to fetch leaderboard/holdings: {e}")
 
     # Normalize
     try:
-        lb = _normalize_leaderboard(lb_raw)
-        hd = _normalize_holdings(hd_raw)
+        lb = _norm_lb(lb_raw)
+        hd = _norm_holdings(hd_raw)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to normalize inputs: {e}")
 
-    # Trade deltas + evaluation
+    # Trade deltas + evaluation (small scope & small response)
     deltas = _trade_to_deltas(payload.trade, rule=payload.multi_subject_rule)
-    result = _evaluate(lb, hd, deltas, my_user="Easystreet31", defend_buffer=payload.defend_buffer)
+    result = _evaluate(
+        lb, hd, deltas, me="Easystreet31",
+        defend_buffer=payload.defend_buffer,
+        scope=payload.scope,
+        max_return_players=payload.max_return_players,
+        players_whitelist=payload.players_whitelist
+    )
     return result
