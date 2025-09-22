@@ -14,7 +14,7 @@ async def evaluate_trade_json(request: Request):
             "dustercrusher",
             "leaderboard",
             "the_collection",
-            "trade_file"
+            "trade"
         ]
 
         missing = [k for k in required_keys if k not in data]
