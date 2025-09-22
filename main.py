@@ -1,4 +1,4 @@
-# main.py — Ultimate Quest Service (trade-scope by default + small JSON response)
+# main.py — Ultimate Quest Service (E31 URL mode, no-quantity trades, trade-scope responses)
 from typing import List, Literal, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, AnyUrl
@@ -27,11 +27,10 @@ app = FastAPI(title="Ultimate Quest Service (E31 URL mode)")
 
 # -------------------- Models --------------------
 class TradeRow(BaseModel):
-    side: Literal["GET", "GIVE"]      # GET = receive -> prefer Their Qty; GIVE = send -> prefer My Qty
-    players: str                      # e.g., "Ryan O'Reilly/Filip Forsberg"
-    sp: float                         # subject points printed on card
-    my_qty: int = 0
-    their_qty: int = 0
+    side: Literal["GET", "GIVE"]      # GET = you receive this card; GIVE = you send this card
+    players: str                      # e.g., "Ryan O'Reilly/Filip Forsberg" (multi-subject)
+    sp: float                         # subject points printed on the card
+    # No quantities; one line = one card. For multiples, repeat lines.
 
 class EvalByUrls(BaseModel):
     leaderboard_url: AnyUrl
@@ -39,11 +38,10 @@ class EvalByUrls(BaseModel):
     trade: List[TradeRow]
     multi_subject_rule: Literal["full_each_unique", "split_even"] = "full_each_unique"
     defend_buffer: int = 20
-
-    # NEW knobs to keep responses small:
+    # Keep responses small to avoid connector limits:
     scope: Literal["trade_only", "portfolio_union"] = "trade_only"
     max_return_players: int = 200
-    players_whitelist: Optional[List[str]] = None  # optional hard filter if needed
+    players_whitelist: Optional[List[str]] = None
 
 # -------------------- Helpers --------------------
 def _normalize_gsheets_url(url: str, prefer_xlsx: bool = True) -> str:
@@ -170,7 +168,12 @@ def _norm_holdings(df: pd.DataFrame) -> pd.DataFrame:
     return out[["player", "sp", "rank", "qp"]]
 
 def _trade_to_deltas(rows: List[TradeRow], rule: str = "full_each_unique") -> Dict[str, float]:
-    """Multi-subject rule: full SP to each unique listed player; same-player quads count once per card."""
+    """
+    Convert trade rows into {player -> delta SP}.
+    - One row = one card (qty = 1).
+    - "full_each_unique": each unique listed player receives FULL SP per card (same-player quad counts once).
+    - "split_even": SP split evenly across listed players.
+    """
     agg: Dict[str, float] = {}
     for r in rows:
         players_raw = re.sub(r"\s+", " ", r.players).strip()
@@ -180,14 +183,9 @@ def _trade_to_deltas(rows: List[TradeRow], rule: str = "full_each_unique") -> Di
             per_player_sp = float(r.sp)
         else:
             per_player_sp = float(r.sp) / max(1, len(names))
-        if r.side == "GET":
-            qty = int(r.their_qty) if r.their_qty else int(r.my_qty)
-            sign = +1.0
-        else:
-            qty = int(r.my_qty) if r.my_qty else int(r.their_qty)
-            sign = -1.0
+        sign = +1.0 if r.side == "GET" else -1.0
         for n in names:
-            agg[n] = agg.get(n, 0.0) + sign * per_player_sp * float(qty)
+            agg[n] = agg.get(n, 0.0) + sign * per_player_sp  # qty=1
     return agg
 
 def _rank_with_me(lb: pd.DataFrame, player: str, me: str, my_sp: int):
@@ -219,7 +217,7 @@ def _evaluate(lb_df: pd.DataFrame,
 
     delta_keys = set(deltas.keys())
     if scope == "trade_only":
-        players_all = sorted(delta_keys)  # ← **small**: evaluate only trade-affected players
+        players_all = sorted(delta_keys)  # small: only trade-affected players
     else:
         players_all = sorted(set(hold_df["player"].tolist()) | delta_keys)
 
@@ -261,7 +259,7 @@ def _evaluate(lb_df: pd.DataFrame,
     verdict = "GREEN" if (qp_delta_total > 0 and cmp["lost_first_place"].sum() == 0 and cmp["created_thin_lead"].sum() == 0) \
               else ("AMBER" if qp_delta_total >= 0 else "RED")
 
-    # Return only *touched* players to keep JSON small
+    # Return only touched rows to keep JSON small
     touched = cmp[(cmp["sp_delta"] != 0) | (cmp["qp_delta"] != 0) |
                   (cmp["created_thin_lead"] == 1) | (cmp["lost_first_place"] == 1) |
                   (cmp["player"].isin(delta_keys))].copy()
@@ -278,7 +276,7 @@ def _evaluate(lb_df: pd.DataFrame,
         per_player = per_player.head(max_return_players)
 
     return {
-        "portfolio_qp_before": qp_total_before,   # trade-scope total (used for Δ)
+        "portfolio_qp_before": qp_total_before,   # trade-scope (used for Δ)
         "portfolio_qp_after":  qp_total_after,
         "portfolio_qp_delta":  qp_delta_total,
         "buffer_target":       defend_buffer,
