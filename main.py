@@ -12,7 +12,7 @@ import pandas as pd
 import numpy as np
 import io, re, zipfile, math
 
-SERVICE_VERSION = "3.2.1-collection-rival-robust"
+SERVICE_VERSION = "3.2.2-collection-rival-robust"
 
 # ---- Robust URL fetch (requests if present; urllib fallback) ----
 try:
@@ -289,6 +289,24 @@ def _trade_to_deltas(rows: Optional[List[TradeRow]], rule: str = "full_each_uniq
         for n in names:
             agg[n] = agg.get(n, 0.0) + sign * per_player_sp
     return agg
+
+# -------------------- NEW: bundle (N copies of one card) → deltas --------------------
+def _bundle_to_deltas(bundle: List[Tuple[List[str], int]], rule: str = "full_each_unique") -> Dict[str, float]:
+    """
+    bundle: list of tuples (players_list, sp_value) for each copy being added
+    Returns: {player: +total_sp}
+    """
+    deltas: Dict[str, float] = {}
+    for players, sp in bundle:
+        if rule == "full_each_unique":
+            names = list(dict.fromkeys(players))
+            per = float(sp)
+        else:
+            names = list(players)
+            per = float(sp) / max(1, len(names))
+        for n in names:
+            deltas[n] = deltas.get(n, 0.0) + per
+    return deltas
 
 # -------------------- Evaluate a set of deltas --------------------
 def _evaluate(lb_df: pd.DataFrame,
@@ -799,7 +817,6 @@ def health():
 
 @app.get("/info")
 def info():
-    # tiny helper so you can confirm which code is live
     routes = [r.path for r in app.routes if hasattr(r, "path")]
     return {"version": SERVICE_VERSION, "routes": sorted(routes)}
 
@@ -911,5 +928,4 @@ def review_collection_by_urls_easystreet31(payload: CollectionReviewByUrls):
         )
         return JSONResponse(content=_json_safe(result))
     except Exception as e:
-        # Convert any unexpected failure to JSON instead of 500 NameError
         raise HTTPException(status_code=500, detail=f"Collection review failed internally: {e}")
