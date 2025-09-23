@@ -2,8 +2,8 @@
 # Endpoints:
 #   POST /evaluate_by_urls_easystreet31
 #   POST /scan_by_urls_easystreet31
-#   POST /scan_rival_by_urls_easystreet31      (no omissions if max_each<=0)
-#   POST /review_collection_by_urls_easystreet31  (qty-aware; supports focus_rival; fault-tolerant)
+#   POST /scan_rival_by_urls_easystreet31
+#   POST /review_collection_by_urls_easystreet31
 from typing import List, Literal, Dict, Any, Optional, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -12,7 +12,7 @@ import pandas as pd
 import numpy as np
 import io, re, zipfile, math
 
-SERVICE_VERSION = "3.2.2-collection-rival-robust"
+SERVICE_VERSION = "3.2.3-collection-rival-fast"
 
 # ---- Robust URL fetch (requests if present; urllib fallback) ----
 try:
@@ -68,8 +68,7 @@ class RivalScanByUrls(BaseModel):
     upgrade_gap: int = 12
     entry_gap: int = 8
     keep_buffer: int = 30
-    # <=0 => no omissions
-    max_each: int = 0
+    max_each: int = 0            # <=0 => no omissions
     players_whitelist: Optional[List[str]] = None
     players_exclude: Optional[List[str]] = None
 
@@ -78,19 +77,16 @@ class CollectionReviewByUrls(BaseModel):
     holdings_url: AnyUrl
     collection_url: AnyUrl
     multi_subject_rule: Literal["full_each_unique", "split_even"] = "full_each_unique"
-    # thresholds
     defend_buffer: int = 20
     upgrade_gap: int = 12
     entry_gap: int = 8
     keep_buffer: int = 30
-    # sizing
     max_each: int = 25                  # <=0 => show all
     max_multiples_per_card: int = 3
     scan_top_candidates: int = 60
     players_whitelist: Optional[List[str]] = None
     players_exclude: Optional[List[str]] = None
     baseline_trade: Optional[List[TradeRow]] = None
-    # rival focus
     focus_rival: Optional[str] = None
     rival_only: bool = False
     rival_score_weight: int = 250
@@ -127,7 +123,7 @@ def _json_safe(obj: Any) -> Any:
         pass
     return obj
 
-# -------------------- Helpers: loading tables --------------------
+# -------------------- Loaders --------------------
 def _normalize_gsheets_url(url: str, prefer_xlsx: bool = True) -> str:
     if "docs.google.com/spreadsheets" not in url: return url
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
@@ -292,10 +288,6 @@ def _trade_to_deltas(rows: Optional[List[TradeRow]], rule: str = "full_each_uniq
 
 # -------------------- NEW: bundle (N copies of one card) → deltas --------------------
 def _bundle_to_deltas(bundle: List[Tuple[List[str], int]], rule: str = "full_each_unique") -> Dict[str, float]:
-    """
-    bundle: list of tuples (players_list, sp_value) for each copy being added
-    Returns: {player: +total_sp}
-    """
     deltas: Dict[str, float] = {}
     for players, sp in bundle:
         if rule == "full_each_unique":
@@ -383,7 +375,7 @@ def _evaluate(lb_df: pd.DataFrame,
         "verdict": verdict
     }
 
-# -------------------- Daily scans (global / rival) --------------------
+# -------------------- Daily scans --------------------
 def _scan(lb_df: pd.DataFrame,
           hold_df: pd.DataFrame,
           me: str,
@@ -394,10 +386,8 @@ def _scan(lb_df: pd.DataFrame,
           max_each: int,
           players_whitelist: Optional[List[str]],
           players_exclude: Optional[List[str]]) -> Dict[str, Any]:
-
     players_all = sorted(set(hold_df["player"].tolist()) | set(lb_df["player"].tolist()))
     norm = lambda s: re.sub(r"\s+", " ", s).strip()
-
     if players_whitelist:
         wl = {norm(p) for p in players_whitelist};  players_all = [p for p in players_all if norm(p) in wl]
     if players_exclude:
@@ -474,10 +464,7 @@ def _scan_vs_rival(lb_df: pd.DataFrame,
                    max_each: int,
                    players_whitelist: Optional[List[str]],
                    players_exclude: Optional[List[str]]) -> Dict[str, Any]:
-
-    rival_norm = _norm_user(rival)
-    rival_label = _short_user(rival)
-
+    rival_norm = _norm_user(rival); rival_label = _short_user(rival)
     players_all = sorted(set(hold_df["player"].tolist()) | set(lb_df["player"].tolist()))
     norm = lambda s: re.sub(r"\s+", " ", s).strip()
     if players_whitelist:
@@ -535,7 +522,7 @@ def _scan_vs_rival(lb_df: pd.DataFrame,
         "overshoot_vs_rival": ovr_c, "omitted_overshoots": ovr_om
     }
 
-# -------------------- Collection normalizer (qty + multi-subject) --------------------
+# -------------------- Collection normalizer --------------------
 def _norm_collection(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy().dropna(how="all")
     d = d.loc[:, ~d.columns.astype(str).str.contains("^Unnamed", na=False)]
@@ -591,7 +578,7 @@ def _summarize_effect(eval_result: Dict[str, Any], defend_buffer: int) -> Dict[s
         "qp_delta":            int(eval_result["portfolio_qp_delta"])
     }
 
-# -------------------- Rival-aware impact (per player) --------------------
+# -------------------- Rival-aware impact --------------------
 def _rival_impact_for_player(lb_df: pd.DataFrame,
                              me: str,
                              rival_norm: Optional[str],
@@ -626,7 +613,7 @@ def _rival_impact_for_player(lb_df: pd.DataFrame,
         "entered_top3_over_rival": bool(entered_top3_over)
     }
 
-# -------------------- Build recommendations from a collection (rival-aware, fault-tolerant) --------------------
+# -------------------- Collection review (qty-aware, rival-aware, fast) --------------------
 def _review_collection(lb_df: pd.DataFrame,
                        hold_df: pd.DataFrame,
                        coll_df: pd.DataFrame,
@@ -689,9 +676,10 @@ def _review_collection(lb_df: pd.DataFrame,
                     for p, v in baseline_deltas.items():
                         deltas[p] = deltas.get(p, 0.0) + v
 
+                    # *** PERFORMANCE TWEAK: evaluate only touched players ***
                     res = _evaluate(lb_df, hold_df, deltas, me="Easystreet31",
-                                    defend_buffer=defend_buffer, scope="portfolio_union",
-                                    max_return_players=500, players_whitelist=None)
+                                    defend_buffer=defend_buffer, scope="trade_only",
+                                    max_return_players=60, players_whitelist=list(deltas.keys()))
                     summary = _summarize_effect(res, defend_buffer=defend_buffer)
 
                     rival_hits = {"took_first_from_rival": [], "shored_vs_rival": [], "entered_top3_over_rival": []}
@@ -741,25 +729,16 @@ def _review_collection(lb_df: pd.DataFrame,
                         best = item
 
                 except Exception as inner_e:
-                    errors.append({
-                        "card": f"{card_no} — {card_name}",
-                        "take_n": str(k),
-                        "error": str(inner_e)[:220]
-                    })
+                    errors.append({"card": f"{card_no} — {card_name}", "take_n": str(k), "error": str(inner_e)[:220]})
                     continue
 
             if rival_only and best is None:
                 skipped_no_rival += 1
-
             if best:
                 scored.append(best)
 
         except Exception as outer_e:
-            errors.append({
-                "card": f"{row.get('card_number', '?')} — {row.get('card_name', '?')}",
-                "take_n": "n/a",
-                "error": str(outer_e)[:220]
-            })
+            errors.append({"card": f"{row.get('card_number','?')} — {row.get('card_name','?')}", "take_n": "n/a", "error": str(outer_e)[:220]})
             continue
 
     scored_sorted = sorted(scored, key=lambda r: (r["effects"]["qp_delta"], r["score"]), reverse=True)
@@ -812,8 +791,7 @@ def _review_collection(lb_df: pd.DataFrame,
 
 # -------------------- Routes --------------------
 @app.get("/health")
-def health():
-    return {"ok": True}
+def health(): return {"ok": True}
 
 @app.get("/info")
 def info():
@@ -835,13 +813,11 @@ def evaluate_by_urls_easystreet31(payload: EvalByUrls):
         raise HTTPException(status_code=400, detail=f"Failed to normalize inputs: {e}")
 
     deltas = _trade_to_deltas(payload.trade, rule=payload.multi_subject_rule)
-    result = _evaluate(
-        lb, hd, deltas, me="Easystreet31",
-        defend_buffer=payload.defend_buffer,
-        scope=payload.scope,
-        max_return_players=payload.max_return_players,
-        players_whitelist=payload.players_whitelist
-    )
+    result = _evaluate(lb, hd, deltas, me="Easystreet31",
+                       defend_buffer=payload.defend_buffer,
+                       scope=payload.scope,
+                       max_return_players=payload.max_return_players,
+                       players_whitelist=payload.players_whitelist)
     return JSONResponse(content=_json_safe(result))
 
 @app.post("/scan_by_urls_easystreet31")
@@ -858,16 +834,14 @@ def scan_by_urls_easystreet31(payload: ScanByUrls):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to normalize inputs: {e}")
 
-    result = _scan(
-        lb, hd, me="Easystreet31",
-        defend_buffer=payload.defend_buffer,
-        upgrade_gap=payload.upgrade_gap,
-        entry_gap=payload.entry_gap,
-        keep_buffer=payload.keep_buffer,
-        max_each=payload.max_each,
-        players_whitelist=payload.players_whitelist,
-        players_exclude=payload.players_exclude
-    )
+    result = _scan(lb, hd, me="Easystreet31",
+                   defend_buffer=payload.defend_buffer,
+                   upgrade_gap=payload.upgrade_gap,
+                   entry_gap=payload.entry_gap,
+                   keep_buffer=payload.keep_buffer,
+                   max_each=payload.max_each,
+                   players_whitelist=payload.players_whitelist,
+                   players_exclude=payload.players_exclude)
     return JSONResponse(content=_json_safe(result))
 
 @app.post("/scan_rival_by_urls_easystreet31")
@@ -884,16 +858,12 @@ def scan_rival_by_urls_easystreet31(payload: RivalScanByUrls):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to normalize inputs: {e}")
 
-    result = _scan_vs_rival(
-        lb, hd, me="Easystreet31", rival=payload.rival,
-        defend_buffer=payload.defend_buffer,
-        upgrade_gap=payload.upgrade_gap,
-        entry_gap=payload.entry_gap,
-        keep_buffer=payload.keep_buffer,
-        max_each=payload.max_each,
-        players_whitelist=payload.players_whitelist,
-        players_exclude=payload.players_exclude
-    )
+    result = _scan_vs_rival(lb, hd, me="Easystreet31", rival=payload.rival,
+                            defend_buffer=payload.defend_buffer, upgrade_gap=payload.upgrade_gap,
+                            entry_gap=payload.entry_gap, keep_buffer=payload.keep_buffer,
+                            max_each=payload.max_each,
+                            players_whitelist=payload.players_whitelist,
+                            players_exclude=payload.players_exclude)
     return JSONResponse(content=_json_safe(result))
 
 @app.post("/review_collection_by_urls_easystreet31")
@@ -912,20 +882,18 @@ def review_collection_by_urls_easystreet31(payload: CollectionReviewByUrls):
         raise HTTPException(status_code=400, detail=f"Failed to normalize inputs: {e}")
 
     try:
-        result = _review_collection(
-            lb_df=lb, hold_df=hd, coll_df=col, me="Easystreet31",
-            defend_buffer=payload.defend_buffer, upgrade_gap=payload.upgrade_gap,
-            entry_gap=payload.entry_gap, keep_buffer=payload.keep_buffer,
-            max_each=payload.max_each, max_multiples_per_card=payload.max_multiples_per_card,
-            scan_top_candidates=payload.scan_top_candidates,
-            multi_subject_rule=payload.multi_subject_rule,
-            players_whitelist=payload.players_whitelist,
-            players_exclude=payload.players_exclude,
-            baseline_trade=payload.baseline_trade,
-            focus_rival=payload.focus_rival,
-            rival_only=payload.rival_only,
-            rival_score_weight=payload.rival_score_weight
-        )
+        result = _review_collection(lb_df=lb, hold_df=hd, coll_df=col, me="Easystreet31",
+                                    defend_buffer=payload.defend_buffer, upgrade_gap=payload.upgrade_gap,
+                                    entry_gap=payload.entry_gap, keep_buffer=payload.keep_buffer,
+                                    max_each=payload.max_each, max_multiples_per_card=payload.max_multiples_per_card,
+                                    scan_top_candidates=payload.scan_top_candidates,
+                                    multi_subject_rule=payload.multi_subject_rule,
+                                    players_whitelist=payload.players_whitelist,
+                                    players_exclude=payload.players_exclude,
+                                    baseline_trade=payload.baseline_trade,
+                                    focus_rival=payload.focus_rival,
+                                    rival_only=payload.rival_only,
+                                    rival_score_weight=payload.rival_score_weight)
         return JSONResponse(content=_json_safe(result))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Collection review failed internally: {e}")
