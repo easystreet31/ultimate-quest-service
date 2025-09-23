@@ -1,12 +1,11 @@
-# main.py — Ultimate Quest Service
+# main.py — Ultimate Quest Service (Easystreet31)
 # Endpoints:
 #   POST /evaluate_by_urls_easystreet31  (no-quantity trades, trade-scope response)
-#   POST /scan_by_urls_easystreet31      (Thin Leads / Upgrades / Top-3 / Overshoots)
+#   POST /scan_by_urls_easystreet31      (Thin Leads / Upgrade Opps / Top-3 / Overshoots)
 from typing import List, Literal, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, AnyUrl
 import pandas as pd
-import numpy as np
 import io, re, zipfile
 
 # ---- Robust URL fetch (requests if present; urllib fallback) ----
@@ -33,7 +32,6 @@ class TradeRow(BaseModel):
     side: Literal["GET", "GIVE"]      # GET = you receive this card; GIVE = you send this card
     players: str                      # e.g., "Ryan O'Reilly/Filip Forsberg" (multi-subject)
     sp: float                         # subject points on the card
-    # No quantities; one row = one card. For multiples, repeat rows.
 
 class EvalByUrls(BaseModel):
     leaderboard_url: AnyUrl
@@ -41,7 +39,6 @@ class EvalByUrls(BaseModel):
     trade: List[TradeRow]
     multi_subject_rule: Literal["full_each_unique", "split_even"] = "full_each_unique"
     defend_buffer: int = 20
-    # keep responses small:
     scope: Literal["trade_only", "portfolio_union"] = "trade_only"
     max_return_players: int = 200
     players_whitelist: Optional[List[str]] = None
@@ -53,11 +50,11 @@ class ScanByUrls(BaseModel):
     upgrade_gap: int = 12            # 2nd -> 1st opportunities
     entry_gap: int = 8               # into Top-3
     keep_buffer: int = 30            # overshoot slack threshold
-    max_each: int = 50               # cap list size per section
+    max_each: int = 25               # cap list size per section (smaller = cleaner output)
     players_whitelist: Optional[List[str]] = None
     players_exclude: Optional[List[str]] = None
 
-# -------------------- Helpers --------------------
+# -------------------- Normalization helpers --------------------
 def _normalize_gsheets_url(url: str, prefer_xlsx: bool = True) -> str:
     if "docs.google.com/spreadsheets" not in url:
         return url
@@ -74,7 +71,7 @@ def _looks_like_xlsx(url: str, content_type: str, head: bytes) -> bool:
         return True
     if "spreadsheetml" in content_type or "ms-excel" in content_type:
         return True
-    return head[:2] == b"PK"  # XLSX is a ZIP container
+    return head[:2] == b"PK"  # XLSX is a ZIP
 
 def _fetch_table(url: str) -> pd.DataFrame:
     url = _normalize_gsheets_url(url, prefer_xlsx=True)
@@ -98,7 +95,7 @@ def _fetch_table(url: str) -> pd.DataFrame:
         except zipfile.BadZipFile:
             buf.seek(0)  # fall through to CSV
 
-    # CSV with encoding fallbacks
+    # CSV with encodings
     for enc in (None, "utf-8", "utf-8-sig", "latin1"):
         try:
             buf.seek(0)
@@ -109,31 +106,40 @@ def _fetch_table(url: str) -> pd.DataFrame:
             continue
     raise HTTPException(status_code=400, detail="Unable to parse CSV after multiple encoding attempts.")
 
+def _short_user(u: str) -> str:
+    """Strip trailing '(digits)' id for display."""
+    s = str(u or "").strip()
+    s = re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+def _norm_user(u: str) -> str:
+    """Canonical form for equality: lowercased, no trailing '(digits)' id, single spaces."""
+    return _short_user(u).lower()
+
 def _qp_from_rank(rank: int) -> int:
     return 5 if rank == 1 else 3 if rank == 2 else 1 if rank == 3 else 0
 
+# -------------------- Table normalization --------------------
 def _norm_lb(df: pd.DataFrame) -> pd.DataFrame:
-    """Standardize leaderboard to: player, user, sp, rank (keep top-5)."""
     d = df.copy()
     d = d.dropna(how="all")
     d = d.loc[:, ~d.columns.astype(str).str.contains("^Unnamed", na=False)]
     lower = {c.lower(): c for c in d.columns}
 
-    player_col = lower.get("player") or lower.get("subject") or lower.get("name") or None
-    user_col   = lower.get("user")   or lower.get("collector") or lower.get("username") or None
-    sp_col     = lower.get("sp")     or lower.get("points") or lower.get("score") or None
+    player_col = lower.get("player") or lower.get("subject") or lower.get("name") or "__sheet__"
+    user_col   = lower.get("user")   or lower.get("collector") or lower.get("username")
+    sp_col     = lower.get("sp")     or lower.get("points") or lower.get("score")
 
-    if player_col is None and "__sheet__" in d.columns:
-        player_col = "__sheet__"
-    if player_col is None:
+    if player_col not in d.columns:
+        # fallback: first object column
         obj = [c for c in d.columns if d[c].dtype == object]
         if not obj: raise HTTPException(status_code=400, detail="Leaderboard missing a 'player' column.")
         player_col = obj[0]
-    if user_col is None:
+    if not user_col:
         obj = [c for c in d.columns if d[c].dtype == object and c != player_col]
         if not obj: raise HTTPException(status_code=400, detail="Leaderboard missing a 'user' column.")
         user_col = obj[0]
-    if sp_col is None:
+    if not sp_col:
         nums = [c for c in d.columns if pd.api.types.is_numeric_dtype(d[c])]
         if not nums: raise HTTPException(status_code=400, detail="Leaderboard missing SP/points column.")
         sp_col = nums[0]
@@ -143,28 +149,28 @@ def _norm_lb(df: pd.DataFrame) -> pd.DataFrame:
     out["player"] = out["player"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
     out["user"]   = out["user"].astype(str).str.strip()
     out["sp"]     = pd.to_numeric(out["sp"], errors="coerce").fillna(0).astype(int)
+    out["user_norm"] = out["user"].map(_norm_user)
 
     out = out.sort_values(["player", "sp"], ascending=[True, False])
     out["rank"] = out.groupby("player")["sp"].rank(method="first", ascending=False).astype(int)
-    return out[out["rank"] <= 5][["player", "user", "sp", "rank"]]
+    return out[out["rank"] <= 5][["player", "user", "user_norm", "sp", "rank"]]
 
 def _norm_holdings(df: pd.DataFrame) -> pd.DataFrame:
-    """Standardize holdings to: player, sp, rank, qp (dedupe max SP per player)."""
     d = df.copy()
     d = d.dropna(how="all")
     d = d.loc[:, ~d.columns.astype(str).str.contains("^Unnamed", na=False)]
     lower = {c.lower(): c for c in d.columns}
 
-    player_col = lower.get("player") or lower.get("subject") or lower.get("name") or None
-    sp_col     = lower.get("sp") or lower.get("points") or lower.get("subject points") or None
-    rank_col   = lower.get("rank") or lower.get("#") or lower.get("place") or None
-    qp_col     = lower.get("qp") or None
+    player_col = lower.get("player") or lower.get("subject") or lower.get("name")
+    sp_col     = lower.get("sp") or lower.get("points") or lower.get("subject points")
+    rank_col   = lower.get("rank") or lower.get("#") or lower.get("place")
+    qp_col     = lower.get("qp")
 
-    if player_col is None:
+    if not player_col:
         obj = [c for c in d.columns if d[c].dtype == object]
         if not obj: raise HTTPException(status_code=400, detail="Holdings missing a 'player' column.")
         player_col = obj[0]
-    if sp_col is None:
+    if not sp_col:
         nums = [c for c in d.columns if pd.api.types.is_numeric_dtype(d[c])]
         if not nums: raise HTTPException(status_code=400, detail="Holdings missing an SP column.")
         sp_col = nums[0]
@@ -173,19 +179,45 @@ def _norm_holdings(df: pd.DataFrame) -> pd.DataFrame:
     out.columns = ["player", "sp"]
     out["player"] = out["player"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
     out["sp"]     = pd.to_numeric(out["sp"], errors="coerce").fillna(0).astype(int)
-
-    out["rank"] = pd.to_numeric(d.get(rank_col, 99), errors="coerce").fillna(99).astype(int) if rank_col in (d.columns if rank_col else []) else 99
-    out["qp"]   = pd.to_numeric(d.get(qp_col, out["rank"].map({1:5,2:3,3:1})), errors="coerce").fillna(0).astype(int) if qp_col in (d.columns if qp_col else []) else out["rank"].map({1:5,2:3,3:1}).fillna(0).astype(int)
-
+    out["rank"]   = pd.to_numeric(d.get(rank_col, 99), errors="coerce").fillna(99).astype(int) if rank_col in (d.columns if rank_col else []) else 99
+    out["qp"]     = pd.to_numeric(d.get(qp_col, out["rank"].map({1:5,2:3,3:1})), errors="coerce").fillna(0).astype(int) if qp_col in (d.columns if qp_col else []) else out["rank"].map({1:5,2:3,3:1}).fillna(0).astype(int)
     out = out.sort_values(["player", "sp"], ascending=[True, False]).drop_duplicates("player", keep="first")
     return out[["player", "sp", "rank", "qp"]]
 
+# -------------------- Core rank logic (now alias-aware) --------------------
+def _rank_with_me(lb: pd.DataFrame, player: str, me: str, my_sp: int):
+    me_norm = _norm_user(me)
+    sub = lb[lb["player"] == player][["user", "user_norm", "sp"]].copy()
+
+    if sub.empty:
+        sub = pd.DataFrame([{"user": me, "user_norm": me_norm, "sp": int(my_sp)}])
+    else:
+        mask_me = sub["user_norm"].eq(me_norm)
+        if mask_me.any():
+            sub.loc[mask_me, "sp"] = int(my_sp)
+        else:
+            sub = pd.concat([sub, pd.DataFrame([{"user": me, "user_norm": me_norm, "sp": int(my_sp)}])], ignore_index=True)
+
+    sub = sub.sort_values("sp", ascending=False).reset_index(drop=True)
+    # index of me
+    my_idx = sub.index[sub["user_norm"] == me_norm]
+    my_rank = int(my_idx[0] + 1) if len(my_idx) else 99
+
+    # top slots (labels shortened; 'YOU' if it's you)
+    def _as_label(u_norm: str, u_raw: str) -> str:
+        return "YOU" if u_norm == me_norm else _short_user(u_raw)
+
+    first_sp  = int(sub.iloc[0]["sp"]) if len(sub) > 0 else 0
+    first_usr = _as_label(sub.iloc[0]["user_norm"], sub.iloc[0]["user"]) if len(sub) > 0 else None
+    second_sp = int(sub.iloc[1]["sp"]) if len(sub) > 1 else 0
+    second_usr= _as_label(sub.iloc[1]["user_norm"], sub.iloc[1]["user"]) if len(sub) > 1 else None
+    third_sp  = int(sub.iloc[2]["sp"]) if len(sub) > 2 else 0
+    third_usr = _as_label(sub.iloc[2]["user_norm"], sub.iloc[2]["user"]) if len(sub) > 2 else None
+
+    return my_rank, first_sp, second_sp, third_sp, first_usr, second_usr, third_usr
+
+# -------------------- Trade evaluation --------------------
 def _trade_to_deltas(rows: List[TradeRow], rule: str = "full_each_unique") -> Dict[str, float]:
-    """
-    One row = one card (qty = 1).
-    - "full_each_unique": each unique listed player receives FULL SP per card (same-player quad counts once).
-    - "split_even": SP split evenly across listed players.
-    """
     agg: Dict[str, float] = {}
     for r in rows:
         players_raw = re.sub(r"\s+", " ", r.players).strip()
@@ -200,28 +232,6 @@ def _trade_to_deltas(rows: List[TradeRow], rule: str = "full_each_unique") -> Di
             agg[n] = agg.get(n, 0.0) + sign * per_player_sp
     return agg
 
-def _rank_with_me(lb: pd.DataFrame, player: str, me: str, my_sp: int):
-    sub = lb[lb["player"] == player][["user", "sp"]].copy()
-    if sub.empty:
-        sub = pd.DataFrame([{"user": me, "sp": int(my_sp)}])
-    else:
-        mask_me = sub["user"].str.lower().eq(me.lower())
-        if mask_me.any():
-            sub.loc[mask_me, "sp"] = int(my_sp)
-        else:
-            sub = pd.concat([sub, pd.DataFrame([{"user": me, "sp": int(my_sp)}])], ignore_index=True)
-    sub = sub.sort_values("sp", ascending=False).reset_index(drop=True)
-    my_idx = sub.index[sub["user"].str.lower() == me.lower()]
-    my_rank = int(my_idx[0] + 1) if len(my_idx) else 99
-    first_sp  = int(sub.iloc[0]["sp"]) if len(sub) > 0 else 0
-    second_sp = int(sub.iloc[1]["sp"]) if len(sub) > 1 else 0
-    third_sp  = int(sub.iloc[2]["sp"]) if len(sub) > 2 else 0
-    first_user  = str(sub.iloc[0]["user"]) if len(sub) > 0 else None
-    second_user = str(sub.iloc[1]["user"]) if len(sub) > 1 else None
-    third_user  = str(sub.iloc[2]["user"]) if len(sub) > 2 else None
-    return my_rank, first_sp, second_sp, third_sp, first_user, second_user, third_user
-
-# -------------------- Core evaluation --------------------
 def _evaluate(lb_df: pd.DataFrame,
               hold_df: pd.DataFrame,
               deltas: Dict[str, float],
@@ -301,7 +311,7 @@ def _evaluate(lb_df: pd.DataFrame,
         "verdict": verdict
     }
 
-# -------------------- Daily scan (no trade) --------------------
+# -------------------- Daily scan (alias-aware, compact-friendly) --------------------
 def _scan(lb_df: pd.DataFrame,
           hold_df: pd.DataFrame,
           me: str,
@@ -313,7 +323,7 @@ def _scan(lb_df: pd.DataFrame,
           players_whitelist: Optional[List[str]],
           players_exclude: Optional[List[str]]) -> Dict[str, Any]:
 
-    # Candidate players = union of holdings & leaderboard players
+    me_norm = _norm_user(me)
     players_all = sorted(set(hold_df["player"].tolist()) | set(lb_df["player"].tolist()))
     norm = lambda s: re.sub(r"\s+", " ", s).strip()
 
@@ -371,16 +381,17 @@ def _scan(lb_df: pd.DataFrame,
         ["player","you_sp","second_user","second_sp","margin","tradable_slack"]
     ]
 
-    # Rival watchlist
+    # Rival watchlist (drop 'YOU')
     rivals = pd.concat([
         thin["second_user"].dropna().astype(str).str.strip(),
         upg["first_user"].dropna().astype(str).str.strip(),
         entry["third_user"].dropna().astype(str).str.strip()
     ], ignore_index=True)
+    rivals = rivals[rivals.str.upper() != "YOU"]
     rival_counts = rivals.value_counts().reset_index()
     rival_counts.columns = ["rival_user", "mentions"]
 
-    # Cap each list to keep response tiny
+    # Cap lists
     def cap(df):
         omitted = max(0, len(df) - max_each)
         return df.head(max_each), omitted
