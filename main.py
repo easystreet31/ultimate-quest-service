@@ -1,12 +1,12 @@
-# main.py — Ultimate Quest Service (Easystreet31) — FIX: no suffix KeyError on second_sp
-# Endpoints:
-#   POST /evaluate_by_urls_easystreet31  (no-quantity trades, trade-scope response)
-#   POST /scan_by_urls_easystreet31      (Thin Leads / Upgrade Opps / Top-3 / Overshoots)
+# main.py — Ultimate Quest Service (Easystreet31)
+# FIX: sanitize NaN/Inf to JSON-safe nulls + keep alias and merge fixes
 from typing import List, Literal, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, AnyUrl
 import pandas as pd
-import io, re, zipfile
+import numpy as np
+import io, re, zipfile, math
 
 # ---- Robust URL fetch (requests if present; urllib fallback) ----
 try:
@@ -53,6 +53,38 @@ class ScanByUrls(BaseModel):
     max_each: int = 25
     players_whitelist: Optional[List[str]] = None
     players_exclude: Optional[List[str]] = None
+
+# -------------------- JSON sanitization --------------------
+def _json_safe(obj: Any) -> Any:
+    """Recursively convert NaN/Inf -> None, numpy scalars -> native, timestamps -> iso."""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, pd.DataFrame):
+        df = obj.replace({np.inf: None, -np.inf: None})
+        df = df.where(pd.notnull(df), None)
+        return [ _json_safe(r) for r in df.to_dict(orient="records") ]
+    if isinstance(obj, pd.Series):
+        s = obj.replace({np.inf: None, -np.inf: None})
+        s = s.where(pd.notnull(s), None)
+        return _json_safe(s.to_dict())
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        f = float(obj)
+        return f if math.isfinite(f) else None
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    # Handle pandas NA / numpy NaN generically
+    try:
+        if pd.isna(obj):
+            return None
+    except Exception:
+        pass
+    return obj
 
 # -------------------- Normalization helpers --------------------
 def _normalize_gsheets_url(url: str, prefer_xlsx: bool = True) -> str:
@@ -197,12 +229,11 @@ def _rank_with_me(lb: pd.DataFrame, player: str, me: str, my_sp: int):
 
     sub = sub.sort_values("sp", ascending=False).reset_index(drop=True)
 
-    # my position
-    my_idx = sub.index[sub["user_norm"] == me_norm]
-    my_rank = int(my_idx[0] + 1) if len(my_idx) else 99
-
     def _as_label(u_norm: str, u_raw: str) -> str:
         return "YOU" if u_norm == me_norm else _short_user(u_raw)
+
+    my_idx = sub.index[sub["user_norm"] == me_norm]
+    my_rank = int(my_idx[0] + 1) if len(my_idx) else 99
 
     first_sp  = int(sub.iloc[0]["sp"]) if len(sub) > 0 else 0
     first_usr = _as_label(sub.iloc[0]["user_norm"], sub.iloc[0]["user"]) if len(sub) > 0 else None
@@ -229,7 +260,7 @@ def _trade_to_deltas(rows: List[TradeRow], rule: str = "full_each_unique") -> Di
             agg[n] = agg.get(n, 0.0) + sign * per_player_sp
     return agg
 
-# -------------------- Evaluate trade (FIX: disambiguate second_sp columns) --------------------
+# -------------------- Evaluate trade (NaN-safe, alias-aware) --------------------
 def _evaluate(lb_df: pd.DataFrame,
               hold_df: pd.DataFrame,
               deltas: Dict[str, float],
@@ -241,7 +272,6 @@ def _evaluate(lb_df: pd.DataFrame,
 
     delta_keys = set(deltas.keys())
     players_all = sorted(delta_keys) if scope == "trade_only" else sorted(set(hold_df["player"].tolist()) | delta_keys)
-
     if players_whitelist:
         wl = {re.sub(r"\s+", " ", p).strip() for p in players_whitelist}
         players_all = [p for p in players_all if p in wl]
@@ -262,21 +292,20 @@ def _evaluate(lb_df: pd.DataFrame,
         r2, f2, s2, t2, fu2, su2, tu2 = _rank_with_me(lb_df, p, me, you_sp_after)
         after_rows.append({
             "player": p, "you_sp_after": you_sp_after, "rank_after": r2, "qp_after": _qp_from_rank(r2),
-            # rename these to avoid merge collisions
             "first_sp_after": f2, "second_sp_after": s2, "third_sp_after": t2
         })
 
     before_df = pd.DataFrame(before_rows)
     after_df  = pd.DataFrame(after_rows)
 
-    # Merge with distinct column names (no _x/_y suffixes)
+    # Merge with distinct "after" names (no _x/_y suffixes)
     cmp = pd.merge(before_df, after_df, on="player", how="outer").fillna(0)
 
     # Deltas
     cmp["qp_delta"] = cmp["qp_after"] - cmp["qp"]
     cmp["sp_delta"] = cmp["you_sp_after"] - cmp["you_sp"]
 
-    # Risks (use the correct "second" columns)
+    # Risks (NaN-safe, compute only where relevant)
     cmp["margin_before"] = cmp.apply(
         lambda r: (r["you_sp"] - r["second_sp"]) if r["rank"] == 1 else None, axis=1
     )
@@ -307,6 +336,7 @@ def _evaluate(lb_df: pd.DataFrame,
         "margin_before","margin_after","created_thin_lead","lost_first_place"
     ]]
 
+    # Cap size
     omitted = 0
     if len(per_player) > max_return_players:
         omitted = len(per_player) - max_return_players
@@ -321,7 +351,7 @@ def _evaluate(lb_df: pd.DataFrame,
             "lost_firsts": int(cmp["lost_first_place"].sum()),
             "created_thin_leads": int(cmp["created_thin_lead"].sum()),
         },
-        "per_player": per_player.to_dict(orient="records"),
+        "per_player": per_player,   # DataFrame handled by _json_safe at return time
         "omitted_players": omitted,
         "verdict": verdict
     }
@@ -426,15 +456,15 @@ def _scan(lb_df: pd.DataFrame,
             "top3_entries": len(entry), "overshoots": len(overshoot),
             "rivals": len(rival_counts)
         },
-        "thin_leads": thin_c.to_dict(orient="records"),
+        "thin_leads": thin_c,
         "omitted_thin": thin_om,
-        "upgrade_opps": upg_c.to_dict(orient="records"),
+        "upgrade_opps": upg_c,
         "omitted_upgrades": upg_om,
-        "top3_entries": ent_c.to_dict(orient="records"),
+        "top3_entries": ent_c,
         "omitted_top3": ent_om,
-        "overshoots": ovr_c.to_dict(orient="records"),
+        "overshoots": ovr_c,
         "omitted_overshoots": ovr_om,
-        "rival_watchlist": rv_c.to_dict(orient="records"),
+        "rival_watchlist": rv_c,
         "omitted_rivals": rv_om
     }
 
@@ -466,7 +496,8 @@ def evaluate_by_urls_easystreet31(payload: EvalByUrls):
         max_return_players=payload.max_return_players,
         players_whitelist=payload.players_whitelist
     )
-    return result
+    # JSON-safe response (no NaN/Inf)
+    return JSONResponse(content=_json_safe(result))
 
 @app.post("/scan_by_urls_easystreet31")
 def scan_by_urls_easystreet31(payload: ScanByUrls):
@@ -493,4 +524,5 @@ def scan_by_urls_easystreet31(payload: ScanByUrls):
         players_whitelist=payload.players_whitelist,
         players_exclude=payload.players_exclude
     )
-    return result
+    # JSON-safe response (no NaN/Inf)
+    return JSONResponse(content=_json_safe(result))
