@@ -610,239 +610,6 @@ def _rival_impact_for_player(lb_df: pd.DataFrame,
     }
 
 # -------------------- Build recommendations from a collection (now rival-aware) --------------------
-def _review_collection(lb_df: pd.DataFrame,
-                       hold_df: pd.DataFrame,
-                       coll_df: pd.DataFrame,
-                       me: str,
-                       defend_buffer: int,
-                       upgrade_gap: int,
-                       entry_gap: int,
-                       keep_buffer: int,
-                       max_each: int,
-                       max_multiples_per_card: int,
-                       scan_top_candidates: int,
-                       multi_subject_rule: str,
-                       players_whitelist: Optional[List[str]],
-                       players_exclude: Optional[List[str]],
-                       baseline_trade: Optional[List[TradeRow]],
-                       focus_rival: Optional[str],
-                       rival_only: bool,
-                       rival_score_weight: int) -> Dict[str, Any]:
-
-    baseline_deltas = _trade_to_deltas(baseline_trade, rule=multi_subject_rule) if baseline_trade else {}
-
-    def _intersects_focus(players: List[str]) -> bool:
-        if not players_whitelist and not players_exclude: return True
-        n = lambda s: re.sub(r"\s+", " ", s).strip()
-        if players_whitelist:
-            wl = {n(p) for p in players_whitelist}
-            if not any(n(x) in wl for x in players): return False
-        if players_exclude:
-            ex = {n(p) for p in players_exclude}
-            if any(n(x) in ex for x in players): return False
-        return True
-
-    candidates = coll_df[coll_df["players"].apply(_intersects_focus)].copy()
-    total_cards = int(candidates["qty"].sum())
-    total_types = int(len(candidates))
-
-    rival_norm = _norm_user(focus_rival) if focus_rival else None
-
-    scored: List[Dict[str, Any]] = []
-    for _, row in candidates.iterrows():
-        players, sp, qty = row["players"], int(row["sp"]), int(row["qty"])
-        card_id, card_no, card_name = row["card_id"], row["card_number"], row["card_name"]
-
-        best = None
-        k_max = max(1, min(qty, int(max_multiples_per_card)))
-        for k in range(1, k_max + 1):
-            # Build bundle deltas for this card (k copies)
-            bundle = [(players, sp)] * k
-            deltas = _bundle_to_deltas(bundle, rule=multi_subject_rule)
-            # stack baseline (if any)
-            for p, v in baseline_deltas.items():
-                deltas[p] = deltas.get(p, 0.0) + v
-
-            # Evaluate
-            res = _evaluate(lb_df, hold_df, deltas, me="Easystreet31",
-                            defend_buffer=defend_buffer, scope="portfolio_union",
-                            max_return_players=500, players_whitelist=None)
-            summary = _summarize_effect(res, defend_buffer=defend_buffer)
-
-            # Rival-aware features
-            rival_hits = {"took_first_from_rival": [], "shored_vs_rival": [], "entered_top3_over_rival": []}
-            for p in deltas.keys():
-                you_sp_before = int(hold_df.loc[hold_df["player"] == p, "sp"].iloc[0]) if (hold_df["player"] == p).any() else 0
-                you_sp_after  = int(you_sp_before + int(round(deltas.get(p, 0))))
-                rfx = _rival_impact_for_player(lb_df, me="Easystreet31", rival_norm=rival_norm,
-                                               player=p, you_sp_before=you_sp_before, you_sp_after=you_sp_after,
-                                               defend_buffer=defend_buffer)
-                if rfx["took_first"]: rival_hits["took_first_from_rival"].append(p)
-                if rfx["shored_vs_rival"]: rival_hits["shored_vs_rival"].append(p)
-                if rfx["entered_top3_over_rival"]: rival_hits["entered_top3_over_rival"].append(p)
-
-            # Scoring: QP first, then rival impact boosts
-            score = (summary["qp_delta"] * 1000
-                     + len(summary["promotions_to_first"]) * 50
-                     + len(summary["entries_top3"]) * 20
-                     + len(summary["shored_thin_firsts"]) * 10
-                     - summary["lost_firsts"] * 200
-                     - summary["created_thin_leads"] * 30)
-
-            if focus_rival:
-                score += (rival_score_weight * len(rival_hits["took_first_from_rival"])
-                          + 100 * len(rival_hits["shored_vs_rival"])
-                          + 60  * len(rival_hits["entered_top3_over_rival"]))
-
-            item = {
-                "card_id": card_id,
-                "card_number": card_no,
-                "card_name": card_name,
-                "players": players,
-                "sp": sp,
-                "available_qty": qty,
-                "take_n": k,
-                "score": score,
-                "rival_score": (score if focus_rival else 0),
-                "effects": summary,
-                "rival_effects": rival_hits
-            }
-
-            # If rival_only, keep only picks that actually interact with rival
-            rival_interacts = any(len(v) > 0 for v in rival_hits.values())
-            if rival_only and not rival_interacts:
-                continue
-
-            if (best is None) or (item["score"] > best["score"]):
-                best = item
-
-        if best:
-            scored.append(best)
-
-    # Rank the candidate set we’ll present
-    scored_sorted = sorted(scored, key=lambda r: (r["effects"]["qp_delta"], r["score"]), reverse=True)
-    if scan_top_candidates and scan_top_candidates > 0:
-        scored_sorted = scored_sorted[:int(scan_top_candidates)]
-
-    # Buckets
-    def cap(lst):
-        if max_each is None or max_each <= 0:
-            return lst, 0
-        omitted = max(0, len(lst) - max_each)
-        return lst[:max_each], omitted
-
-    qp_positive = [r for r in scored_sorted if r["effects"]["qp_delta"] > 0]
-    thin_shore  = [r for r in scored_sorted if r["effects"]["qp_delta"] >= 0 and len(r["effects"]["shored_thin_firsts"]) > 0]
-    take_first  = [r for r in scored_sorted if len(r["effects"]["promotions_to_first"]) > 0]
-    enter_top3  = [r for r in scored_sorted if len(r["effects"]["entries_top3"]) > 0]
-    rival_prio  = [r for r in scored_sorted if focus_rival and any(len(v) > 0 for v in r["rival_effects"].values())]
-    rival_prio  = sorted(rival_prio, key=lambda r: (len(r["rival_effects"]["took_first_from_rival"]),
-                                                    len(r["rival_effects"]["shored_vs_rival"]),
-                                                    len(r["rival_effects"]["entered_top3_over_rival"]),
-                                                    r["score"]), reverse=True)
-
-    pos_c,  pos_om  = cap(qp_positive)
-    sho_c,  sho_om  = cap(thin_shore)
-    fir_c,  fir_om  = cap(take_first)
-    top3_c, top3_om = cap(enter_top3)
-    riv_c,  riv_om  = cap(rival_prio)
-
-    return {
-        "params": {
-            "defend_buffer": defend_buffer, "upgrade_gap": upgrade_gap, "entry_gap": entry_gap,
-            "keep_buffer": keep_buffer, "max_each": max_each,
-            "max_multiples_per_card": max_multiples_per_card, "scan_top_candidates": scan_top_candidates,
-            "focus_rival": focus_rival, "rival_only": rival_only, "rival_score_weight": rival_score_weight
-        },
-        "collection_counts": {"card_types": total_types, "total_units": total_cards},
-        "qp_positive_picks": pos_c, "omitted_qp_positive": pos_om,
-        "shore_thin_from_collection": sho_c, "omitted_shore_thin": sho_om,
-        "take_first_from_collection": fir_c, "omitted_take_first": fir_om,
-        "enter_top3_from_collection": top3_c, "omitted_enter_top3": top3_om,
-        "rival_priority_picks": riv_c, "omitted_rival_priority": riv_om
-    }
-
-# -------------------- Routes --------------------
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-@app.post("/evaluate_by_urls_easystreet31")
-def evaluate_by_urls_easystreet31(payload: EvalByUrls):
-    try:
-        lb_raw = _fetch_table(str(payload.leaderboard_url))
-        hd_raw = _fetch_table(str(payload.holdings_url))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to fetch leaderboard/holdings: {e}")
-    try:
-        lb = _norm_lb(lb_raw);  hd = _norm_holdings(hd_raw)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to normalize inputs: {e}")
-
-    deltas = _trade_to_deltas(payload.trade, rule=payload.multi_subject_rule)
-    result = _evaluate(
-        lb, hd, deltas, me="Easystreet31",
-        defend_buffer=payload.defend_buffer,
-        scope=payload.scope,
-        max_return_players=payload.max_return_players,
-        players_whitelist=payload.players_whitelist
-    )
-    return JSONResponse(content=_json_safe(result))
-
-@app.post("/scan_by_urls_easystreet31")
-def scan_by_urls_easystreet31(payload: ScanByUrls):
-    try:
-        lb_raw = _fetch_table(str(payload.leaderboard_url))
-        hd_raw = _fetch_table(str(payload.holdings_url))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to fetch leaderboard/holdings: {e}")
-    try:
-        lb = _norm_lb(lb_raw);  hd = _norm_holdings(hd_raw)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to normalize inputs: {e}")
-
-    result = _scan(
-        lb, hd, me="Easystreet31",
-        defend_buffer=payload.defend_buffer,
-        upgrade_gap=payload.upgrade_gap,
-        entry_gap=payload.entry_gap,
-        keep_buffer=payload.keep_buffer,
-        max_each=payload.max_each,
-        players_whitelist=payload.players_whitelist,
-        players_exclude=payload.players_exclude
-    )
-    return JSONResponse(content=_json_safe(result))
-
-@app.post("/scan_rival_by_urls_easystreet31")
-def scan_rival_by_urls_easystreet31(payload: RivalScanByUrls):
-    try:
-        lb_raw = _fetch_table(str(payload.leaderboard_url))
-        hd_raw = _fetch_table(str(payload.holdings_url))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to fetch leaderboard/holdings: {e}")
-    try:
-        lb = _norm_lb(lb_raw);  hd = _norm_holdings(hd_raw)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to normalize inputs: {e}")
-
-    result = _scan_vs_rival(
-        lb, hd, me="Easystreet31", rival=payload.rival,
-        defend_buffer=payload.defend_buffer,
-        upgrade_gap=payload.upgrade_gap,
-        entry_gap=payload.entry_gap,
-        keep_buffer=payload.keep_buffer,
-        max_each=payload.max_each,
-        players_whitelist=payload.players_whitelist,
-        players_exclude=payload.players_exclude
-    )
-    return JSONResponse(content=_json_safe(result))
-
 @app.post("/review_collection_by_urls_easystreet31")
 def review_collection_by_urls_easystreet31(payload: CollectionReviewByUrls):
     try:
@@ -858,18 +625,22 @@ def review_collection_by_urls_easystreet31(payload: CollectionReviewByUrls):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to normalize inputs: {e}")
 
-    result = _review_collection(
-        lb_df=lb, hold_df=hd, coll_df=col, me="Easystreet31",
-        defend_buffer=payload.defend_buffer, upgrade_gap=payload.upgrade_gap,
-        entry_gap=payload.entry_gap, keep_buffer=payload.keep_buffer,
-        max_each=payload.max_each, max_multiples_per_card=payload.max_multiples_per_card,
-        scan_top_candidates=payload.scan_top_candidates,
-        multi_subject_rule=payload.multi_subject_rule,
-        players_whitelist=payload.players_whitelist,
-        players_exclude=payload.players_exclude,
-        baseline_trade=payload.baseline_trade,
-        focus_rival=payload.focus_rival,
-        rival_only=payload.rival_only,
-        rival_score_weight=payload.rival_score_weight
-    )
-    return JSONResponse(content=_json_safe(result))
+    try:
+        result = _review_collection(
+            lb_df=lb, hold_df=hd, coll_df=col, me="Easystreet31",
+            defend_buffer=payload.defend_buffer, upgrade_gap=payload.upgrade_gap,
+            entry_gap=payload.entry_gap, keep_buffer=payload.keep_buffer,
+            max_each=payload.max_each, max_multiples_per_card=payload.max_multiples_per_card,
+            scan_top_candidates=payload.scan_top_candidates,
+            multi_subject_rule=payload.multi_subject_rule,
+            players_whitelist=payload.players_whitelist,
+            players_exclude=payload.players_exclude,
+            baseline_trade=payload.baseline_trade,
+            focus_rival=payload.focus_rival,
+            rival_only=payload.rival_only,
+            rival_score_weight=payload.rival_score_weight
+        )
+        return JSONResponse(content=_json_safe(result))
+    except Exception as e:
+        # Convert any unexpected failure to a JSON response instead of 500
+        raise HTTPException(status_code=500, detail=f"Collection review failed internally: {e}")
