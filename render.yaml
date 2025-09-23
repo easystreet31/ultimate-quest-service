@@ -2,7 +2,7 @@ services:
   - type: web
     name: ultimate-quest-service
     env: python
-    plan: free
+    plan: starter           # was: free
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
