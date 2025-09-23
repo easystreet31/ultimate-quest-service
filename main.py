@@ -1,4 +1,4 @@
-# main.py — Ultimate Quest Service (Easystreet31)
+# main.py — Ultimate Quest Service (Easystreet31) — FIX: no suffix KeyError on second_sp
 # Endpoints:
 #   POST /evaluate_by_urls_easystreet31  (no-quantity trades, trade-scope response)
 #   POST /scan_by_urls_easystreet31      (Thin Leads / Upgrade Opps / Top-3 / Overshoots)
@@ -46,11 +46,11 @@ class EvalByUrls(BaseModel):
 class ScanByUrls(BaseModel):
     leaderboard_url: AnyUrl
     holdings_url: AnyUrl
-    defend_buffer: int = 20          # thin 1st threshold
-    upgrade_gap: int = 12            # 2nd -> 1st opportunities
-    entry_gap: int = 8               # into Top-3
-    keep_buffer: int = 30            # overshoot slack threshold
-    max_each: int = 25               # cap list size per section (smaller = cleaner output)
+    defend_buffer: int = 20
+    upgrade_gap: int = 12
+    entry_gap: int = 8
+    keep_buffer: int = 30
+    max_each: int = 25
     players_whitelist: Optional[List[str]] = None
     players_exclude: Optional[List[str]] = None
 
@@ -107,13 +107,11 @@ def _fetch_table(url: str) -> pd.DataFrame:
     raise HTTPException(status_code=400, detail="Unable to parse CSV after multiple encoding attempts.")
 
 def _short_user(u: str) -> str:
-    """Strip trailing '(digits)' id for display."""
     s = str(u or "").strip()
-    s = re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", s)
+    s = re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", s)  # strip trailing "(digits)"
     return re.sub(r"\s+", " ", s).strip()
 
 def _norm_user(u: str) -> str:
-    """Canonical form for equality: lowercased, no trailing '(digits)' id, single spaces."""
     return _short_user(u).lower()
 
 def _qp_from_rank(rank: int) -> int:
@@ -131,7 +129,6 @@ def _norm_lb(df: pd.DataFrame) -> pd.DataFrame:
     sp_col     = lower.get("sp")     or lower.get("points") or lower.get("score")
 
     if player_col not in d.columns:
-        # fallback: first object column
         obj = [c for c in d.columns if d[c].dtype == object]
         if not obj: raise HTTPException(status_code=400, detail="Leaderboard missing a 'player' column.")
         player_col = obj[0]
@@ -184,7 +181,7 @@ def _norm_holdings(df: pd.DataFrame) -> pd.DataFrame:
     out = out.sort_values(["player", "sp"], ascending=[True, False]).drop_duplicates("player", keep="first")
     return out[["player", "sp", "rank", "qp"]]
 
-# -------------------- Core rank logic (now alias-aware) --------------------
+# -------------------- Rank logic (alias-aware) --------------------
 def _rank_with_me(lb: pd.DataFrame, player: str, me: str, my_sp: int):
     me_norm = _norm_user(me)
     sub = lb[lb["player"] == player][["user", "user_norm", "sp"]].copy()
@@ -199,11 +196,11 @@ def _rank_with_me(lb: pd.DataFrame, player: str, me: str, my_sp: int):
             sub = pd.concat([sub, pd.DataFrame([{"user": me, "user_norm": me_norm, "sp": int(my_sp)}])], ignore_index=True)
 
     sub = sub.sort_values("sp", ascending=False).reset_index(drop=True)
-    # index of me
+
+    # my position
     my_idx = sub.index[sub["user_norm"] == me_norm]
     my_rank = int(my_idx[0] + 1) if len(my_idx) else 99
 
-    # top slots (labels shortened; 'YOU' if it's you)
     def _as_label(u_norm: str, u_raw: str) -> str:
         return "YOU" if u_norm == me_norm else _short_user(u_raw)
 
@@ -216,7 +213,7 @@ def _rank_with_me(lb: pd.DataFrame, player: str, me: str, my_sp: int):
 
     return my_rank, first_sp, second_sp, third_sp, first_usr, second_usr, third_usr
 
-# -------------------- Trade evaluation --------------------
+# -------------------- Trade → deltas --------------------
 def _trade_to_deltas(rows: List[TradeRow], rule: str = "full_each_unique") -> Dict[str, float]:
     agg: Dict[str, float] = {}
     for r in rows:
@@ -232,6 +229,7 @@ def _trade_to_deltas(rows: List[TradeRow], rule: str = "full_each_unique") -> Di
             agg[n] = agg.get(n, 0.0) + sign * per_player_sp
     return agg
 
+# -------------------- Evaluate trade (FIX: disambiguate second_sp columns) --------------------
 def _evaluate(lb_df: pd.DataFrame,
               hold_df: pd.DataFrame,
               deltas: Dict[str, float],
@@ -242,10 +240,7 @@ def _evaluate(lb_df: pd.DataFrame,
               players_whitelist: Optional[List[str]]) -> Dict[str, Any]:
 
     delta_keys = set(deltas.keys())
-    if scope == "trade_only":
-        players_all = sorted(delta_keys)
-    else:
-        players_all = sorted(set(hold_df["player"].tolist()) | delta_keys)
+    players_all = sorted(delta_keys) if scope == "trade_only" else sorted(set(hold_df["player"].tolist()) | delta_keys)
 
     if players_whitelist:
         wl = {re.sub(r"\s+", " ", p).strip() for p in players_whitelist}
@@ -254,27 +249,46 @@ def _evaluate(lb_df: pd.DataFrame,
     before_rows, after_rows = [], []
     for p in players_all:
         you_sp_before = int(hold_df.loc[hold_df["player"] == p, "sp"].iloc[0]) if (hold_df["player"] == p).any() else 0
-        r, f, s, t, fu, su, tu = _rank_with_me(lb_df, p, me, you_sp_before)
-        before_rows.append({"player": p, "you_sp": you_sp_before, "rank": r, "qp": _qp_from_rank(r),
-                            "first_sp": f, "second_sp": s, "third_sp": t})
 
+        # BEFORE
+        r, f, s, t, fu, su, tu = _rank_with_me(lb_df, p, me, you_sp_before)
+        before_rows.append({
+            "player": p, "you_sp": you_sp_before, "rank": r, "qp": _qp_from_rank(r),
+            "first_sp": f, "second_sp": s, "third_sp": t
+        })
+
+        # AFTER
         you_sp_after = int(you_sp_before + int(round(deltas.get(p, 0))))
         r2, f2, s2, t2, fu2, su2, tu2 = _rank_with_me(lb_df, p, me, you_sp_after)
-        after_rows.append({"player": p, "you_sp_after": you_sp_after, "rank_after": r2, "qp_after": _qp_from_rank(r2),
-                           "first_sp": f2, "second_sp": s2, "third_sp": t2})
+        after_rows.append({
+            "player": p, "you_sp_after": you_sp_after, "rank_after": r2, "qp_after": _qp_from_rank(r2),
+            # rename these to avoid merge collisions
+            "first_sp_after": f2, "second_sp_after": s2, "third_sp_after": t2
+        })
 
     before_df = pd.DataFrame(before_rows)
     after_df  = pd.DataFrame(after_rows)
+
+    # Merge with distinct column names (no _x/_y suffixes)
     cmp = pd.merge(before_df, after_df, on="player", how="outer").fillna(0)
+
+    # Deltas
     cmp["qp_delta"] = cmp["qp_after"] - cmp["qp"]
     cmp["sp_delta"] = cmp["you_sp_after"] - cmp["you_sp"]
-    cmp["margin_before"] = cmp.apply(lambda r: (r["you_sp"] - r["second_sp"]) if r["rank"] == 1 else None, axis=1)
-    cmp["margin_after"]  = cmp.apply(lambda r: (r["you_sp_after"] - r["second_sp"]) if r["rank_after"] == 1 else None, axis=1)
+
+    # Risks (use the correct "second" columns)
+    cmp["margin_before"] = cmp.apply(
+        lambda r: (r["you_sp"] - r["second_sp"]) if r["rank"] == 1 else None, axis=1
+    )
+    cmp["margin_after"]  = cmp.apply(
+        lambda r: (r["you_sp_after"] - r["second_sp_after"]) if r["rank_after"] == 1 else None, axis=1
+    )
     cmp["created_thin_lead"] = cmp.apply(
         lambda r: 1 if (r["rank_after"] == 1 and (r["margin_after"] is not None) and (r["margin_after"] <= defend_buffer)
                         and (r["margin_before"] is None or r["margin_before"] > defend_buffer)) else 0, axis=1)
     cmp["lost_first_place"] = cmp.apply(lambda r: 1 if (r["rank"] == 1 and r["rank_after"] != 1) else 0, axis=1)
 
+    # Trade-scope QP totals
     qp_total_before = int(before_df["qp"].sum())
     qp_total_after  = int(after_df["qp_after"].sum())
     qp_delta_total  = qp_total_after - qp_total_before
@@ -282,6 +296,7 @@ def _evaluate(lb_df: pd.DataFrame,
     verdict = "GREEN" if (qp_delta_total > 0 and cmp["lost_first_place"].sum() == 0 and cmp["created_thin_lead"].sum() == 0) \
               else ("AMBER" if qp_delta_total >= 0 else "RED")
 
+    # Keep response compact
     touched = cmp[(cmp["sp_delta"] != 0) | (cmp["qp_delta"] != 0) |
                   (cmp["created_thin_lead"] == 1) | (cmp["lost_first_place"] == 1) |
                   (cmp["player"].isin(delta_keys))].copy()
@@ -323,7 +338,6 @@ def _scan(lb_df: pd.DataFrame,
           players_whitelist: Optional[List[str]],
           players_exclude: Optional[List[str]]) -> Dict[str, Any]:
 
-    me_norm = _norm_user(me)
     players_all = sorted(set(hold_df["player"].tolist()) | set(lb_df["player"].tolist()))
     norm = lambda s: re.sub(r"\s+", " ", s).strip()
 
@@ -372,7 +386,7 @@ def _scan(lb_df: pd.DataFrame,
         ["player","you_sp","third_user","third_sp","gap_to_3rd","add_to_enter_top3"]
     ]
 
-    # Overshoots (> keep_buffer slack)
+    # Overshoots
     over = snap[snap["you_rank"] == 1].copy()
     over["margin"] = over["you_sp"] - over["second_sp"]
     overshoot = over[over["margin"] > keep_buffer].copy()
@@ -381,7 +395,7 @@ def _scan(lb_df: pd.DataFrame,
         ["player","you_sp","second_user","second_sp","margin","tradable_slack"]
     ]
 
-    # Rival watchlist (drop 'YOU')
+    # Rivals (exclude YOU)
     rivals = pd.concat([
         thin["second_user"].dropna().astype(str).str.strip(),
         upg["first_user"].dropna().astype(str).str.strip(),
