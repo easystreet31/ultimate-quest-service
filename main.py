@@ -3,7 +3,7 @@
 #   POST /evaluate_by_urls_easystreet31
 #   POST /scan_by_urls_easystreet31
 #   POST /scan_rival_by_urls_easystreet31      (no omissions if max_each<=0)
-#   POST /review_collection_by_urls_easystreet31  (qty-aware; now supports focus_rival)
+#   POST /review_collection_by_urls_easystreet31  (qty-aware; supports focus_rival; fault-tolerant)
 from typing import List, Literal, Dict, Any, Optional, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -11,6 +11,8 @@ from pydantic import BaseModel, AnyUrl
 import pandas as pd
 import numpy as np
 import io, re, zipfile, math
+
+SERVICE_VERSION = "3.2.1-collection-rival-robust"
 
 # ---- Robust URL fetch (requests if present; urllib fallback) ----
 try:
@@ -29,7 +31,7 @@ except Exception:
             final_url = resp.geturl()
             return data, ctype, final_url
 
-app = FastAPI(title="Ultimate Quest Service (Easystreet31)")
+app = FastAPI(title="Ultimate Quest Service (Easystreet31)", version=SERVICE_VERSION)
 
 # -------------------- Models --------------------
 class TradeRow(BaseModel):
@@ -88,10 +90,10 @@ class CollectionReviewByUrls(BaseModel):
     players_whitelist: Optional[List[str]] = None
     players_exclude: Optional[List[str]] = None
     baseline_trade: Optional[List[TradeRow]] = None
-    # NEW: rival focus
-    focus_rival: Optional[str] = None   # e.g., "chfkyle" or "Erikk"
-    rival_only: bool = False            # if True, return only picks that interact with the rival
-    rival_score_weight: int = 250       # weight per "took 1st from rival"; other rival effects get smaller weights
+    # rival focus
+    focus_rival: Optional[str] = None
+    rival_only: bool = False
+    rival_score_weight: int = 250
 
 # -------------------- JSON sanitization --------------------
 def _json_safe(obj: Any) -> Any:
@@ -340,7 +342,7 @@ def _evaluate(lb_df: pd.DataFrame,
 
     touched = cmp[(cmp["sp_delta"] != 0) | (cmp["qp_delta"] != 0) |
                   (cmp["created_thin_lead"] == 1) | (cmp["lost_first_place"] == 1) |
-                  (cmp["player"].isin(delta_keys))].copy()
+                  (cmp["player"].isin(players_all))].copy()
 
     touched = touched.sort_values(["qp_delta", "sp_delta"], ascending=[False, False])
     per_player = touched[["player","you_sp","you_sp_after","sp_delta","rank","rank_after","qp","qp_after","qp_delta",
@@ -589,15 +591,12 @@ def _rival_impact_for_player(lb_df: pd.DataFrame,
 
     shored = False
     if r1 == 1 and sn1 == rival_norm:
-        # margin vs rival (before)
         margin_before = you_sp_before - s1
-        # margin vs rival (after)
         if sn2 == rival_norm:
             margin_after = you_sp_after - s2
         elif tn2 == rival_norm:
             margin_after = you_sp_after - t2
         else:
-            # rival fell out of top-3; treat as safely shored
             margin_after = defend_buffer + 1
         shored = (margin_before <= defend_buffer and margin_after > defend_buffer)
 
@@ -609,7 +608,277 @@ def _rival_impact_for_player(lb_df: pd.DataFrame,
         "entered_top3_over_rival": bool(entered_top3_over)
     }
 
-# -------------------- Build recommendations from a collection (now rival-aware) --------------------
+# -------------------- Build recommendations from a collection (rival-aware, fault-tolerant) --------------------
+def _review_collection(lb_df: pd.DataFrame,
+                       hold_df: pd.DataFrame,
+                       coll_df: pd.DataFrame,
+                       me: str,
+                       defend_buffer: int,
+                       upgrade_gap: int,
+                       entry_gap: int,
+                       keep_buffer: int,
+                       max_each: int,
+                       max_multiples_per_card: int,
+                       scan_top_candidates: int,
+                       multi_subject_rule: str,
+                       players_whitelist: Optional[List[str]],
+                       players_exclude: Optional[List[str]],
+                       baseline_trade: Optional[List[TradeRow]],
+                       focus_rival: Optional[str],
+                       rival_only: bool,
+                       rival_score_weight: int) -> Dict[str, Any]:
+
+    baseline_deltas = _trade_to_deltas(baseline_trade, rule=multi_subject_rule) if baseline_trade else {}
+
+    def _intersects_focus(players: List[str]) -> bool:
+        if not players_whitelist and not players_exclude: return True
+        n = lambda s: re.sub(r"\s+", " ", s).strip()
+        if players_whitelist:
+            wl = {n(p) for p in players_whitelist}
+            if not any(n(x) in wl for x in players): return False
+        if players_exclude:
+            ex = {n(p) for p in players_exclude}
+            if any(n(x) in ex for x in players): return False
+        return True
+
+    candidates = coll_df[coll_df["players"].apply(_intersects_focus)].copy()
+    total_cards = int(candidates["qty"].sum())
+    total_types = int(len(candidates))
+
+    rival_norm = _norm_user(focus_rival) if focus_rival else None
+
+    scored: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    skipped_no_rival: int = 0
+
+    for _, row in candidates.iterrows():
+        try:
+            players = row["players"]
+            sp      = int(row["sp"])
+            qty     = int(row["qty"])
+            card_id, card_no, card_name = row["card_id"], row["card_number"], row["card_name"]
+
+            if not isinstance(players, list) or len(players) == 0 or qty <= 0 or sp <= 0:
+                continue
+
+            best = None
+            k_max = max(1, min(qty, int(max_multiples_per_card)))
+
+            for k in range(1, k_max + 1):
+                try:
+                    bundle = [(players, sp)] * k
+                    deltas = _bundle_to_deltas(bundle, rule=multi_subject_rule)
+                    for p, v in baseline_deltas.items():
+                        deltas[p] = deltas.get(p, 0.0) + v
+
+                    res = _evaluate(lb_df, hold_df, deltas, me="Easystreet31",
+                                    defend_buffer=defend_buffer, scope="portfolio_union",
+                                    max_return_players=500, players_whitelist=None)
+                    summary = _summarize_effect(res, defend_buffer=defend_buffer)
+
+                    rival_hits = {"took_first_from_rival": [], "shored_vs_rival": [], "entered_top3_over_rival": []}
+                    if rival_norm:
+                        for p in deltas.keys():
+                            you_sp_before = int(hold_df.loc[hold_df["player"] == p, "sp"].iloc[0]) if (hold_df["player"] == p).any() else 0
+                            you_sp_after  = int(you_sp_before + int(round(deltas.get(p, 0))))
+                            rfx = _rival_impact_for_player(lb_df, me="Easystreet31", rival_norm=rival_norm,
+                                                           player=p, you_sp_before=you_sp_before, you_sp_after=you_sp_after,
+                                                           defend_buffer=defend_buffer)
+                            if rfx["took_first"]: rival_hits["took_first_from_rival"].append(p)
+                            if rfx["shored_vs_rival"]: rival_hits["shored_vs_rival"].append(p)
+                            if rfx["entered_top3_over_rival"]: rival_hits["entered_top3_over_rival"].append(p)
+
+                    score = (summary["qp_delta"] * 1000
+                             + len(summary["promotions_to_first"]) * 50
+                             + len(summary["entries_top3"]) * 20
+                             + len(summary["shored_thin_firsts"]) * 10
+                             - summary["lost_firsts"] * 200
+                             - summary["created_thin_leads"] * 30)
+
+                    if rival_norm:
+                        score += (rival_score_weight * len(rival_hits["took_first_from_rival"])
+                                  + 100 * len(rival_hits["shored_vs_rival"])
+                                  + 60  * len(rival_hits["entered_top3_over_rival"]))
+
+                    item = {
+                        "card_id": card_id,
+                        "card_number": card_no,
+                        "card_name": card_name,
+                        "players": players,
+                        "sp": sp,
+                        "available_qty": qty,
+                        "take_n": k,
+                        "score": int(score),
+                        "rival_score": int(score if rival_norm else 0),
+                        "effects": summary,
+                        "rival_effects": rival_hits
+                    }
+
+                    if rival_only:
+                        rival_interacts = any(len(v) > 0 for v in rival_hits.values())
+                        if not rival_interacts:
+                            continue
+
+                    if (best is None) or (item["score"] > best["score"]):
+                        best = item
+
+                except Exception as inner_e:
+                    errors.append({
+                        "card": f"{card_no} — {card_name}",
+                        "take_n": str(k),
+                        "error": str(inner_e)[:220]
+                    })
+                    continue
+
+            if rival_only and best is None:
+                skipped_no_rival += 1
+
+            if best:
+                scored.append(best)
+
+        except Exception as outer_e:
+            errors.append({
+                "card": f"{row.get('card_number', '?')} — {row.get('card_name', '?')}",
+                "take_n": "n/a",
+                "error": str(outer_e)[:220]
+            })
+            continue
+
+    scored_sorted = sorted(scored, key=lambda r: (r["effects"]["qp_delta"], r["score"]), reverse=True)
+    if scan_top_candidates and scan_top_candidates > 0:
+        scored_sorted = scored_sorted[:int(scan_top_candidates)]
+
+    def cap(lst):
+        if max_each is None or max_each <= 0:
+            return lst, 0
+        omitted = max(0, len(lst) - max_each)
+        return lst[:max_each], omitted
+
+    qp_positive = [r for r in scored_sorted if r["effects"]["qp_delta"] > 0]
+    thin_shore  = [r for r in scored_sorted if r["effects"]["qp_delta"] >= 0 and len(r["effects"]["shored_thin_firsts"]) > 0]
+    take_first  = [r for r in scored_sorted if len(r["effects"]["promotions_to_first"]) > 0]
+    enter_top3  = [r for r in scored_sorted if len(r["effects"]["entries_top3"]) > 0]
+    rival_prio  = [r for r in scored_sorted if focus_rival and any(len(v) > 0 for v in r["rival_effects"].values())]
+    rival_prio  = sorted(rival_prio, key=lambda r: (len(r["rival_effects"]["took_first_from_rival"]),
+                                                    len(r["rival_effects"]["shored_vs_rival"]),
+                                                    len(r["rival_effects"]["entered_top3_over_rival"]),
+                                                    r["score"]), reverse=True)
+
+    pos_c,  pos_om  = cap(qp_positive)
+    sho_c,  sho_om  = cap(thin_shore)
+    fir_c,  fir_om  = cap(take_first)
+    top3_c, top3_om = cap(enter_top3)
+    riv_c,  riv_om  = cap(rival_prio)
+
+    error_samples = errors[:5]
+
+    return {
+        "params": {
+            "defend_buffer": defend_buffer, "upgrade_gap": upgrade_gap, "entry_gap": entry_gap,
+            "keep_buffer": keep_buffer, "max_each": max_each,
+            "max_multiples_per_card": max_multiples_per_card, "scan_top_candidates": scan_top_candidates,
+            "focus_rival": focus_rival, "rival_only": rival_only, "rival_score_weight": rival_score_weight
+        },
+        "collection_counts": {"card_types": total_types, "total_units": total_cards},
+        "qp_positive_picks": pos_c, "omitted_qp_positive": pos_om,
+        "shore_thin_from_collection": sho_c, "omitted_shore_thin": sho_om,
+        "take_first_from_collection": fir_c, "omitted_take_first": fir_om,
+        "enter_top3_from_collection": top3_c, "omitted_enter_top3": top3_om,
+        "rival_priority_picks": riv_c, "omitted_rival_priority": riv_om,
+        "diagnostics": {
+            "errors_count": len(errors),
+            "error_samples": error_samples,
+            "skipped_because_rival_only": skipped_no_rival
+        }
+    }
+
+# -------------------- Routes --------------------
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.get("/info")
+def info():
+    # tiny helper so you can confirm which code is live
+    routes = [r.path for r in app.routes if hasattr(r, "path")]
+    return {"version": SERVICE_VERSION, "routes": sorted(routes)}
+
+@app.post("/evaluate_by_urls_easystreet31")
+def evaluate_by_urls_easystreet31(payload: EvalByUrls):
+    try:
+        lb_raw = _fetch_table(str(payload.leaderboard_url))
+        hd_raw = _fetch_table(str(payload.holdings_url))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch leaderboard/holdings: {e}")
+    try:
+        lb = _norm_lb(lb_raw);  hd = _norm_holdings(hd_raw)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to normalize inputs: {e}")
+
+    deltas = _trade_to_deltas(payload.trade, rule=payload.multi_subject_rule)
+    result = _evaluate(
+        lb, hd, deltas, me="Easystreet31",
+        defend_buffer=payload.defend_buffer,
+        scope=payload.scope,
+        max_return_players=payload.max_return_players,
+        players_whitelist=payload.players_whitelist
+    )
+    return JSONResponse(content=_json_safe(result))
+
+@app.post("/scan_by_urls_easystreet31")
+def scan_by_urls_easystreet31(payload: ScanByUrls):
+    try:
+        lb_raw = _fetch_table(str(payload.leaderboard_url))
+        hd_raw = _fetch_table(str(payload.holdings_url))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch leaderboard/holdings: {e}")
+    try:
+        lb = _norm_lb(lb_raw);  hd = _norm_holdings(hd_raw)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to normalize inputs: {e}")
+
+    result = _scan(
+        lb, hd, me="Easystreet31",
+        defend_buffer=payload.defend_buffer,
+        upgrade_gap=payload.upgrade_gap,
+        entry_gap=payload.entry_gap,
+        keep_buffer=payload.keep_buffer,
+        max_each=payload.max_each,
+        players_whitelist=payload.players_whitelist,
+        players_exclude=payload.players_exclude
+    )
+    return JSONResponse(content=_json_safe(result))
+
+@app.post("/scan_rival_by_urls_easystreet31")
+def scan_rival_by_urls_easystreet31(payload: RivalScanByUrls):
+    try:
+        lb_raw = _fetch_table(str(payload.leaderboard_url))
+        hd_raw = _fetch_table(str(payload.holdings_url))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch leaderboard/holdings: {e}")
+    try:
+        lb = _norm_lb(lb_raw);  hd = _norm_holdings(hd_raw)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to normalize inputs: {e}")
+
+    result = _scan_vs_rival(
+        lb, hd, me="Easystreet31", rival=payload.rival,
+        defend_buffer=payload.defend_buffer,
+        upgrade_gap=payload.upgrade_gap,
+        entry_gap=payload.entry_gap,
+        keep_buffer=payload.keep_buffer,
+        max_each=payload.max_each,
+        players_whitelist=payload.players_whitelist,
+        players_exclude=payload.players_exclude
+    )
+    return JSONResponse(content=_json_safe(result))
+
 @app.post("/review_collection_by_urls_easystreet31")
 def review_collection_by_urls_easystreet31(payload: CollectionReviewByUrls):
     try:
@@ -642,5 +911,5 @@ def review_collection_by_urls_easystreet31(payload: CollectionReviewByUrls):
         )
         return JSONResponse(content=_json_safe(result))
     except Exception as e:
-        # Convert any unexpected failure to a JSON response instead of 500
+        # Convert any unexpected failure to JSON instead of 500 NameError
         raise HTTPException(status_code=500, detail=f"Collection review failed internally: {e}")
