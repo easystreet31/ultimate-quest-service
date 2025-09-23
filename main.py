@@ -1,8 +1,8 @@
 # main.py — Ultimate Quest Service (Easystreet31)
-# Endpoints:
-#   POST /evaluate_by_urls_easystreet31   (no-qty trade evaluator, tiny response)
+# Small-payload endpoints:
+#   POST /evaluate_by_urls_easystreet31   (no-qty trade evaluator)
 #   POST /scan_by_urls_easystreet31       (Daily scan: Thin/Upgrade/Top3/Overshoot)
-#   POST /scan_rival_by_urls_easystreet31 (Daily scan focused on one rival)
+#   POST /scan_rival_by_urls_easystreet31 (Daily scan vs one rival)  <-- max_each <= 0 => NO OMISSIONS
 from typing import List, Literal, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -65,7 +65,8 @@ class RivalScanByUrls(BaseModel):
     upgrade_gap: int = 12
     entry_gap: int = 8
     keep_buffer: int = 30
-    max_each: int = 25
+    # IMPORTANT: 0 or negative => unlimited (no omissions)
+    max_each: int = 0
     players_whitelist: Optional[List[str]] = None
     players_exclude: Optional[List[str]] = None
 
@@ -86,8 +87,7 @@ def _json_safe(obj: Any) -> Any:
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
-        f = float(obj)
-        return f if math.isfinite(f) else None
+        f = float(obj);  return f if math.isfinite(f) else None
     if isinstance(obj, float):
         return obj if math.isfinite(obj) else None
     try:
@@ -104,21 +104,17 @@ def _json_safe(obj: Any) -> Any:
         pass
     return obj
 
-# -------------------- Normalization helpers --------------------
+# -------------------- Helpers --------------------
 def _normalize_gsheets_url(url: str, prefer_xlsx: bool = True) -> str:
-    if "docs.google.com/spreadsheets" not in url:
-        return url
+    if "docs.google.com/spreadsheets" not in url: return url
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
-    if not m:
-        return url
+    if not m: return url
     doc_id = m.group(1)
     return f"https://docs.google.com/spreadsheets/d/{doc_id}/export?format=" + ("xlsx" if prefer_xlsx else "csv")
 
 def _looks_like_xlsx(url: str, content_type: str, head: bytes) -> bool:
-    if url.lower().endswith((".xlsx", ".xls")):
-        return True
-    if "spreadsheetml" in content_type or "ms-excel" in content_type:
-        return True
+    if url.lower().endswith((".xlsx", ".xls")): return True
+    if "spreadsheetml" in content_type or "ms-excel" in content_type: return True
     return head[:2] == b"PK"
 
 def _fetch_table(url: str) -> pd.DataFrame:
@@ -131,8 +127,7 @@ def _fetch_table(url: str) -> pd.DataFrame:
             frames = []
             for sheet in xls.sheet_names:
                 df = xls.parse(sheet)
-                if df.empty or (df.dropna(how="all").shape[0] == 0):
-                    continue
+                if df.empty or (df.dropna(how="all").shape[0] == 0): continue
                 df = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed", na=False)]
                 df["__sheet__"] = sheet
                 frames.append(df)
@@ -164,8 +159,7 @@ def _qp_from_rank(rank: int) -> int:
 
 # -------------------- Table normalization --------------------
 def _norm_lb(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.copy()
-    d = d.dropna(how="all")
+    d = df.copy().dropna(how="all")
     d = d.loc[:, ~d.columns.astype(str).str.contains("^Unnamed", na=False)]
     lower = {c.lower(): c for c in d.columns}
 
@@ -198,8 +192,7 @@ def _norm_lb(df: pd.DataFrame) -> pd.DataFrame:
     return out[out["rank"] <= 5][["player", "user", "user_norm", "sp", "rank"]]
 
 def _norm_holdings(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.copy()
-    d = d.dropna(how="all")
+    d = df.copy().dropna(how="all")
     d = d.loc[:, ~d.columns.astype(str).str.contains("^Unnamed", na=False)]
     lower = {c.lower(): c for c in d.columns}
 
@@ -269,8 +262,7 @@ def _trade_to_deltas(rows: List[TradeRow], rule: str = "full_each_unique") -> Di
         players_raw = re.sub(r"\s+", " ", r.players).strip()
         names = [p.strip() for p in players_raw.split("/") if p.strip()]
         if rule == "full_each_unique":
-            names = list(dict.fromkeys(names))
-            per_player_sp = float(r.sp)
+            names = list(dict.fromkeys(names)); per_player_sp = float(r.sp)
         else:
             per_player_sp = float(r.sp) / max(1, len(names))
         sign = +1.0 if r.side == "GET" else -1.0
@@ -299,17 +291,13 @@ def _evaluate(lb_df: pd.DataFrame,
         you_sp_before = int(hold_df.loc[hold_df["player"] == p, "sp"].iloc[0]) if (hold_df["player"] == p).any() else 0
 
         r, f, s, t, fu, su, tu, fn, sn, tn = _rank_with_me(lb_df, p, me, you_sp_before)
-        before_rows.append({
-            "player": p, "you_sp": you_sp_before, "rank": r, "qp": _qp_from_rank(r),
-            "first_sp": f, "second_sp": s, "third_sp": t
-        })
+        before_rows.append({"player": p, "you_sp": you_sp_before, "rank": r, "qp": _qp_from_rank(r),
+                            "first_sp": f, "second_sp": s, "third_sp": t})
 
         you_sp_after = int(you_sp_before + int(round(deltas.get(p, 0))))
         r2, f2, s2, t2, fu2, su2, tu2, fn2, sn2, tn2 = _rank_with_me(lb_df, p, me, you_sp_after)
-        after_rows.append({
-            "player": p, "you_sp_after": you_sp_after, "rank_after": r2, "qp_after": _qp_from_rank(r2),
-            "first_sp_after": f2, "second_sp_after": s2, "third_sp_after": t2
-        })
+        after_rows.append({"player": p, "you_sp_after": you_sp_after, "rank_after": r2, "qp_after": _qp_from_rank(r2),
+                           "first_sp_after": f2, "second_sp_after": s2, "third_sp_after": t2})
 
     before_df = pd.DataFrame(before_rows)
     after_df  = pd.DataFrame(after_rows)
@@ -318,12 +306,8 @@ def _evaluate(lb_df: pd.DataFrame,
     cmp["qp_delta"] = cmp["qp_after"] - cmp["qp"]
     cmp["sp_delta"] = cmp["you_sp_after"] - cmp["you_sp"]
 
-    cmp["margin_before"] = cmp.apply(
-        lambda r: (r["you_sp"] - r["second_sp"]) if r["rank"] == 1 else None, axis=1
-    )
-    cmp["margin_after"]  = cmp.apply(
-        lambda r: (r["you_sp_after"] - r["second_sp_after"]) if r["rank_after"] == 1 else None, axis=1
-    )
+    cmp["margin_before"] = cmp.apply(lambda r: (r["you_sp"] - r["second_sp"]) if r["rank"] == 1 else None, axis=1)
+    cmp["margin_after"]  = cmp.apply(lambda r: (r["you_sp_after"] - r["second_sp_after"]) if r["rank_after"] == 1 else None, axis=1)
     cmp["created_thin_lead"] = cmp.apply(
         lambda r: 1 if (r["rank_after"] == 1 and (r["margin_after"] is not None) and (r["margin_after"] <= defend_buffer)
                         and (r["margin_before"] is None or r["margin_before"] > defend_buffer)) else 0, axis=1)
@@ -341,10 +325,8 @@ def _evaluate(lb_df: pd.DataFrame,
                   (cmp["player"].isin(delta_keys))].copy()
 
     touched = touched.sort_values(["qp_delta", "sp_delta"], ascending=[False, False])
-    per_player = touched[[
-        "player","you_sp","you_sp_after","sp_delta","rank","rank_after","qp","qp_after","qp_delta",
-        "margin_before","margin_after","created_thin_lead","lost_first_place"
-    ]]
+    per_player = touched[["player","you_sp","you_sp_after","sp_delta","rank","rank_after","qp","qp_after","qp_delta",
+                          "margin_before","margin_after","created_thin_lead","lost_first_place"]]
 
     omitted = 0
     if len(per_player) > max_return_players:
@@ -356,10 +338,8 @@ def _evaluate(lb_df: pd.DataFrame,
         "portfolio_qp_after":  qp_total_after,
         "portfolio_qp_delta":  qp_delta_total,
         "buffer_target":       defend_buffer,
-        "risks": {
-            "lost_firsts": int(cmp["lost_first_place"].sum()),
-            "created_thin_leads": int(cmp["created_thin_lead"].sum()),
-        },
+        "risks": { "lost_firsts": int(cmp["lost_first_place"].sum()),
+                   "created_thin_leads": int(cmp["created_thin_lead"].sum()) },
         "per_player": per_player,
         "omitted_players": omitted,
         "verdict": verdict
@@ -381,54 +361,42 @@ def _scan(lb_df: pd.DataFrame,
     norm = lambda s: re.sub(r"\s+", " ", s).strip()
 
     if players_whitelist:
-        wl = {norm(p) for p in players_whitelist}
-        players_all = [p for p in players_all if norm(p) in wl]
+        wl = {norm(p) for p in players_whitelist};  players_all = [p for p in players_all if norm(p) in wl]
     if players_exclude:
-        ex = {norm(p) for p in players_exclude}
-        players_all = [p for p in players_all if norm(p) not in ex]
+        ex = {norm(p) for p in players_exclude};    players_all = [p for p in players_all if norm(p) not in ex]
 
     rows = []
     for p in players_all:
         you_sp = int(hold_df.loc[hold_df["player"] == p, "sp"].iloc[0]) if (hold_df["player"] == p).any() else 0
         r, f, s, t, fu, su, tu, fn, sn, tn = _rank_with_me(lb_df, p, me, you_sp)
-        rows.append({
-            "player": p, "you_sp": you_sp, "you_rank": r,
-            "first_sp": f, "second_sp": s, "third_sp": t,
-            "first_user": fu, "second_user": su, "third_user": tu
-        })
+        rows.append({"player": p, "you_sp": you_sp, "you_rank": r,
+                     "first_sp": f, "second_sp": s, "third_sp": t,
+                     "first_user": fu, "second_user": su, "third_user": tu})
     snap = pd.DataFrame(rows)
 
     thin = snap[snap["you_rank"] == 1].copy()
     thin["margin"] = thin["you_sp"] - thin["second_sp"]
     thin = thin[thin["margin"] <= defend_buffer]
     thin["add_to_buffer"] = (defend_buffer + 1 - thin["margin"]).clip(lower=0).astype(int)
-    thin = thin.sort_values("margin", ascending=True)[
-        ["player","you_sp","second_user","second_sp","margin","add_to_buffer"]
-    ]
+    thin = thin.sort_values("margin", ascending=True)[["player","you_sp","second_user","second_sp","margin","add_to_buffer"]]
 
     upg = snap[snap["you_rank"] == 2].copy()
     upg["gap_to_1st"] = upg["first_sp"] - upg["you_sp"]
     upg = upg[upg["gap_to_1st"] <= upgrade_gap]
     upg["add_to_take_1st"] = (upg["gap_to_1st"] + 1).clip(lower=0).astype(int)
-    upg = upg.sort_values("gap_to_1st", ascending=True)[
-        ["player","you_sp","first_user","first_sp","gap_to_1st","add_to_take_1st"]
-    ]
+    upg = upg.sort_values("gap_to_1st", ascending=True)[["player","you_sp","first_user","first_sp","gap_to_1st","add_to_take_1st"]]
 
     entry = snap[snap["you_rank"] > 3].copy()
     entry["gap_to_3rd"] = entry["third_sp"] - entry["you_sp"]
     entry = entry[(entry["gap_to_3rd"] >= 0) & (entry["gap_to_3rd"] <= entry_gap)]
     entry["add_to_enter_top3"] = (entry["gap_to_3rd"] + 1).astype(int)
-    entry = entry.sort_values("gap_to_3rd", ascending=True)[
-        ["player","you_sp","third_user","third_sp","gap_to_3rd","add_to_enter_top3"]
-    ]
+    entry = entry.sort_values("gap_to_3rd", ascending=True)[["player","you_sp","third_user","third_sp","gap_to_3rd","add_to_enter_top3"]]
 
     over = snap[snap["you_rank"] == 1].copy()
     over["margin"] = over["you_sp"] - over["second_sp"]
     overshoot = over[over["margin"] > keep_buffer].copy()
     overshoot["tradable_slack"] = (overshoot["margin"] - keep_buffer).astype(int)
-    overshoot = overshoot.sort_values("tradable_slack", ascending=False)[
-        ["player","you_sp","second_user","second_sp","margin","tradable_slack"]
-    ]
+    overshoot = overshoot.sort_values("tradable_slack", ascending=False)[["player","you_sp","second_user","second_sp","margin","tradable_slack"]]
 
     rivals = pd.concat([
         thin["second_user"].dropna().astype(str).str.strip(),
@@ -439,39 +407,29 @@ def _scan(lb_df: pd.DataFrame,
     rival_counts = rivals.value_counts().reset_index()
     rival_counts.columns = ["rival_user", "mentions"]
 
-    def cap(df):
+    def cap_df(df):
         omitted = max(0, len(df) - max_each)
         return df.head(max_each), omitted
 
-    thin_c, thin_om = cap(thin)
-    upg_c, upg_om   = cap(upg)
-    ent_c, ent_om   = cap(entry)
-    ovr_c, ovr_om   = cap(overshoot)
-    rv_c, rv_om     = cap(rival_counts)
+    thin_c, thin_om = cap_df(thin)
+    upg_c,  upg_om  = cap_df(upg)
+    ent_c,  ent_om  = cap_df(entry)
+    ovr_c,  ovr_om  = cap_df(overshoot)
+    rv_c,   rv_om   = cap_df(rival_counts)
 
     return {
-        "params": {
-            "defend_buffer": defend_buffer, "upgrade_gap": upgrade_gap,
-            "entry_gap": entry_gap, "keep_buffer": keep_buffer, "max_each": max_each
-        },
-        "counts": {
-            "thin": len(thin), "upgrades": len(upg),
-            "top3_entries": len(entry), "overshoots": len(overshoot),
-            "rivals": len(rival_counts)
-        },
-        "thin_leads": thin_c,
-        "omitted_thin": thin_om,
-        "upgrade_opps": upg_c,
-        "omitted_upgrades": upg_om,
-        "top3_entries": ent_c,
-        "omitted_top3": ent_om,
-        "overshoots": ovr_c,
-        "omitted_overshoots": ovr_om,
-        "rival_watchlist": rv_c,
-        "omitted_rivals": rv_om
+        "params": { "defend_buffer": defend_buffer, "upgrade_gap": upgrade_gap,
+                    "entry_gap": entry_gap, "keep_buffer": keep_buffer, "max_each": max_each },
+        "counts": { "thin": len(thin), "upgrades": len(upg),
+                    "top3_entries": len(entry), "overshoots": len(overshoot), "rivals": len(rival_counts) },
+        "thin_leads": thin_c, "omitted_thin": thin_om,
+        "upgrade_opps": upg_c, "omitted_upgrades": upg_om,
+        "top3_entries": ent_c, "omitted_top3": ent_om,
+        "overshoots": ovr_c, "omitted_overshoots": ovr_om,
+        "rival_watchlist": rv_c, "omitted_rivals": rv_om
     }
 
-# -------------------- Rival-focused scan --------------------
+# -------------------- Rival-focused scan (NO OMISSIONS if max_each <= 0) --------------------
 def _scan_vs_rival(lb_df: pd.DataFrame,
                    hold_df: pd.DataFrame,
                    me: str,
@@ -491,11 +449,9 @@ def _scan_vs_rival(lb_df: pd.DataFrame,
     norm = lambda s: re.sub(r"\s+", " ", s).strip()
 
     if players_whitelist:
-        wl = {norm(p) for p in players_whitelist}
-        players_all = [p for p in players_all if norm(p) in wl]
+        wl = {norm(p) for p in players_whitelist}; players_all = [p for p in players_all if norm(p) in wl]
     if players_exclude:
-        ex = {norm(p) for p in players_exclude}
-        players_all = [p for p in players_all if norm(p) not in ex]
+        ex = {norm(p) for p in players_exclude};   players_all = [p for p in players_all if norm(p) not in ex]
 
     thin_rows, upg_rows, ent_rows, ovr_rows = [], [], [], []
 
@@ -503,65 +459,53 @@ def _scan_vs_rival(lb_df: pd.DataFrame,
         you_sp = int(hold_df.loc[hold_df["player"] == p, "sp"].iloc[0]) if (hold_df["player"] == p).any() else 0
         r, f, s, t, fu, su, tu, fn, sn, tn = _rank_with_me(lb_df, p, me, you_sp)
 
-        # You 1st, rival 2nd -> thin vs rival
+        # You 1st, rival 2nd
         if r == 1 and sn == rival_norm:
             margin = you_sp - s
             addbuf = max(0, defend_buffer + 1 - margin)
             if margin <= defend_buffer:
-                thin_rows.append({
-                    "player": p, "you_sp": you_sp, "rival": rival_label, "rival_sp": s,
-                    "margin": int(margin), "add_to_buffer": int(addbuf)
-                })
+                thin_rows.append({"player": p, "you_sp": you_sp, "rival": rival_label, "rival_sp": s,
+                                  "margin": int(margin), "add_to_buffer": int(addbuf)})
             if margin > keep_buffer:
-                ovr_rows.append({
-                    "player": p, "you_sp": you_sp, "rival": rival_label, "rival_sp": s,
-                    "margin": int(margin), "tradable_slack": int(margin - keep_buffer)
-                })
+                ovr_rows.append({"player": p, "you_sp": you_sp, "rival": rival_label, "rival_sp": s,
+                                 "margin": int(margin), "tradable_slack": int(margin - keep_buffer)})
 
-        # Rival 1st, you 2nd -> upgrade vs rival
+        # Rival 1st, you 2nd
         if r == 2 and fn == rival_norm:
             gap = f - you_sp
             if gap <= upgrade_gap:
-                upg_rows.append({
-                    "player": p, "you_sp": you_sp, "rival": rival_label, "rival_sp": f,
-                    "gap_to_rival": int(gap), "add_to_take_1st": int(gap + 1)
-                })
+                upg_rows.append({"player": p, "you_sp": you_sp, "rival": rival_label, "rival_sp": f,
+                                 "gap_to_rival": int(gap), "add_to_take_1st": int(gap + 1)})
 
-        # Rival 3rd, you outside top3 -> entry vs rival
+        # Rival 3rd, you outside top‑3
         if r > 3 and tn == rival_norm:
             gap3 = t - you_sp
             if 0 <= gap3 <= entry_gap:
-                ent_rows.append({
-                    "player": p, "you_sp": you_sp, "rival": rival_label, "rival_sp": t,
-                    "gap_to_3rd": int(gap3), "add_to_enter_top3": int(gap3 + 1)
-                })
+                ent_rows.append({"player": p, "you_sp": you_sp, "rival": rival_label, "rival_sp": t,
+                                 "gap_to_3rd": int(gap3), "add_to_enter_top3": int(gap3 + 1)})
 
-    # Cap lists
+    # cap() honors "no omission" when max_each <= 0
     def cap(lst):
+        if max_each is None or max_each <= 0:
+            return lst, 0
         omitted = max(0, len(lst) - max_each)
         return lst[:max_each], omitted
 
     thin_c, thin_om = cap(sorted(thin_rows, key=lambda r: r["margin"]))
-    upg_c, upg_om   = cap(sorted(upg_rows, key=lambda r: r["gap_to_rival"]))
-    ent_c, ent_om   = cap(sorted(ent_rows, key=lambda r: r["gap_to_3rd"]))
-    ovr_c, ovr_om   = cap(sorted(ovr_rows, key=lambda r: r["tradable_slack"], reverse=True))
+    upg_c,  upg_om  = cap(sorted(upg_rows,  key=lambda r: r["gap_to_rival"]))
+    ent_c,  ent_om  = cap(sorted(ent_rows,  key=lambda r: r["gap_to_3rd"]))
+    ovr_c,  ovr_om  = cap(sorted(ovr_rows,  key=lambda r: r["tradable_slack"], reverse=True))
 
     return {
-        "params": {
-            "rival": rival_label,
-            "defend_buffer": defend_buffer, "upgrade_gap": upgrade_gap,
-            "entry_gap": entry_gap, "keep_buffer": keep_buffer, "max_each": max_each
-        },
-        "counts": {
-            "thin_vs_rival": len(thin_rows),
-            "upgrade_vs_rival": len(upg_rows),
-            "entry_vs_rival": len(ent_rows),
-            "overshoot_vs_rival": len(ovr_rows)
-        },
-        "thin_vs_rival": thin_c,                 "omitted_thin": thin_om,
-        "upgrade_vs_rival": upg_c,               "omitted_upgrades": upg_om,
-        "entry_vs_rival": ent_c,                 "omitted_top3": ent_om,
-        "overshoot_vs_rival": ovr_c,             "omitted_overshoots": ovr_om
+        "params": { "rival": rival_label,
+                    "defend_buffer": defend_buffer, "upgrade_gap": upgrade_gap,
+                    "entry_gap": entry_gap, "keep_buffer": keep_buffer, "max_each": max_each },
+        "counts": { "thin_vs_rival": len(thin_rows), "upgrade_vs_rival": len(upg_rows),
+                    "entry_vs_rival": len(ent_rows), "overshoot_vs_rival": len(ovr_rows) },
+        "thin_vs_rival": thin_c,            "omitted_thin": thin_om,
+        "upgrade_vs_rival": upg_c,          "omitted_upgrades": upg_om,
+        "entry_vs_rival": ent_c,            "omitted_top3": ent_om,
+        "overshoot_vs_rival": ovr_c,        "omitted_overshoots": ovr_om
     }
 
 # -------------------- Routes --------------------
@@ -577,7 +521,7 @@ def evaluate_by_urls_easystreet31(payload: EvalByUrls):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to fetch leaderboard/holdings: {e}")
     try:
-        lb = _norm_lb(lb_raw); hd = _norm_holdings(hd_raw)
+        lb = _norm_lb(lb_raw);  hd = _norm_holdings(hd_raw)
     except HTTPException:
         raise
     except Exception as e:
@@ -601,7 +545,7 @@ def scan_by_urls_easystreet31(payload: ScanByUrls):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to fetch leaderboard/holdings: {e}")
     try:
-        lb = _norm_lb(lb_raw); hd = _norm_holdings(hd_raw)
+        lb = _norm_lb(lb_raw);  hd = _norm_holdings(hd_raw)
     except HTTPException:
         raise
     except Exception as e:
@@ -627,7 +571,7 @@ def scan_rival_by_urls_easystreet31(payload: RivalScanByUrls):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to fetch leaderboard/holdings: {e}")
     try:
-        lb = _norm_lb(lb_raw); hd = _norm_holdings(hd_raw)
+        lb = _norm_lb(lb_raw);  hd = _norm_holdings(hd_raw)
     except HTTPException:
         raise
     except Exception as e:
@@ -639,7 +583,7 @@ def scan_rival_by_urls_easystreet31(payload: RivalScanByUrls):
         upgrade_gap=payload.upgrade_gap,
         entry_gap=payload.entry_gap,
         keep_buffer=payload.keep_buffer,
-        max_each=payload.max_each,
+        max_each=payload.max_each,                    # <= 0 means NO OMISSIONS
         players_whitelist=payload.players_whitelist,
         players_exclude=payload.players_exclude
     )
