@@ -4,6 +4,7 @@
 #   POST /scan_by_urls_easystreet31
 #   POST /scan_rival_by_urls_easystreet31
 #   POST /review_collection_by_urls_easystreet31
+#   POST /scan_partner_by_urls_easystreet31   <-- NEW
 from typing import List, Literal, Dict, Any, Optional, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -12,9 +13,9 @@ import pandas as pd
 import numpy as np
 import io, re, zipfile, math
 
-SERVICE_VERSION = "3.2.3-collection-rival-fast"
+SERVICE_VERSION = "3.3.0-partner-opps"
 
-# ---- Robust URL fetch (requests if present; urllib fallback) ----
+# ---- Robust URL fetch ----
 try:
     import requests
     def _fetch(url: str, timeout: int = 25):
@@ -68,7 +69,7 @@ class RivalScanByUrls(BaseModel):
     upgrade_gap: int = 12
     entry_gap: int = 8
     keep_buffer: int = 30
-    max_each: int = 0            # <=0 => no omissions
+    max_each: int = 0
     players_whitelist: Optional[List[str]] = None
     players_exclude: Optional[List[str]] = None
 
@@ -81,7 +82,7 @@ class CollectionReviewByUrls(BaseModel):
     upgrade_gap: int = 12
     entry_gap: int = 8
     keep_buffer: int = 30
-    max_each: int = 25                  # <=0 => show all
+    max_each: int = 25
     max_multiples_per_card: int = 3
     scan_top_candidates: int = 60
     players_whitelist: Optional[List[str]] = None
@@ -90,6 +91,19 @@ class CollectionReviewByUrls(BaseModel):
     focus_rival: Optional[str] = None
     rival_only: bool = False
     rival_score_weight: int = 250
+
+# NEW: Partner opportunities
+class PartnerOppsByUrls(BaseModel):
+    leaderboard_url: AnyUrl
+    holdings_url: AnyUrl
+    partner: str
+    target_rivals: Optional[List[str]] = None
+    max_sp_to_gain: int = 25          # ignore unrealistic asks
+    protect_qp: bool = True           # do not reduce Easystreet31's QP
+    protect_buffer: Optional[int] = None  # if set (e.g., 20), keep YOUR margin >= this when you’re 1st
+    max_each: int = 50                # <=0 => no omissions
+    players_whitelist: Optional[List[str]] = None
+    players_exclude: Optional[List[str]] = None
 
 # -------------------- JSON sanitization --------------------
 def _json_safe(obj: Any) -> Any:
@@ -238,7 +252,7 @@ def _norm_holdings(df: pd.DataFrame) -> pd.DataFrame:
     out = out.sort_values(["player", "sp"], ascending=[True, False]).drop_duplicates("player", keep="first")
     return out[["player", "sp", "rank", "qp"]]
 
-# -------------------- Rank logic --------------------
+# -------------------- Rank helper --------------------
 def _rank_with_me(lb: pd.DataFrame, player: str, me: str, my_sp: int):
     me_norm = _norm_user(me)
     sub = lb[lb["player"] == player][["user", "user_norm", "sp"]].copy()
@@ -286,16 +300,14 @@ def _trade_to_deltas(rows: Optional[List[TradeRow]], rule: str = "full_each_uniq
             agg[n] = agg.get(n, 0.0) + sign * per_player_sp
     return agg
 
-# -------------------- NEW: bundle (N copies of one card) → deltas --------------------
+# NEW: bundle → deltas
 def _bundle_to_deltas(bundle: List[Tuple[List[str], int]], rule: str = "full_each_unique") -> Dict[str, float]:
     deltas: Dict[str, float] = {}
     for players, sp in bundle:
         if rule == "full_each_unique":
-            names = list(dict.fromkeys(players))
-            per = float(sp)
+            names = list(dict.fromkeys(players)); per = float(sp)
         else:
-            names = list(players)
-            per = float(sp) / max(1, len(names))
+            names = list(players); per = float(sp) / max(1, len(names))
         for n in names:
             deltas[n] = deltas.get(n, 0.0) + per
     return deltas
@@ -375,96 +387,49 @@ def _evaluate(lb_df: pd.DataFrame,
         "verdict": verdict
     }
 
-# -------------------- Daily scans --------------------
-def _scan(lb_df: pd.DataFrame,
-          hold_df: pd.DataFrame,
-          me: str,
-          defend_buffer: int,
-          upgrade_gap: int,
-          entry_gap: int,
-          keep_buffer: int,
-          max_each: int,
-          players_whitelist: Optional[List[str]],
-          players_exclude: Optional[List[str]]) -> Dict[str, Any]:
-    players_all = sorted(set(hold_df["player"].tolist()) | set(lb_df["player"].tolist()))
-    norm = lambda s: re.sub(r"\s+", " ", s).strip()
-    if players_whitelist:
-        wl = {norm(p) for p in players_whitelist};  players_all = [p for p in players_all if norm(p) in wl]
-    if players_exclude:
-        ex = {norm(p) for p in players_exclude};    players_all = [p for p in players_all if norm(p) not in ex]
+# -------------------- Scans (daily / rival) --------------------
+def _scan(...):
+    # (unchanged)  <<< KEEP YOUR EXISTING _scan BODY HERE >>>
+    ...
 
-    rows = []
-    for p in players_all:
-        you_sp = int(hold_df.loc[hold_df["player"] == p, "sp"].iloc[0]) if (hold_df["player"] == p).any() else 0
-        r, f, s, t, fu, su, tu, fn, sn, tn = _rank_with_me(lb_df, p, me, you_sp)
-        rows.append({"player": p, "you_sp": you_sp, "you_rank": r,
-                     "first_sp": f, "second_sp": s, "third_sp": t,
-                     "first_user": fu, "second_user": su, "third_user": tu})
-    snap = pd.DataFrame(rows)
+def _scan_vs_rival(...):
+    # (unchanged)  <<< KEEP YOUR EXISTING _scan_vs_rival BODY HERE >>>
+    ...
 
-    thin = snap[snap["you_rank"] == 1].copy()
-    thin["margin"] = thin["you_sp"] - thin["second_sp"]
-    thin = thin[thin["margin"] <= defend_buffer]
-    thin["add_to_buffer"] = (defend_buffer + 1 - thin["margin"]).clip(lower=0).astype(int)
-    thin = thin.sort_values("margin", ascending=True)[["player","you_sp","second_user","second_sp","margin","add_to_buffer"]]
+# -------------------- Collection normalizer & review (fast) --------------------
+def _norm_collection(...):
+    # (unchanged)  <<< KEEP YOUR EXISTING _norm_collection BODY HERE >>>
+    ...
 
-    upg = snap[snap["you_rank"] == 2].copy()
-    upg["gap_to_1st"] = upg["first_sp"] - upg["you_sp"]
-    upg = upg[upg["gap_to_1st"] <= upgrade_gap]
-    upg["add_to_take_1st"] = (upg["gap_to_1st"] + 1).clip(lower=0).astype(int)
-    upg = upg.sort_values("gap_to_1st", ascending=True)[["player","you_sp","first_user","first_sp","gap_to_1st","add_to_take_1st"]]
+def _summarize_effect(...):
+    # (unchanged)  <<< KEEP YOUR EXISTING _summarize_effect BODY HERE >>>
+    ...
 
-    entry = snap[snap["you_rank"] > 3].copy()
-    entry["gap_to_3rd"] = entry["third_sp"] - entry["you_sp"]
-    entry = entry[(entry["gap_to_3rd"] >= 0) & (entry["gap_to_3rd"] <= entry_gap)]
-    entry["add_to_enter_top3"] = (entry["gap_to_3rd"] + 1).astype(int)
-    entry = entry.sort_values("gap_to_3rd", ascending=True)[["player","you_sp","third_user","third_sp","gap_to_3rd","add_to_enter_top3"]]
+def _rival_impact_for_player(...):
+    # (unchanged)  <<< KEEP YOUR EXISTING _rival_impact_for_player BODY HERE >>>
+    ...
 
-    over = snap[snap["you_rank"] == 1].copy()
-    over["margin"] = over["you_sp"] - over["second_sp"]
-    overshoot = over[over["margin"] > keep_buffer].copy()
-    overshoot["tradable_slack"] = (overshoot["margin"] - keep_buffer).astype(int)
-    overshoot = overshoot.sort_values("tradable_slack", ascending=False)[["player","you_sp","second_user","second_sp","margin","tradable_slack"]]
+def _review_collection(...):
+    # (unchanged; already uses scope='trade_only' for speed)  <<< KEEP YOUR EXISTING BODY HERE >>>
+    ...
 
-    rivals = pd.concat([
-        thin["second_user"].dropna().astype(str).str.strip(),
-        upg["first_user"].dropna().astype(str).str.strip(),
-        entry["third_user"].dropna().astype(str).str.strip()
-    ], ignore_index=True)
-    rivals = rivals[rivals.str.upper() != "YOU"]
-    rival_counts = rivals.value_counts().reset_index()
-    rival_counts.columns = ["rival_user", "mentions"]
+# -------------------- NEW: scan partner opportunities --------------------
+def _scan_partner_opps(lb_df: pd.DataFrame,
+                       hold_df: pd.DataFrame,
+                       me: str,
+                       partner: str,
+                       target_rivals: Optional[List[str]],
+                       max_sp_to_gain: int,
+                       protect_qp: bool,
+                       protect_buffer: Optional[int],
+                       max_each: int,
+                       players_whitelist: Optional[List[str]],
+                       players_exclude: Optional[List[str]]) -> Dict[str, Any]:
 
-    def cap_df(df):
-        omitted = max(0, len(df) - max_each)
-        return df.head(max_each), omitted
+    me_norm = _norm_user(me)
+    partner_norm = _norm_user(partner)
+    rivals_norm = { _norm_user(r) for r in (target_rivals or []) }
 
-    thin_c, thin_om = cap_df(thin)
-    upg_c,  upg_om  = cap_df(upg)
-    ent_c,  ent_om  = cap_df(entry)
-    ovr_c,  ovr_om  = cap_df(overshoot)
-    rv_c,   rv_om   = cap_df(rival_counts)
-
-    return {
-        "params": { "defend_buffer": defend_buffer, "upgrade_gap": upgrade_gap,
-                    "entry_gap": entry_gap, "keep_buffer": keep_buffer, "max_each": max_each },
-        "counts": { "thin": len(thin), "upgrades": len(upg),
-                    "top3_entries": len(entry), "overshoots": len(overshoot), "rivals": len(rival_counts) },
-        "thin_leads": thin_c, "omitted_thin": thin_om,
-        "upgrade_opps": upg_c, "omitted_upgrades": upg_om,
-        "top3_entries": ent_c, "omitted_top3": ent_om,
-        "overshoots": ovr_c, "omitted_overshoots": ovr_om,
-        "rival_watchlist": rv_c, "omitted_rivals": rv_om
-    }
-
-def _scan_vs_rival(lb_df: pd.DataFrame,
-                   hold_df: pd.DataFrame,
-                   me: str, rival: str,
-                   defend_buffer: int, upgrade_gap: int, entry_gap: int, keep_buffer: int,
-                   max_each: int,
-                   players_whitelist: Optional[List[str]],
-                   players_exclude: Optional[List[str]]) -> Dict[str, Any]:
-    rival_norm = _norm_user(rival); rival_label = _short_user(rival)
     players_all = sorted(set(hold_df["player"].tolist()) | set(lb_df["player"].tolist()))
     norm = lambda s: re.sub(r"\s+", " ", s).strip()
     if players_whitelist:
@@ -472,321 +437,123 @@ def _scan_vs_rival(lb_df: pd.DataFrame,
     if players_exclude:
         ex = {norm(p) for p in players_exclude};   players_all = [p for p in players_all if norm(p) not in ex]
 
-    thin_rows, upg_rows, ent_rows, ovr_rows = [], [], [], []
+    def qp_for_index(i: int) -> int:
+        return 5 if i == 0 else 3 if i == 1 else 1 if i == 2 else 0
+
+    def rank_list(rows):
+        return sorted(rows, key=lambda r: (-int(r["sp"]), r["_order"]))
+
+    def get_rank(ranked, u_norm):
+        for i, c in enumerate(ranked):
+            if c["user_norm"] == u_norm:
+                return i + 1
+        return 99
+
+    opportunities = []
     for p in players_all:
         you_sp = int(hold_df.loc[hold_df["player"] == p, "sp"].iloc[0]) if (hold_df["player"] == p).any() else 0
-        r, f, s, t, fu, su, tu, fn, sn, tn = _rank_with_me(lb_df, p, me, you_sp)
 
-        if r == 1 and sn == rival_norm:
-            margin = you_sp - s
-            addbuf = max(0, defend_buffer + 1 - margin)
-            if margin <= defend_buffer:
-                thin_rows.append({"player": p, "you_sp": you_sp, "rival": rival_label, "rival_sp": s,
-                                  "margin": int(margin), "add_to_buffer": int(addbuf)})
-            if margin > keep_buffer:
-                ovr_rows.append({"player": p, "you_sp": you_sp, "rival": rival_label, "rival_sp": s,
-                                 "margin": int(margin), "tradable_slack": int(margin - keep_buffer)})
+        sub = lb_df[lb_df["player"] == p][["user","user_norm","sp"]].copy()
+        comps = []
+        for idx, r in sub.iterrows():
+            comps.append({"user": r["user"], "user_norm": r["user_norm"], "sp": int(r["sp"]), "_order": len(comps)})
 
-        if r == 2 and fn == rival_norm:
-            gap = f - you_sp
-            if gap <= upgrade_gap:
-                upg_rows.append({"player": p, "you_sp": you_sp, "rival": rival_label, "rival_sp": f,
-                                 "gap_to_rival": int(gap), "add_to_take_1st": int(gap + 1)})
-
-        if r > 3 and tn == rival_norm:
-            gap3 = t - you_sp
-            if 0 <= gap3 <= entry_gap:
-                ent_rows.append({"player": p, "you_sp": you_sp, "rival": rival_label, "rival_sp": t,
-                                 "gap_to_3rd": int(gap3), "add_to_enter_top3": int(gap3 + 1)})
-
-    def cap(lst):
-        if max_each is None or max_each <= 0:
-            return lst, 0
-        omitted = max(0, len(lst) - max_each)
-        return lst[:max_each], omitted
-
-    thin_c, thin_om = cap(sorted(thin_rows, key=lambda r: r["margin"]))
-    upg_c,  upg_om  = cap(sorted(upg_rows,  key=lambda r: r["gap_to_rival"]))
-    ent_c,  ent_om  = cap(sorted(ent_rows,  key=lambda r: r["gap_to_3rd"]))
-    ovr_c,  ovr_om  = cap(sorted(ovr_rows,  key=lambda r: r["tradable_slack"], reverse=True))
-
-    return {
-        "params": { "rival": rival_label,
-                    "defend_buffer": defend_buffer, "upgrade_gap": upgrade_gap,
-                    "entry_gap": entry_gap, "keep_buffer": keep_buffer, "max_each": max_each },
-        "counts": { "thin_vs_rival": len(thin_rows), "upgrade_vs_rival": len(upg_rows),
-                    "entry_vs_rival": len(ent_rows), "overshoot_vs_rival": len(ovr_rows) },
-        "thin_vs_rival": thin_c, "omitted_thin": thin_om,
-        "upgrade_vs_rival": upg_c, "omitted_upgrades": upg_om,
-        "entry_vs_rival": ent_c, "omitted_top3": ent_om,
-        "overshoot_vs_rival": ovr_c, "omitted_overshoots": ovr_om
-    }
-
-# -------------------- Collection normalizer --------------------
-def _norm_collection(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.copy().dropna(how="all")
-    d = d.loc[:, ~d.columns.astype(str).str.contains("^Unnamed", na=False)]
-    lower = {c.lower(): c for c in d.columns}
-
-    player_col = lower.get("player") or lower.get("players") or lower.get("subject") or lower.get("name")
-    sp_col     = lower.get("sp") or lower.get("subject points") or lower.get("points")
-    qty_col    = lower.get("their qty") or lower.get("qty") or lower.get("quantity") or lower.get("count")
-    name_col   = lower.get("card name") or lower.get("name")
-    num_col    = lower.get("card number") or lower.get("card #") or lower.get("no") or lower.get("number")
-
-    if not player_col or not sp_col:
-        raise HTTPException(status_code=400, detail="Collection missing required columns (Player, SP).")
-    if not qty_col:
-        d["__qty__"] = 1; qty_col = "__qty__"
-    if not num_col:
-        d["__id__"] = d.get(name_col, pd.Series([""] * len(d))); num_col = "__id__"
-
-    out = d[[player_col, sp_col, qty_col, name_col, num_col]].copy()
-    out.columns = ["players_raw", "sp", "qty", "card_name", "card_number"]
-
-    out["sp"] = pd.to_numeric(out["sp"], errors="coerce").fillna(0).astype(int)
-    out["qty"] = pd.to_numeric(out["qty"], errors="coerce").fillna(0).astype(int)
-    out["players_raw"] = out["players_raw"].astype(str).str.strip()
-    out["players"] = out["players_raw"].apply(lambda s: [p.strip() for p in s.split("/") if p.strip()])
-    out["players"] = out["players"].apply(lambda li: list(dict.fromkeys(li)))
-
-    grp = out.groupby(["card_number", "card_name", "sp"], as_index=False)["qty"].sum()
-    first_players = out.groupby(["card_number", "card_name", "sp"])["players"].first().reset_index()
-    merged = pd.merge(grp, first_players, on=["card_number", "card_name", "sp"], how="left")
-    merged["card_id"] = merged["card_number"].astype(str) + " — " + merged["card_name"].astype(str)
-    merged = merged[merged["qty"] > 0].reset_index(drop=True)
-    return merged[["card_id", "card_number", "card_name", "players", "sp", "qty"]]
-
-# -------------------- Effects summarizer --------------------
-def _summarize_effect(eval_result: Dict[str, Any], defend_buffer: int) -> Dict[str, Any]:
-    per = pd.DataFrame(eval_result["per_player"])
-    promos_first, promos_top3, shored = [], [], []
-    if not per.empty:
-        for _, r in per.iterrows():
-            before, after = int(r["rank"]), int(r["rank_after"])
-            mb, ma = r.get("margin_before"), r.get("margin_after")
-            if before != 1 and after == 1: promos_first.append(str(r["player"]))
-            if before > 3 and after <= 3:  promos_top3.append(str(r["player"]))
-            if before == 1 and (mb is not None) and (ma is not None) and (mb <= defend_buffer) and (ma > defend_buffer):
-                shored.append(str(r["player"]))
-    return {
-        "promotions_to_first": sorted(list(dict.fromkeys(promos_first))),
-        "entries_top3":        sorted(list(dict.fromkeys(promos_top3))),
-        "shored_thin_firsts":  sorted(list(dict.fromkeys(shored))),
-        "lost_firsts":         int(eval_result["risks"]["lost_firsts"]),
-        "created_thin_leads":  int(eval_result["risks"]["created_thin_leads"]),
-        "qp_delta":            int(eval_result["portfolio_qp_delta"])
-    }
-
-# -------------------- Rival-aware impact --------------------
-def _rival_impact_for_player(lb_df: pd.DataFrame,
-                             me: str,
-                             rival_norm: Optional[str],
-                             player: str,
-                             you_sp_before: int,
-                             you_sp_after: int,
-                             defend_buffer: int) -> Dict[str, Any]:
-    if not rival_norm:
-        return {"took_first": False, "shored_vs_rival": False, "entered_top3_over_rival": False}
-
-    r1, f1, s1, t1, fu1, su1, tu1, fn1, sn1, tn1 = _rank_with_me(lb_df, player, me, you_sp_before)
-    r2, f2, s2, t2, fu2, su2, tu2, fn2, sn2, tn2 = _rank_with_me(lb_df, player, me, you_sp_after)
-
-    took_first = (r1 == 2 and fn1 == rival_norm and r2 == 1)
-
-    shored = False
-    if r1 == 1 and sn1 == rival_norm:
-        margin_before = you_sp_before - s1
-        if sn2 == rival_norm:
-            margin_after = you_sp_after - s2
-        elif tn2 == rival_norm:
-            margin_after = you_sp_after - t2
+        # ensure YOU + partner entries
+        present_you = any(c["user_norm"] == me_norm for c in comps)
+        present_partner = any(c["user_norm"] == partner_norm for c in comps)
+        if present_you:
+            for c in comps:
+                if c["user_norm"] == me_norm: c["sp"] = you_sp
         else:
-            margin_after = defend_buffer + 1
-        shored = (margin_before <= defend_buffer and margin_after > defend_buffer)
+            comps.append({"user": "YOU", "user_norm": me_norm, "sp": you_sp, "_order": 1000})
+        partner_sp = 0
+        if present_partner:
+            for c in comps:
+                if c["user_norm"] == partner_norm: partner_sp = int(c["sp"])
+        else:
+            comps.append({"user": partner, "user_norm": partner_norm, "sp": 0, "_order": 1001})
 
-    entered_top3_over = (r1 > 3 and tn1 == rival_norm and r2 <= 3)
+        before = rank_list([dict(c) for c in comps])
+        you_rank_before = get_rank(before, me_norm);  yqp_before = qp_for_index(you_rank_before - 1)
+        partner_rank_before = get_rank(before, partner_norm); pqp_before = qp_for_index(partner_rank_before - 1)
 
-    return {
-        "took_first": bool(took_first),
-        "shored_vs_rival": bool(shored),
-        "entered_top3_over_rival": bool(entered_top3_over)
-    }
+        first_sp  = before[0]["sp"] if len(before) > 0 else 0
+        second_sp = before[1]["sp"] if len(before) > 1 else 0
+        third_sp  = before[2]["sp"] if len(before) > 2 else 0
 
-# -------------------- Collection review (qty-aware, rival-aware, fast) --------------------
-def _review_collection(lb_df: pd.DataFrame,
-                       hold_df: pd.DataFrame,
-                       coll_df: pd.DataFrame,
-                       me: str,
-                       defend_buffer: int,
-                       upgrade_gap: int,
-                       entry_gap: int,
-                       keep_buffer: int,
-                       max_each: int,
-                       max_multiples_per_card: int,
-                       scan_top_candidates: int,
-                       multi_subject_rule: str,
-                       players_whitelist: Optional[List[str]],
-                       players_exclude: Optional[List[str]],
-                       baseline_trade: Optional[List[TradeRow]],
-                       focus_rival: Optional[str],
-                       rival_only: bool,
-                       rival_score_weight: int) -> Dict[str, Any]:
-
-    baseline_deltas = _trade_to_deltas(baseline_trade, rule=multi_subject_rule) if baseline_trade else {}
-
-    def _intersects_focus(players: List[str]) -> bool:
-        if not players_whitelist and not players_exclude: return True
-        n = lambda s: re.sub(r"\s+", " ", s).strip()
-        if players_whitelist:
-            wl = {n(p) for p in players_whitelist}
-            if not any(n(x) in wl for x in players): return False
-        if players_exclude:
-            ex = {n(p) for p in players_exclude}
-            if any(n(x) in ex for x in players): return False
-        return True
-
-    candidates = coll_df[coll_df["players"].apply(_intersects_focus)].copy()
-    total_cards = int(candidates["qty"].sum())
-    total_types = int(len(candidates))
-
-    rival_norm = _norm_user(focus_rival) if focus_rival else None
-
-    scored: List[Dict[str, Any]] = []
-    errors: List[Dict[str, str]] = []
-    skipped_no_rival: int = 0
-
-    for _, row in candidates.iterrows():
-        try:
-            players = row["players"]
-            sp      = int(row["sp"])
-            qty     = int(row["qty"])
-            card_id, card_no, card_name = row["card_id"], row["card_number"], row["card_name"]
-
-            if not isinstance(players, list) or len(players) == 0 or qty <= 0 or sp <= 0:
+        # try for 3rd, 2nd, 1st (in that order)
+        for target_rank, thr in ((3, third_sp), (2, second_sp), (1, first_sp)):
+            needed = max(0, int(thr) - int(partner_sp) + 1)
+            if needed <= 0:  # already at/above this rank
+                continue
+            if max_sp_to_gain is not None and needed > int(max_sp_to_gain):
                 continue
 
-            best = None
-            k_max = max(1, min(qty, int(max_multiples_per_card)))
+            after_comps = [dict(c) for c in comps]
+            for c in after_comps:
+                if c["user_norm"] == partner_norm:
+                    c["sp"] = int(c["sp"]) + int(needed)
 
-            for k in range(1, k_max + 1):
-                try:
-                    bundle = [(players, sp)] * k
-                    deltas = _bundle_to_deltas(bundle, rule=multi_subject_rule)
-                    for p, v in baseline_deltas.items():
-                        deltas[p] = deltas.get(p, 0.0) + v
-
-                    # *** PERFORMANCE TWEAK: evaluate only touched players ***
-                    res = _evaluate(lb_df, hold_df, deltas, me="Easystreet31",
-                                    defend_buffer=defend_buffer, scope="trade_only",
-                                    max_return_players=60, players_whitelist=list(deltas.keys()))
-                    summary = _summarize_effect(res, defend_buffer=defend_buffer)
-
-                    rival_hits = {"took_first_from_rival": [], "shored_vs_rival": [], "entered_top3_over_rival": []}
-                    if rival_norm:
-                        for p in deltas.keys():
-                            you_sp_before = int(hold_df.loc[hold_df["player"] == p, "sp"].iloc[0]) if (hold_df["player"] == p).any() else 0
-                            you_sp_after  = int(you_sp_before + int(round(deltas.get(p, 0))))
-                            rfx = _rival_impact_for_player(lb_df, me="Easystreet31", rival_norm=rival_norm,
-                                                           player=p, you_sp_before=you_sp_before, you_sp_after=you_sp_after,
-                                                           defend_buffer=defend_buffer)
-                            if rfx["took_first"]: rival_hits["took_first_from_rival"].append(p)
-                            if rfx["shored_vs_rival"]: rival_hits["shored_vs_rival"].append(p)
-                            if rfx["entered_top3_over_rival"]: rival_hits["entered_top3_over_rival"].append(p)
-
-                    score = (summary["qp_delta"] * 1000
-                             + len(summary["promotions_to_first"]) * 50
-                             + len(summary["entries_top3"]) * 20
-                             + len(summary["shored_thin_firsts"]) * 10
-                             - summary["lost_firsts"] * 200
-                             - summary["created_thin_leads"] * 30)
-
-                    if rival_norm:
-                        score += (rival_score_weight * len(rival_hits["took_first_from_rival"])
-                                  + 100 * len(rival_hits["shored_vs_rival"])
-                                  + 60  * len(rival_hits["entered_top3_over_rival"]))
-
-                    item = {
-                        "card_id": card_id,
-                        "card_number": card_no,
-                        "card_name": card_name,
-                        "players": players,
-                        "sp": sp,
-                        "available_qty": qty,
-                        "take_n": k,
-                        "score": int(score),
-                        "rival_score": int(score if rival_norm else 0),
-                        "effects": summary,
-                        "rival_effects": rival_hits
-                    }
-
-                    if rival_only:
-                        rival_interacts = any(len(v) > 0 for v in rival_hits.values())
-                        if not rival_interacts:
-                            continue
-
-                    if (best is None) or (item["score"] > best["score"]):
-                        best = item
-
-                except Exception as inner_e:
-                    errors.append({"card": f"{card_no} — {card_name}", "take_n": str(k), "error": str(inner_e)[:220]})
+            after = rank_list(after_comps)
+            you_rank_after = get_rank(after, me_norm); yqp_after = qp_for_index(you_rank_after - 1)
+            if protect_qp and (yqp_after < yqp_before):
+                continue
+            if protect_buffer and you_rank_after == 1:
+                second_after_sp = after[1]["sp"] if len(after) > 1 else 0
+                margin_after = int(you_sp) - int(second_after_sp)
+                if margin_after < int(protect_buffer):
                     continue
 
-            if rival_only and best is None:
-                skipped_no_rival += 1
-            if best:
-                scored.append(best)
+            partner_rank_after = get_rank(after, partner_norm); pqp_after = qp_for_index(partner_rank_after - 1)
+            partner_qp_delta = pqp_after - pqp_before
+            if partner_qp_delta <= 0:
+                continue
 
-        except Exception as outer_e:
-            errors.append({"card": f"{row.get('card_number','?')} — {row.get('card_name','?')}", "take_n": "n/a", "error": str(outer_e)[:220]})
-            continue
+            # who loses QP?
+            before_qp = {}
+            for i, c in enumerate(before[:3]): before_qp[c["user_norm"]] = qp_for_index(i)
+            after_qp  = {}
+            for i, c in enumerate(after[:3]):  after_qp[c["user_norm"]]  = qp_for_index(i)
 
-    scored_sorted = sorted(scored, key=lambda r: (r["effects"]["qp_delta"], r["score"]), reverse=True)
-    if scan_top_candidates and scan_top_candidates > 0:
-        scored_sorted = scored_sorted[:int(scan_top_candidates)]
+            hurts, hurts_target = [], []
+            pool = after + before
+            for u_norm, q0 in before_qp.items():
+                q1 = after_qp.get(u_norm, 0)
+                if q1 < q0 and u_norm not in (me_norm, partner_norm):
+                    raw = next((c["user"] for c in pool if c["user_norm"] == u_norm), u_norm)
+                    delta = q1 - q0  # negative
+                    entry = {"user": _short_user(raw), "qp_change": int(delta)}
+                    hurts.append(entry)
+                    if u_norm in rivals_norm: hurts_target.append(entry)
 
-    def cap(lst):
-        if max_each is None or max_each <= 0:
-            return lst, 0
-        omitted = max(0, len(lst) - max_each)
-        return lst[:max_each], omitted
+            score = (1000 if len(hurts_target) > 0 else 0) + partner_qp_delta * 100 - needed
+            opportunities.append({
+                "player": p,
+                "partner_target_rank": int(partner_rank_after),
+                "partner_needed_sp": int(needed),
+                "partner_qp_delta": int(partner_qp_delta),
+                "your_status": {"rank": int(you_rank_before), "rank_after": int(you_rank_after),
+                                "qp": int(yqp_before), "qp_after": int(yqp_after)},
+                "hurts": hurts,
+                "hurts_target_rival": bool(hurts_target),
+                "score": int(score)
+            })
 
-    qp_positive = [r for r in scored_sorted if r["effects"]["qp_delta"] > 0]
-    thin_shore  = [r for r in scored_sorted if r["effects"]["qp_delta"] >= 0 and len(r["effects"]["shored_thin_firsts"]) > 0]
-    take_first  = [r for r in scored_sorted if len(r["effects"]["promotions_to_first"]) > 0]
-    enter_top3  = [r for r in scored_sorted if len(r["effects"]["entries_top3"]) > 0]
-    rival_prio  = [r for r in scored_sorted if focus_rival and any(len(v) > 0 for v in r["rival_effects"].values())]
-    rival_prio  = sorted(rival_prio, key=lambda r: (len(r["rival_effects"]["took_first_from_rival"]),
-                                                    len(r["rival_effects"]["shored_vs_rival"]),
-                                                    len(r["rival_effects"]["entered_top3_over_rival"]),
-                                                    r["score"]), reverse=True)
-
-    pos_c,  pos_om  = cap(qp_positive)
-    sho_c,  sho_om  = cap(thin_shore)
-    fir_c,  fir_om  = cap(take_first)
-    top3_c, top3_om = cap(enter_top3)
-    riv_c,  riv_om  = cap(rival_prio)
-
-    error_samples = errors[:5]
+    # sort: hit target rivals first, then bigger QP gain, then lower SP needed
+    opportunities = sorted(opportunities, key=lambda r: (-int(r["score"]), int(r["partner_needed_sp"])))
+    omitted = 0
+    if max_each and max_each > 0 and len(opportunities) > max_each:
+        omitted = len(opportunities) - max_each
+        opportunities = opportunities[:max_each]
 
     return {
         "params": {
-            "defend_buffer": defend_buffer, "upgrade_gap": upgrade_gap, "entry_gap": entry_gap,
-            "keep_buffer": keep_buffer, "max_each": max_each,
-            "max_multiples_per_card": max_multiples_per_card, "scan_top_candidates": scan_top_candidates,
-            "focus_rival": focus_rival, "rival_only": rival_only, "rival_score_weight": rival_score_weight
+            "partner": partner, "target_rivals": list(target_rivals or []),
+            "max_sp_to_gain": max_sp_to_gain, "protect_qp": bool(protect_qp),
+            "protect_buffer": protect_buffer, "max_each": max_each
         },
-        "collection_counts": {"card_types": total_types, "total_units": total_cards},
-        "qp_positive_picks": pos_c, "omitted_qp_positive": pos_om,
-        "shore_thin_from_collection": sho_c, "omitted_shore_thin": sho_om,
-        "take_first_from_collection": fir_c, "omitted_take_first": fir_om,
-        "enter_top3_from_collection": top3_c, "omitted_enter_top3": top3_om,
-        "rival_priority_picks": riv_c, "omitted_rival_priority": riv_om,
-        "diagnostics": {
-            "errors_count": len(errors),
-            "error_samples": error_samples,
-            "skipped_because_rival_only": skipped_no_rival
-        }
+        "counts": {"opportunities": len(opportunities), "omitted": omitted},
+        "opportunities": opportunities
     }
 
 # -------------------- Routes --------------------
@@ -897,3 +664,28 @@ def review_collection_by_urls_easystreet31(payload: CollectionReviewByUrls):
         return JSONResponse(content=_json_safe(result))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Collection review failed internally: {e}")
+
+@app.post("/scan_partner_by_urls_easystreet31")
+def scan_partner_by_urls_easystreet31(payload: PartnerOppsByUrls):
+    try:
+        lb_raw = _fetch_table(str(payload.leaderboard_url))
+        hd_raw = _fetch_table(str(payload.holdings_url))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch leaderboard/holdings: {e}")
+    try:
+        lb = _norm_lb(lb_raw);  hd = _norm_holdings(hd_raw)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to normalize inputs: {e}")
+
+    result = _scan_partner_opps(lb, hd, me="Easystreet31",
+                                partner=payload.partner,
+                                target_rivals=payload.target_rivals,
+                                max_sp_to_gain=payload.max_sp_to_gain,
+                                protect_qp=payload.protect_qp,
+                                protect_buffer=payload.protect_buffer,
+                                max_each=payload.max_each,
+                                players_whitelist=payload.players_whitelist,
+                                players_exclude=payload.players_exclude)
+    return JSONResponse(content=_json_safe(result))
