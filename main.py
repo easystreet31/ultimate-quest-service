@@ -1,5 +1,5 @@
 # main.py
-# Ultimate Quest Service — v3.4.0 "all-in-one + partner-safe-give"
+# Ultimate Quest Service — v3.4.1 "all-in-one + partner-safe-give + counts"
 #
 # Endpoints
 # ---------
@@ -29,7 +29,7 @@
 # requests==2.32.3
 
 from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Dict, Any, List, Optional, Tuple, Union
 import pandas as pd
 import numpy as np
@@ -38,7 +38,7 @@ import io
 import math
 import re
 
-APP_VERSION = "3.4.0-all"
+APP_VERSION = "3.4.1-all"
 
 app = FastAPI(title="Ultimate Quest Service", version=APP_VERSION)
 
@@ -212,6 +212,7 @@ def parse_collection(url: str) -> pd.DataFrame:
       players/subjects, sp, qty (optional), card_name/title (optional), card_number (optional)
     """
     sheets = _fetch_xlsx(url)
+    # If a sheet doesn't literally have "players", fallback still picks first sheet; we'll map columns below.
     df = _first_sheet_with(sheets, ["players","sp"])
     df = _norm_cols(df)
 
@@ -229,7 +230,7 @@ def parse_collection(url: str) -> pd.DataFrame:
     c_no      = pick1(["card_number","card_no","no","number"])
 
     if not c_players or not c_sp:
-        raise ValueError("Collection sheet needs at least 'players' and 'sp' columns.")
+        raise ValueError("Collection sheet needs at least 'players' (or 'player'/'subjects') and 'sp' columns.")
 
     out = pd.DataFrame()
     out["card_name"]   = df[c_card].astype(str).str.strip() if c_card else ""
@@ -390,7 +391,7 @@ def _players_filter(whitelist: Optional[List[str]], blacklist: Optional[List[str
         return lambda p: p.lower().strip() not in bl
     return lambda p: True
 
-def _apply_trade_to_holdings(my: pd.DataFrame, trade: List[TradeLine], multi_rule: str) -> Tuple[pd.DataFrame, Dict[str,int]]:
+def _apply_trade_to_holdings(my: pd.DataFrame, trade: List[TradeLine], multi_rule: str):
     """Return (new_holdings_df, delta_by_player)."""
     deltas: Dict[str,int] = {}
     for t in trade:
@@ -425,7 +426,6 @@ def _evaluate_trade(lb: pd.DataFrame, my: pd.DataFrame, trade: List[TradeLine], 
     net_qp = 0
     fragile = []
 
-    # compute before & after for changed players
     for p, d in deltas.items():
         if not allow(p):
             continue
@@ -456,7 +456,6 @@ def _evaluate_trade(lb: pd.DataFrame, my: pd.DataFrame, trade: List[TradeLine], 
             "margin_after_if_first": margin_a
         })
 
-    # sort & cap
     impacts.sort(key=lambda r: (-abs((r["qp_after"]-r["qp_before"])), r["player"]))
     if max_return_players > 0:
         impacts = impacts[:max_return_players]
@@ -492,7 +491,6 @@ def _daily_scan(lb: pd.DataFrame, my: pd.DataFrame, defend_buffer: int, upgrade_
     overshoots = []
     rival_counts: Dict[str,int] = {}
 
-    # iterate all players we have or appear in leaderboard
     players = sorted(set(my["player"].unique()).union(lb["player"].unique()))
     for p in players:
         if not allow(p): continue
@@ -504,7 +502,6 @@ def _daily_scan(lb: pd.DataFrame, my: pd.DataFrame, defend_buffer: int, upgrade_
         you_sp = int(my.loc[my["player"]==p, "you_sp"].iloc[0]) if (my["player"]==p).any() else 0
         rank, qp, mg, _ = qp_for(me, p, lb_map, you_sp)
 
-        # thin firsts
         if rank == 1:
             margin = you_sp - second_sp
             if margin <= defend_buffer:
@@ -512,17 +509,14 @@ def _daily_scan(lb: pd.DataFrame, my: pd.DataFrame, defend_buffer: int, upgrade_
             if margin > keep_buffer:
                 overshoots.append({"player": p, "your": you_sp, "vs": first_u, "first_sp": first_sp, "slack": margin})
         else:
-            # upgrade opps: gap to 1st
             gap1 = max(0, first_sp - you_sp + 1)
             if gap1 <= upgrade_gap and gap1 > 0:
                 upgrade_opps.append({"player": p, "your": you_sp, "leader": first_u, "leader_sp": first_sp, "gap": gap1, "add_to_take_1st": gap1})
-        # enter top3
         if rank > 3:
             gap3 = max(0, third_sp - you_sp + 1)
             if gap3 <= entry_gap and gap3 > 0:
                 top3_entries.append({"player": p, "your": you_sp, "third_sp": third_sp, "gap": gap3, "add_to_enter_top3": gap3})
 
-        # rival watchlist counting (who blocks me most)
         if rank != 1 and first_u:
             rival_counts[first_u] = rival_counts.get(first_u, 0) + 1
 
@@ -556,8 +550,8 @@ def _rival_scan(lb: pd.DataFrame, my: pd.DataFrame, focus_rival: str, defend_buf
     lb_map = leaderboard_map(lb)
     rv = _norm_user(focus_rival)
 
-    threats = []   # where rival is near overtaking me or leading
-    opps    = []   # where I can pass the rival quickly
+    threats = []
+    opps    = []
     both_out_top3 = []
 
     players = sorted(set(my["player"].unique()).union(lb["player"].unique()))
@@ -572,12 +566,10 @@ def _rival_scan(lb: pd.DataFrame, my: pd.DataFrame, focus_rival: str, defend_buf
         my_rank, rv_rank, second_sp = ranks_with_two(arr, me, you_sp, rv, rv_sp)
         margin_vs_second = you_sp - second_sp if my_rank == 1 else None
 
-        # threat if I'm first but margin thin vs second (could be rival) OR rival is close to me
         if my_rank == 1:
             if margin_vs_second is not None and margin_vs_second <= defend_buffer:
                 threats.append({"player": p, "my_rank": my_rank, "rival_rank": rv_rank, "your": you_sp, "second_sp": second_sp, "margin": margin_vs_second})
         else:
-            # opp if I can pass rival within upgrade_gap
             need = max(0, rv_sp - you_sp + 1)
             if need <= upgrade_gap and need > 0:
                 opps.append({"player": p, "your": you_sp, "rival_sp": rv_sp, "add_to_beat_rival": need})
@@ -621,29 +613,22 @@ def _partner_scan(lb: pd.DataFrame, my: pd.DataFrame, partner: str, target_rival
         arr = lb_map.get(p, [])
         you_sp = int(my.loc[my["player"]==p, "you_sp"].iloc[0]) if (my["player"]==p).any() else 0
 
-        # partner current
         part_sp = 0
         for (u, sp, _) in arr:
             if _norm_user(u) == partner:
                 part_sp = sp; break
 
-        # potential QP steps for partner: gain 3rd (QP+1), gain 2nd (QP+3), gain 1st (QP+5)
-        # We'll compute minimal SP to reach each target, and enforce protect_qp/buffer for me.
-        # Determine thresholds from arr (first/second/third)
         r_first = arr[0][1] if len(arr) > 0 else 0
         r_second = arr[1][1] if len(arr) > 1 else 0
         r_third = arr[2][1] if len(arr) > 2 else 0
 
         targets = []
-        # enter 3rd
         if part_sp < r_third:
             need3 = r_third - part_sp + 1
             targets.append(("enter_top3", 3, need3))
-        # move to 2nd
         if part_sp < r_second:
             need2 = r_second - part_sp + 1
             targets.append(("reach_2nd", 2, need2))
-        # move to 1st
         if part_sp < r_first:
             need1 = r_first - part_sp + 1
             targets.append(("reach_1st", 1, need1))
@@ -651,7 +636,6 @@ def _partner_scan(lb: pd.DataFrame, my: pd.DataFrame, partner: str, target_rival
         for label, tgt_rank, need in targets:
             if need <= 0 or need > max_sp_to_gain:
                 continue
-            # Check my protection constraints with partner boosted
             my_rank_after, partner_rank_after, second_sp = ranks_with_two(arr, me, you_sp, partner, part_sp + need)
             my_qp_after = _qp_for_rank(my_rank_after)
             my_rank_now, my_qp_now, _, sec_now = qp_for(me, p, lb_map, you_sp)
@@ -659,18 +643,14 @@ def _partner_scan(lb: pd.DataFrame, my: pd.DataFrame, partner: str, target_rival
             if protect_qp and my_qp_after < my_qp_now:
                 continue
             if my_rank_now == 1 and protect_buffer:
-                # ensure I keep >= protect_buffer
-                # my margin after partner boost is my_sp - new second_sp (which could be partner)
                 margin_after = you_sp - second_sp
                 if margin_after < protect_buffer:
                     continue
 
             score = (3 if label == "enter_top3" else 7 if label == "reach_2nd" else 10)
-            # Rival scoring bump
             if rv_set:
-                # if any rival in top3 gets pushed down by partner's move, bump
-                for (u, sp, rk) in arr:
-                    if _norm_user(u) in rv_set and rk <= 3 and (part_sp + need) > sp:
+                for (u, s, rk) in arr:
+                    if _norm_user(u) in rv_set and rk <= 3 and (part_sp + need) > s:
                         score += 5
 
             suggestions.append({
@@ -698,8 +678,8 @@ def _partner_scan(lb: pd.DataFrame, my: pd.DataFrame, partner: str, target_rival
 
 def _evaluate_card_take(my_map: Dict[str, Dict[str,int]], lb_map: Dict[str, List[Tuple[str,int,int]]],
                         players: List[str], sp: int, take_n: int, me: str, defend_buffer: int,
-                        focus_rival: Optional[str] = None) -> Tuple[int, List[Dict[str,Any]], List[Dict[str,Any]], List[Dict[str,Any]]]:
-    """Return (my_total_qp_delta, my_impacts[], rival_impacts[], shore_thin_hits[] if margin improves past buffer)."""
+                        focus_rival: Optional[str] = None):
+    """Return (my_total_qp_delta, my_impacts[], rival_impacts[], shore_thin_hits[])."""
     my_total_qp_delta = 0
     my_impacts = []
     rival_impacts = []
@@ -721,7 +701,6 @@ def _evaluate_card_take(my_map: Dict[str, Dict[str,int]], lb_map: Dict[str, List
             shore_hits.append({"player": p, "margin_before": margin_b, "margin_after": margin_a})
 
         if rv:
-            # if we overtake the rival in top-3 as a result, note it (approx)
             arr = lb_map.get(p, [])
             rv_sp = 0
             for (u, s, _) in arr:
@@ -762,7 +741,6 @@ def _review_collection(lb: pd.DataFrame, my: pd.DataFrame, coll: pd.DataFrame, d
 
     errors = []
 
-    # Optionally pre-trim candidate cards by whether any player is relevant to us
     candidates = []
     for _, row in coll.iterrows():
         try:
@@ -811,10 +789,8 @@ def _review_collection(lb: pd.DataFrame, my: pd.DataFrame, coll: pd.DataFrame, d
                         "my_qp_change": total_qp, "my_impacts": my_imp
                     })
                 if not rival_only:
-                    # classify by goals
                     for m in my_imp:
                         p = m["player"]
-                        # recompute before/after for precise gating
                         sp_b = m["my_sp"]; sp_a = m["my_sp_after"]
                         r_b, q_b, _, sec_b = qp_for(me, p, lb_map, sp_b)
                         r_a, q_a, _, sec_a = qp_for(me, p, lb_map, sp_a)
@@ -822,8 +798,7 @@ def _review_collection(lb: pd.DataFrame, my: pd.DataFrame, coll: pd.DataFrame, d
                             shore_thin.append({"card": card, "card_number": no, "player": p, "sp": sp, "take_n": take_n,
                                                "margin_before": sp_b-sec_b, "margin_after": sp_a-sec_a})
                         if r_b != 1 and r_a == 1:
-                            take_first.append({"card": card, "card_number": no, "player": p, "sp": sp, "take_n": take_n,
-                                               "gap_to_first_before": max(0, (lb_map.get(p, [(me,0,1)])[0][1] if lb_map.get(p) else 0) - sp_b + 1)})
+                            take_first.append({"card": card, "card_number": no, "player": p, "sp": sp, "take_n": take_n})
                         if r_b > 3 and r_a <= 3:
                             third_sp = (lb_map.get(p, []))[2][1] if len(lb_map.get(p, []))>2 else 0
                             enter_top3.append({"card": card, "card_number": no, "player": p, "sp": sp, "take_n": take_n,
@@ -895,13 +870,11 @@ def _safe_give(lb: pd.DataFrame, my: pd.DataFrame, my_coll: pd.DataFrame, partne
         players = [p for p in players if allow(p)]
         if not players: continue
 
-        # max copies we can give safely across all involved players
         max_copies_allowed = min(qty, max_multiples_per_card)
         for p in players:
             mine = my_map.get(p, {"you_sp":0,"rank":None,"you_qp":0})
             my_sp = int(mine["you_sp"] or 0)
             my_qp = int(mine["you_qp"] or 0)
-            # try giving 0..max copies and keep best "safe" n
             safe_n = 0
             for n in range(0, max_copies_allowed+1):
                 my_sp_after = max(0, my_sp - n*sp)
@@ -933,7 +906,6 @@ def _safe_give(lb: pd.DataFrame, my: pd.DataFrame, my_coll: pd.DataFrame, partne
                 my_impacts.append({"player": p, "my_sp": my_sp_b, "my_sp_after": my_sp_a,
                                    "qp_before": my_qp_b, "qp_after": my_qp_a})
 
-                # partner before/after
                 arr = lb_map.get(p, [])
                 part_sp_b = 0
                 for (u, s, _) in arr:
@@ -980,87 +952,104 @@ def _safe_give(lb: pd.DataFrame, my: pd.DataFrame, my_coll: pd.DataFrame, partne
             "max_multiples_per_card": max_multiples_per_card,
             "target_rivals": list(rv_set)
         },
+        "my_collection_counts": {
+            "card_types": int(my_coll.shape[0]),
+            "total_units": int(pd.to_numeric(my_coll.get("qty", pd.Series([1]*len(my_coll))), errors="coerce").fillna(1).astype(int).sum())
+        },
         "safe_gives": suggestions,
-        "omitted": omitted
+        "omitted": omitted,
+        "diagnostics": {
+            "parsed_columns": list(my_coll.columns),
+        }
     }
 
 # ============================================================
 # Routes
 # ============================================================
 
+class TradeLine(BaseModel):
+    side: str
+    players: str
+    sp: int
+
 @app.post("/evaluate_by_urls_easystreet31")
-def evaluate_by_urls_easystreet31(req: EvaluateReq):
+def evaluate_by_urls_easystreet31(req: dict):
     try:
-        lb = parse_leaderboard(req.leaderboard_url)
-        my = parse_holdings(req.holdings_url, me="Easystreet31")
-        result = _evaluate_trade(lb, my, req.trade, req.defend_buffer, req.multi_subject_rule,
-                                 req.players_whitelist, req.players_blacklist, req.max_return_players)
+        eval_req = EvaluateReq(**req)
+        lb = parse_leaderboard(eval_req.leaderboard_url)
+        my = parse_holdings(eval_req.holdings_url, me="Easystreet31")
+        result = _evaluate_trade(lb, my, eval_req.trade, eval_req.defend_buffer, eval_req.multi_subject_rule,
+                                 eval_req.players_whitelist, eval_req.players_blacklist, eval_req.max_return_players)
         return _clean_json(result)
     except Exception as e:
         return {"detail": f"Evaluation failed: {e}"}
 
 @app.post("/scan_by_urls_easystreet31")
-def scan_by_urls_easystreet31(req: ScanReq):
+def scan_by_urls_easystreet31(req: dict):
     try:
-        lb = parse_leaderboard(req.leaderboard_url)
-        my = parse_holdings(req.holdings_url, me="Easystreet31")
-        result = _daily_scan(lb, my, req.defend_buffer, req.upgrade_gap, req.entry_gap,
-                             req.keep_buffer, req.players_whitelist, req.players_blacklist,
-                             req.max_each, req.show_all)
+        scan_req = ScanReq(**req)
+        lb = parse_leaderboard(scan_req.leaderboard_url)
+        my = parse_holdings(scan_req.holdings_url, me="Easystreet31")
+        result = _daily_scan(lb, my, scan_req.defend_buffer, scan_req.upgrade_gap, scan_req.entry_gap,
+                             scan_req.keep_buffer, scan_req.players_whitelist, scan_req.players_blacklist,
+                             scan_req.max_each, scan_req.show_all)
         return _clean_json(result)
     except Exception as e:
         return {"detail": f"Daily scan failed: {e}"}
 
 @app.post("/scan_rival_by_urls_easystreet31")
-def scan_rival_by_urls_easystreet31(req: RivalScanReq):
+def scan_rival_by_urls_easystreet31(req: dict):
     try:
-        lb = parse_leaderboard(req.leaderboard_url)
-        my = parse_holdings(req.holdings_url, me="Easystreet31")
-        result = _rival_scan(lb, my, req.focus_rival, req.defend_buffer, req.upgrade_gap, req.entry_gap,
-                             req.keep_buffer, req.max_each, req.show_all)
+        rreq = RivalScanReq(**req)
+        lb = parse_leaderboard(rreq.leaderboard_url)
+        my = parse_holdings(rreq.holdings_url, me="Easystreet31")
+        result = _rival_scan(lb, my, rreq.focus_rival, rreq.defend_buffer, rreq.upgrade_gap, rreq.entry_gap,
+                             rreq.keep_buffer, rreq.max_each, rreq.show_all)
         return _clean_json(result)
     except Exception as e:
         return {"detail": f"Rival scan failed: {e}"}
 
 @app.post("/scan_partner_by_urls_easystreet31")
-def scan_partner_by_urls_easystreet31(req: PartnerScanReq):
+def scan_partner_by_urls_easystreet31(req: dict):
     try:
-        lb = parse_leaderboard(req.leaderboard_url)
-        my = parse_holdings(req.holdings_url, me="Easystreet31")
-        result = _partner_scan(lb, my, req.partner, req.target_rivals, req.protect_qp,
-                               req.protect_buffer, req.max_sp_to_gain, req.max_each,
-                               req.players_whitelist, req.players_blacklist)
+        preq = PartnerScanReq(**req)
+        lb = parse_leaderboard(preq.leaderboard_url)
+        my = parse_holdings(preq.holdings_url, me="Easystreet31")
+        result = _partner_scan(lb, my, preq.partner, preq.target_rivals, preq.protect_qp,
+                               preq.protect_buffer, preq.max_sp_to_gain, preq.max_each,
+                               preq.players_whitelist, preq.players_blacklist)
         return _clean_json(result)
     except Exception as e:
         return {"detail": f"Partner scan failed: {e}"}
 
 @app.post("/review_collection_by_urls_easystreet31")
-def review_collection_by_urls_easystreet31(req: CollectionReviewReq):
+def review_collection_by_urls_easystreet31(req: dict):
     try:
-        lb = parse_leaderboard(req.leaderboard_url)
-        my = parse_holdings(req.holdings_url, me="Easystreet31")
+        creq = CollectionReviewReq(**req)
+        lb = parse_leaderboard(creq.leaderboard_url)
+        my = parse_holdings(creq.holdings_url, me="Easystreet31")
 
-        # Apply optional baseline trade to my holdings before review (countering a pending swap)
-        if req.baseline_trade:
-            my, _ = _apply_trade_to_holdings(my, req.baseline_trade, req.multi_subject_rule)
+        if creq.baseline_trade:
+            my, _ = _apply_trade_to_holdings(my, creq.baseline_trade, creq.multi_subject_rule)
 
-        coll = parse_collection(req.collection_url)
-        result = _review_collection(lb, my, coll, req.defend_buffer, req.multi_subject_rule, req.focus_rival,
-                                    req.rival_only, req.max_each, req.max_multiples_per_card,
-                                    req.scan_top_candidates, req.players_whitelist, req.players_blacklist)
+        coll = parse_collection(creq.collection_url)
+        result = _review_collection(lb, my, coll, creq.defend_buffer, creq.multi_subject_rule, creq.focus_rival,
+                                    creq.rival_only, creq.max_each, creq.max_multiples_per_card,
+                                    creq.scan_top_candidates, creq.players_whitelist, creq.players_blacklist)
         return _clean_json(result)
     except Exception as e:
         return {"detail": f"Collection review failed: {e}"}
 
 @app.post("/suggest_give_from_collection_by_urls_easystreet31")
-def suggest_give_from_collection_by_urls_easystreet31(req: SafeGiveReq):
+def suggest_give_from_collection_by_urls_easystreet31(req: dict):
     try:
-        lb = parse_leaderboard(req.leaderboard_url)
-        my = parse_holdings(req.holdings_url, me="Easystreet31")
-        my_coll = parse_collection(req.my_collection_url)
-        result = _safe_give(lb, my, my_coll, req.partner, req.multi_subject_rule, req.protect_qp,
-                            req.protect_buffer, req.max_each, req.max_multiples_per_card,
-                            req.players_whitelist, req.players_blacklist, req.target_rivals, req.rival_score_weight)
+        sreq = SafeGiveReq(**req)
+        lb = parse_leaderboard(sreq.leaderboard_url)
+        my = parse_holdings(sreq.holdings_url, me="Easystreet31")
+        my_coll = parse_collection(sreq.my_collection_url)
+        result = _safe_give(lb, my, my_coll, sreq.partner, sreq.multi_subject_rule, sreq.protect_qp,
+                            sreq.protect_buffer, sreq.max_each, sreq.max_multiples_per_card,
+                            sreq.players_whitelist, sreq.players_blacklist, sreq.target_rivals, sreq.rival_score_weight)
         return _clean_json(result)
     except Exception as e:
         return {"detail": f"Partner safe-give failed: {e}"}
