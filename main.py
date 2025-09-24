@@ -1,421 +1,608 @@
-# --- imports you already have ---
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-import io, requests, math, re
+# main.py
+# Ultimate Quest Service — v3.3.0 "partner-safe-give"
+#
+# New endpoint:
+#   POST /suggest_give_from_collection_by_urls_easystreet31
+#     - Finds cards in *your* collection you can trade TO a partner
+#     - Partner gains QP; you do NOT lose QP; optional 1st-place buffer protection
+#
+# Existing helper endpoints remain:
+#   GET  /health
+#   GET  /info
+#
+# Notes:
+#  - Robust XLSX readers
+#  - Multi-subject logic: "full_each_unique"
+#  - Conservative tie-handling: must exceed (>) competitor SP to beat their rank
+#  - NaN/Inf scrubbed before JSON
+#
+# Requirements: fastapi, uvicorn, pandas, openpyxl, python-multipart, requests
+
+from fastapi import FastAPI, Body
+from pydantic import BaseModel, Field
+from typing import Dict, Any, List, Optional, Tuple, Union
 import pandas as pd
+import numpy as np
+import requests, io, math
 
-app = FastAPI()
+APP_VERSION = "3.3.0-partner-safe-give"
 
-# --------- utilities (robust to your Google links) ----------
-def _normalize_gsheet_url(u: str) -> str:
-    if "/export?format=" in u:
-        return u
-    if "/edit" in u or "/view" in u:
-        return re.sub(r"/(edit|view).*", "/export?format=xlsx", u)
-    if "/spreadsheets/d/" in u and "export?format=" not in u:
-        if u.endswith("/"):
-            return u + "export?format=xlsx"
-        return u + "/export?format=xlsx"
-    return u
+app = FastAPI(title="Ultimate Quest Service", version=APP_VERSION)
 
-def _fetch_xlsx(u: str) -> dict:
-    u = _normalize_gsheet_url(u)
-    r = requests.get(u, timeout=60)
-    r.raise_for_status()
-    return pd.read_excel(io.BytesIO(r.content), sheet_name=None)
 
-def _col(df: pd.DataFrame, *cands):
-    lower = {c.lower(): c for c in df.columns}
-    for c in cands:
-        k = c.lower()
-        if k in lower:
-            return lower[k]
-    return None
+# ---------------------------
+# Utilities
+# ---------------------------
 
-def _players_from_text(txt: str) -> list:
-    if pd.isna(txt):
+def _fetch_xlsx(url: str) -> Dict[str, pd.DataFrame]:
+    """Download an xlsx (Google Sheets export) and return {sheetname: DataFrame}."""
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    data = io.BytesIO(resp.content)
+    xl = pd.ExcelFile(data)
+    sheets = {}
+    for name in xl.sheet_names:
+        try:
+            df = xl.parse(name)
+            if isinstance(df, pd.DataFrame) and df.shape[0] > 0:
+                sheets[name] = df
+        except Exception:
+            continue
+    if not sheets:
+        raise ValueError("No readable sheets found in XLSX.")
+    return sheets
+
+
+def _first_sheet_with(df_map: Dict[str, pd.DataFrame], needed_cols: List[str]) -> pd.DataFrame:
+    """Pick the first sheet that contains all needed columns (case-insensitive fuzzy)."""
+    def cols(d: pd.DataFrame) -> List[str]:
+        return [str(c).strip() for c in d.columns]
+
+    for _, df in df_map.items():
+        low = {c.lower().strip(): c for c in cols(df)}
+        ok = True
+        for n in needed_cols:
+            if not any(n in k for k in low.keys()):
+                ok = False
+                break
+        if ok:
+            return df
+    # else return the first sheet
+    return list(df_map.values())[0]
+
+
+def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+    return df
+
+
+def _norm_user(u: Union[str, float, int]) -> str:
+    s = str(u or "").strip()
+    # strip trailing " (1234)"
+    if " (" in s and s.endswith(")"):
+        s = s[: s.rfind(" (")].strip()
+    return s
+
+
+def _qp_for_rank(rank: Optional[int]) -> int:
+    if rank == 1: return 5
+    if rank == 2: return 3
+    if rank == 3: return 1
+    return 0
+
+
+def _split_players(players_str: str) -> List[str]:
+    if not isinstance(players_str, str):
         return []
-    s = str(txt).replace("&", ",").replace("/", ",")
-    parts = [p.strip() for p in re.split(r"[,+]| and ", s) if p.strip()]
-    # de‑dup while preserving order
-    seen, out = set(), []
+    # split on common separators
+    parts = [p.strip() for p in
+             re_split(players_str, [",", "&", "/", "+", ";", "|"])]
+    # drop empties and de-dup while preserving order
+    seen = set(); out = []
     for p in parts:
-        if p.lower() not in seen:
-            seen.add(p.lower())
+        if p and p.lower() not in seen:
             out.append(p)
+            seen.add(p.lower())
     return out
 
-# --------- data loaders ----------
-def load_leaderboard(leaderboard_url: str) -> pd.DataFrame:
-    wb = _fetch_xlsx(leaderboard_url)
-    frames = []
-    for name, df in wb.items():
-        if df.empty: 
-            continue
-        pcol = _col(df, "player", "subject", "subject/player", "name")
-        rcol = _col(df, "rank")
-        ucol = _col(df, "user", "username", "collector", "owner")
-        scol = _col(df, "sp", "subject points", "points")
-        if not all([pcol, rcol, ucol, scol]): 
-            continue
-        f = df[[pcol, rcol, ucol, scol]].copy()
-        f.columns = ["player", "rank", "user", "sp"]
-        frames.append(f)
-    if not frames:
-        raise ValueError("Could not locate a leaderboard sheet with [player, rank, user, sp] columns.")
-    lb = pd.concat(frames, ignore_index=True)
-    # keep top 5 ranks per player
-    lb = lb.dropna(subset=["player", "rank"]).copy()
-    lb["rank"] = lb["rank"].astype(int)
-    lb = lb[lb["rank"].between(1, 5)]
-    # normalize usernames
-    lb["user"] = lb["user"].astype(str).str.strip()
-    return lb
 
-def load_holdings(holdings_url: str) -> pd.DataFrame:
-    wb = _fetch_xlsx(holdings_url)
-    frames = []
-    for name, df in wb.items():
-        if df.empty:
-            continue
-        pcol = _col(df, "player", "subject", "name")
-        scol = _col(df, "sp", "subject points", "your sp", "total sp")
-        rcol = _col(df, "rank")
-        qpcol= _col(df, "qp", "quest points")
-        if not pcol or not scol:
-            continue
-        f = df[[pcol, scol] + ([rcol] if rcol else []) + ([qpcol] if qpcol else [])].copy()
-        cols = ["player","you_sp"] + (["rank"] if rcol else []) + (["you_qp"] if qpcol else [])
-        f.columns = cols
-        frames.append(f)
-    if not frames:
-        raise ValueError("Could not locate holdings columns.")
-    h = pd.concat(frames, ignore_index=True)
-    # collapse duplicates by player
-    h = h.groupby("player", as_index=False)["you_sp"].sum()
-    return h
+def re_split(text: str, seps: List[str]) -> List[str]:
+    import re
+    pattern = "|".join(map(re_escape, seps))
+    return re.split(pattern, text)
 
-def load_collection(collection_url: str) -> pd.DataFrame:
-    wb = _fetch_xlsx(collection_url)
-    frames = []
-    for name, df in wb.items():
-        if df.empty:
-            continue
-        ncol = _col(df, "card", "card name", "name", "item")
-        pcol = _col(df, "players", "subjects", "subject(s)")
-        scol = _col(df, "sp", "subject points", "points")
-        qcol = _col(df, "qty", "quantity", "count")
-        if not all([ncol, pcol, scol]):
-            continue
-        f = df[[ncol, pcol, scol] + ([qcol] if qcol else [])].copy()
-        f.columns = ["card", "players", "sp"] + (["qty"] if qcol else [])
-        if "qty" not in f.columns:
-            f["qty"] = 1
-        frames.append(f)
-    if not frames:
-        raise ValueError("Could not locate collection columns [card, players, sp, qty].")
-    c = pd.concat(frames, ignore_index=True)
-    # parse players
-    c["players_list"] = c["players"].apply(_players_from_text)
-    # drop rows with no subjects parsed
-    c = c[c["players_list"].map(len) > 0].copy()
-    return c
 
-# --------- leaderboard comparison utilities ----------
-def build_cmp_table(lb: pd.DataFrame, you_hold: pd.DataFrame, you_name: str = "Easystreet31") -> pd.DataFrame:
-    # build top5 columns wide
-    wide = {}
-    for player, group in lb.groupby("player"):
-        r = {}
-        for _, row in group.iterrows():
-            rk = int(row["rank"])
-            r[f"r{rk}_user"] = str(row["user"]).strip()
-            r[f"r{rk}_sp"]   = int(row["sp"])
-        wide[player] = r
-    cmp = pd.DataFrame.from_dict(wide, orient="index").reset_index().rename(columns={"index":"player"})
-    # fill missing ranks with 0
-    for k in range(1,6):
-        if f"r{k}_user" not in cmp.columns: cmp[f"r{k}_user"] = None
-        if f"r{k}_sp" not in cmp.columns:   cmp[f"r{k}_sp"]   = 0
-    # attach your SP
-    cmp = cmp.merge(you_hold.rename(columns={"player":"player","you_sp":"you_sp"}), on="player", how="left")
-    cmp["you_sp"] = cmp["you_sp"].fillna(0).astype(int)
+def re_escape(s: str) -> str:
+    import re
+    return re.escape(s)
 
-    # compute your rank relative to top5 bands
-    def my_rank(r):
-        y = r["you_sp"]
-        # compare to rank 1..5 SP (ties treated conservatively as losing)
-        bands = [r[f"r{k}_sp"] for k in range(1,6)]
-        if y > bands[0]: return 1
-        if y > bands[1]: return 2
-        if y > bands[2]: return 3
-        if y > bands[3]: return 4
-        if y > bands[4]: return 5
-        return None  # outside top5
-    cmp["you_rank"] = cmp.apply(my_rank, axis=1)
 
-    # friendly aliases for later math
-    cmp["first_sp"]  = cmp["r1_sp"].fillna(0).astype(int)
-    cmp["second_sp"] = cmp["r2_sp"].fillna(0).astype(int)
-    cmp["third_sp"]  = cmp["r3_sp"].fillna(0).astype(int)
-    cmp["fourth_sp"] = cmp["r4_sp"].fillna(0).astype(int)
-    cmp["fifth_sp"]  = cmp["r5_sp"].fillna(0).astype(int)
-    return cmp
+def _clean_json(obj: Any) -> Any:
+    """Make everything JSON-safe (no NaN/Inf)."""
+    if isinstance(obj, dict):
+        return {k: _clean_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clean_json(v) for v in obj]
+    if obj is None:
+        return None
+    if isinstance(obj, (np.floating, float)):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return float(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    return obj
 
-def safe_slack_for_you(row, defend_buffer: int = 20) -> int:
-    y, r1, r2, r3, r4, r5, myrk = row["you_sp"], row["first_sp"], row["second_sp"], row["third_sp"], row["fourth_sp"], row["fifth_sp"], row["you_rank"]
-    if myrk == 1:
-        # keep at least (second + buffer + 1)
-        need = (r2 + defend_buffer + 1)
-        return max(0, y - need)
-    if myrk == 2:
-        # keep above third by 1
-        need = (r3 + 1)
-        return max(0, y - need)
-    if myrk == 3:
-        # keep above fourth by 1
-        need = (r4 + 1)
-        return max(0, y - need)
-    # outside top3: any give is QP‑safe
-    return 10**9  # effectively unlimited
 
-def qp_band(rank_before: Optional[int]) -> int:
-    if rank_before == 1: return 5
-    if rank_before == 2: return 3
-    if rank_before == 3: return 1
+# ---------------------------
+# Parsers
+# ---------------------------
+
+def parse_leaderboard(url: str) -> pd.DataFrame:
+    """
+    Expect a long format with columns similar to:
+      player, rank, username/user, sp[, qp]
+    We'll normalize to: player, user, rank, sp, qp
+    Only keep rank <= 5.
+    """
+    sheets = _fetch_xlsx(url)
+    # try to pick a sheet that has player, rank, user, sp
+    df = _first_sheet_with(sheets, ["player", "rank", "sp"])
+    df = _norm_cols(df)
+
+    # map possible aliases
+    col_map = {
+        "player": [ "player", "subject", "name" ],
+        "rank":   [ "rank", "rnk" ],
+        "user":   [ "username", "user", "collector", "owner" ],
+        "sp":     [ "sp", "subject_points", "points" ],
+        "qp":     [ "qp", "quest_points" ],
+    }
+    def pick(df, keys):
+        for k in keys:
+            for c in df.columns:
+                if c == k or c.startswith(k):
+                    return c
+        return None
+
+    c_player = pick(df, col_map["player"])
+    c_rank   = pick(df, col_map["rank"])
+    c_user   = pick(df, col_map["user"])
+    c_sp     = pick(df, col_map["sp"])
+    c_qp     = pick(df, col_map["qp"])
+
+    if not all([c_player, c_rank, c_user, c_sp]):
+        raise ValueError("Leaderboard sheet missing required columns (player, rank, user, sp).")
+
+    out = df[[c_player, c_rank, c_user, c_sp] + ([c_qp] if c_qp else [])].copy()
+    out.rename(columns={c_player:"player", c_rank:"rank", c_user:"user", c_sp:"sp"}, inplace=True)
+    if c_qp:
+        out.rename(columns={c_qp:"qp"}, inplace=True)
+    out["user"]  = out["user"].map(_norm_user)
+    out["rank"]  = pd.to_numeric(out["rank"], errors="coerce").astype("Int64")
+    out["sp"]    = pd.to_numeric(out["sp"], errors="coerce").fillna(0).astype(int)
+    if "qp" in out.columns:
+        out["qp"] = pd.to_numeric(out["qp"], errors="coerce").fillna(0).astype(int)
+    else:
+        out["qp"] = out["rank"].map(lambda r: _qp_for_rank(int(r)) if pd.notna(r) else 0)
+
+    out = out[out["rank"].fillna(99) <= 5].copy()
+    out["player"] = out["player"].astype(str).str.strip()
+    return out.reset_index(drop=True)
+
+
+def parse_holdings(url: str, me: str = "Easystreet31") -> pd.DataFrame:
+    """
+    Expect a table with (at least):
+      player, sp (mine), rank (mine), qp (mine)
+    We'll normalize to: player, you_sp, rank, you_qp
+    """
+    sheets = _fetch_xlsx(url)
+    df = _first_sheet_with(sheets, ["player", "sp"])
+    df = _norm_cols(df)
+
+    # attempt to detect my columns
+    c_player = [c for c in df.columns if c.startswith("player") or c.startswith("subject")]
+    c_sp     = [c for c in df.columns if c in ["you_sp", "sp", "my_sp", "easystreet31_sp"]]
+    c_rank   = [c for c in df.columns if c in ["rank", "my_rank", "you_rank"]]
+    c_qp     = [c for c in df.columns if c in ["qp", "my_qp", "you_qp"]]
+
+    if not c_player or not c_sp:
+        raise ValueError("Holdings sheet missing required columns (player, sp).")
+
+    out = pd.DataFrame()
+    out["player"] = df[c_player[0]].astype(str).str.strip()
+    out["you_sp"] = pd.to_numeric(df[c_sp[0]], errors="coerce").fillna(0).astype(int)
+    if c_rank:
+        out["rank"] = pd.to_numeric(df[c_rank[0]], errors="coerce").astype("Int64")
+    else:
+        out["rank"] = pd.NA
+    if c_qp:
+        out["you_qp"] = pd.to_numeric(df[c_qp[0]], errors="coerce").fillna(0).astype(int)
+    else:
+        out["you_qp"] = out["rank"].map(lambda r: _qp_for_rank(int(r)) if pd.notna(r) else 0)
+
+    return out.reset_index(drop=True)
+
+
+def parse_my_collection(url: str) -> pd.DataFrame:
+    """
+    Expect a card-level table with columns (case-insensitive, synonyms accepted):
+      - card name / title
+      - card number (optional)
+      - players or subject(s)
+      - sp (subject points)
+      - qty / quantity / count
+    """
+    sheets = _fetch_xlsx(url)
+    df = _first_sheet_with(sheets, ["players", "sp"])
+    df = _norm_cols(df)
+
+    # flexible column discovery
+    def find1(names):
+        for n in names:
+            for c in df.columns:
+                if c == n or c.startswith(n):
+                    return c
+        return None
+
+    c_players = find1(["players", "subjects", "player", "subject"])
+    c_sp      = find1(["sp", "subject_points", "points"])
+    c_qty     = find1(["qty", "quantity", "count", "copies", "q"])
+    c_card    = find1(["card_name", "card", "title"])
+    c_no      = find1(["card_number", "card_no", "no", "number"])
+
+    if not c_players or not c_sp:
+        raise ValueError("My Collection sheet needs at least 'Players' and 'SP' columns.")
+
+    out = pd.DataFrame()
+    out["card_name"]   = df[c_card].astype(str).str.strip() if c_card else ""
+    out["card_number"] = df[c_no].astype(str).str.strip() if c_no else ""
+    out["players_raw"] = df[c_players].astype(str).str.strip()
+    out["sp"]          = pd.to_numeric(df[c_sp], errors="coerce").fillna(0).astype(int)
+    out["qty"]         = pd.to_numeric(df[c_qty], errors="coerce").fillna(1).astype(int) if c_qty else 1
+    return out.reset_index(drop=True)
+
+
+# ---------------------------
+# Ranking & simulation
+# ---------------------------
+
+def leaderboard_map(lb: pd.DataFrame) -> Dict[str, List[Tuple[str,int,int]]]:
+    """
+    Returns: {player: [(user, sp, rank), ...] sorted by rank asc}
+    """
+    d: Dict[str, List[Tuple[str,int,int]]] = {}
+    for player, grp in lb.groupby("player"):
+        recs = []
+        for _, r in grp.sort_values(["rank", "sp"], ascending=[True, False]).iterrows():
+            recs.append((str(r["user"]), int(r["sp"]), int(r["rank"])))
+        d[player] = recs
+    return d
+
+
+def current_sp_of(user: str, player: str, lb_map: Dict[str, List[Tuple[str,int,int]]]) -> int:
+    arr = lb_map.get(player, [])
+    for u, sp, _ in arr:
+        if _norm_user(u).lower() == _norm_user(user).lower():
+            return sp
     return 0
 
-def still_same_qp_band(row, give_sp: int, defend_buffer: int = 20) -> bool:
-    """Would giving 'give_sp' keep you in the same QP band for this player?"""
-    before = row["you_rank"]
-    after_sp = row["you_sp"] - give_sp
-    # Recompute rank coarsely vs bands (conservative ties)
-    r1, r2, r3, r4, r5 = row["first_sp"], row["second_sp"], row["third_sp"], row["fourth_sp"], row["fifth_sp"]
-    if before == 1:
-        return after_sp > (r2 + defend_buffer)
-    if before == 2:
-        return after_sp > r3
-    if before == 3:
-        return after_sp > r4
-    # outside top3 -> band=0 regardless
-    return True
 
-def partner_baseline_sp(lb_for_player: pd.DataFrame, partner: str) -> int:
-    """If partner appears in top5 for this player, return their SP; otherwise 0 (conservative)."""
-    m = lb_for_player[lb_for_player["user"].str.strip().str.lower() == partner.lower()]
-    if not m.empty:
-        return int(m.iloc[0]["sp"])
-    return 0
-
-# --------- offer planner core ----------
-def compute_offers(
-    leaderboard_url: str,
-    holdings_url: str,
-    my_collection_url: str,
-    partner: str,
-    *,
-    defend_buffer: int = 20,
-    prefer_hurt_rivals: bool = True,
-    target_rivals: list = None,
-    max_each: int = 0,
-    max_multiples_per_card: int = 3,
-    multi_subject_rule: str = "full_each_unique",
-):
-    lb = load_leaderboard(leaderboard_url)
-    you = load_holdings(holdings_url)
-    inv = load_collection(my_collection_url)
-    cmp = build_cmp_table(lb, you)
-
-    # index lb by player for quick access
-    lb_by_player = {p: g.copy() for p, g in lb.groupby("player")}
-
-    suggestions = []
-    diag_errors = []
-
-    # precompute safe slack per player
-    slack = {}
-    for _, r in cmp.iterrows():
-        slack[r["player"]] = safe_slack_for_you(r, defend_buffer=defend_buffer)
-
-    # Walk each inventory line and check if giving N copies can:
-    #  - keep your QP band unchanged for *all* included players
-    #  - put partner into Top3 or 1st for *any* included player (conservative baseline if not in top5)
-    for idx, row in inv.iterrows():
-        card = row["card"]
-        card_sp = int(row["sp"])
-        qty = int(row.get("qty", 1))
-        players = list(row["players_list"])
-        if not players or card_sp <= 0 or qty <= 0:
-            continue
-
-        # respect multi-subject: full SP for each unique player on the card
-        # (duplicates already de‑duplicated in players_list)
-        # compute max safe copies limited by slack on *every* subject
-        max_by_slack = 10**9
-        all_subjects_have_lb = True
-        for subj in players:
-            # If player not on leaderboard, we can't reason about your QP band;
-            # treat it as safe (you have 0 QP there).
-            row_cmp = cmp[cmp["player"] == subj]
-            if row_cmp.empty:
-                subj_slack = 10**9  # untracked subject: doesn't affect your QP
-            else:
-                subj_slack = slack.get(subj, 10**9)
-                # ensure band safety at the per‑copy granularity
-                # c copies consume (card_sp * c)
-            max_copies_for_subj = subj_slack // card_sp
-            max_by_slack = min(max_by_slack, max_copies_for_subj)
-
-        safe_copies_cap = max(0, min(qty, max_by_slack, max_multiples_per_card))
-        if safe_copies_cap <= 0:
-            continue
-
-        # For each subject on the card, see if N copies could move partner to Top3 / 1st.
-        best_pick = None  # keep the best variant for this card
-        for subj in players:
-            lbp = lb_by_player.get(subj)
-            if lbp is None or lbp.empty:
-                continue
-            p_sp = partner_baseline_sp(lbp, partner=partner)
-            first_sp  = int(lbp[lbp["rank"]==1]["sp"].iloc[0]) if (lbp["rank"]==1).any() else 0
-            third_sp  = int(lbp[lbp["rank"]==3]["sp"].iloc[0]) if (lbp["rank"]==3).any() else 0
-
-            need_top3 = max(0, (third_sp + 1) - p_sp)
-            need_first = max(0, (first_sp + 1) - p_sp)
-
-            # how many copies of this card would be needed for subj?
-            # (conservative: only this single card type; we don't mix types)
-            def copies_for(target_need: int) -> int:
-                if target_need <= 0:
-                    return 0
-                return math.ceil(target_need / card_sp)
-
-            c3 = copies_for(need_top3)
-            c1 = copies_for(need_first)
-
-            # filter by safe copies cap
-            can_top3 = (c3 > 0 and c3 <= safe_copies_cap)
-            can_first= (c1 > 0 and c1 <= safe_copies_cap)
-
-            # evaluate the QP change for YOU if you give c copies (across all subjects on the card)
-            def band_safe_for_copies(copies: int) -> bool:
-                give = copies * card_sp
-                for s in players:
-                    row_cmp = cmp[cmp["player"] == s]
-                    if row_cmp.empty:
-                        continue
-                    if not still_same_qp_band(row_cmp.iloc[0], give_sp=give, defend_buffer=defend_buffer):
-                        return False
-                return True
-
-            pick = None
-            target = None
-            copies_needed = None
-            if can_first and band_safe_for_copies(c1):
-                target = "take_1st"
-                copies_needed = c1
-            elif can_top3 and band_safe_for_copies(c3):
-                target = "enter_top3"
-                copies_needed = c3
-
-            if target:
-                # prefer hurting a named rival if displacement occurs
-                hurts = None
-                if prefer_hurt_rivals and target_rivals:
-                    # who gets displaced?
-                    if target == "enter_top3":
-                        displaced = str(lbp[lbp["rank"]==3]["user"].iloc[0]) if (lbp["rank"]==3).any() else ""
-                    else:
-                        displaced = str(lbp[lbp["rank"]==1]["user"].iloc[0]) if (lbp["rank"]==1).any() else ""
-                    for rv in target_rivals:
-                        if rv and displaced.strip().lower() == rv.strip().lower():
-                            hurts = rv
-                            break
-
-                score = (10 if target == "take_1st" else 4) + (3 if hurts else 0)
-                pick = {
-                    "card": card,
-                    "players_on_card": players,
-                    "subject": subj,
-                    "sp_per_copy": card_sp,
-                    "copies_to_offer": copies_needed,
-                    "copies_available": int(qty),
-                    "copies_safe_cap": int(safe_copies_cap),
-                    "partner_need_sp": int(need_first if target=="take_1st" else need_top3),
-                    "partner_target": target,
-                    "your_qp_change": 0,   # guaranteed by band_safe
-                    "hurts_rival": hurts,
-                    "score": score
-                }
-
-            if pick:
-                if (best_pick is None) or (pick["score"] > best_pick["score"]):
-                    best_pick = pick
-
-        if best_pick:
-            suggestions.append(best_pick)
-
-    # sort by score, then by smaller copies_to_offer
-    suggestions.sort(key=lambda x: (-x["score"], x["copies_to_offer"], x["subject"], x["card"]))
-
-    # apply max_each if requested
-    if max_each and max_each > 0:
-        suggestions = suggestions[:max_each]
-
-    return {
-        "params": {
-            "defend_buffer": defend_buffer,
-            "multi_subject_rule": multi_subject_rule,
-            "partner": partner,
-            "prefer_hurt_rivals": prefer_hurt_rivals,
-            "target_rivals": target_rivals or [],
-            "max_each": max_each,
-            "max_multiples_per_card": max_multiples_per_card
-        },
-        "inventory_seen": {
-            "card_types": int(inv.shape[0]),
-            "total_units": int(inv["qty"].sum())
-        },
-        "safe_offers": suggestions,
-        "omitted": 0 if (not max_each or max_each <= 0) else max(0, len(suggestions) - max_each),
-        "diagnostics": {
-            "players_in_holdings": int(you.shape[0]),
-            "players_on_leaderboard": int(lb["player"].nunique()),
-            "errors": diag_errors[:10]
-        }
-    }
-
-# ------------- NEW ROUTE ----------------
-@app.post("/offer_partner_by_urls_easystreet31")
-def offer_partner_by_urls_easystreet31(payload: dict):
+def simulate_insert_rank(
+    arr: List[Tuple[str,int,int]],
+    user: str,
+    new_sp: int
+) -> Tuple[int, int, List[Tuple[str,int]]]:
     """
-    Body:
-    {
-      "leaderboard_url": "...xlsx",
-      "holdings_url": "...xlsx",
-      "my_collection_url": "...xlsx",
-      "partner": "Samm78ca",
-      "defend_buffer": 20,
-      "prefer_hurt_rivals": true,
-      "target_rivals": ["chfkyle","Erikk"],
-      "max_each": 60,
-      "max_multiples_per_card": 3,
-      "multi_subject_rule": "full_each_unique"
-    }
+    Given current top rows for a player: [(user, sp, rank), ...], insert (user,new_sp)
+    and compute new rank for 'user'. Conservative tie logic: competitor keeps place on ties.
+    Returns: (new_rank, margin_if_first_else_gap_to_next, new_order_as[(user,sp)])
     """
+    base = [(u, sp) for (u, sp, _) in arr]
+    # remove if exists
+    base = [(u, sp) for (u, sp) in base if _norm_user(u).lower() != _norm_user(user).lower()]
+    # tie-breaker: original index
+    order_index = {u: i for i, (u, _) in enumerate(base)}
+    base.append((user, new_sp))
+
+    # sort: by sp desc; then by original order (competitors first), then put 'user' last among equals
+    def sort_key(item):
+        u, sp = item
+        tie = order_index.get(u, 1_000_000)
+        return (-sp, tie)
+
+    sorted_list = sorted(base, key=sort_key)
+    # ranks assigned by position
+    new_rank = 1 + [u for (u, _) in sorted_list].index(user)
+
+    # compute margin if first else gap to the next better place
+    def margin_or_gap(lst):
+        idx = [u for (u, _) in lst].index(user)
+        if idx == 0:
+            # margin vs second (or 0 if none)
+            return lst[0][1] - (lst[1][1] if len(lst) > 1 else 0)
+        else:
+            return lst[idx-1][1] - lst[idx][1]  # positive gap needed to move up
+    mg = margin_or_gap(sorted_list)
+
+    return new_rank, mg, sorted_list
+
+
+def qp_for(user: str, player: str, lb_map: Dict[str, List[Tuple[str,int,int]]], sp: int) -> Tuple[int,int,int,int]:
+    """
+    Given a target sp, compute (rank, qp, margin_if_first_else_gap, second_sp).
+    """
+    arr = lb_map.get(player, [])
+    new_rank, mg, new_sorted = simulate_insert_rank(arr, user, sp)
+    qp = _qp_for_rank(new_rank)
+    # find second sp for margin display
+    second_sp = new_sorted[1][1] if len(new_sorted) > 1 else 0
+    return new_rank, qp, mg, second_sp
+
+
+# ---------------------------
+# Partner Safe Give
+# ---------------------------
+
+class SuggestGiveReq(BaseModel):
+    leaderboard_url: str
+    holdings_url: str
+    my_collection_url: str
+    partner: str
+
+    # knobs
+    multi_subject_rule: str = Field("full_each_unique", description="multi-subject scoring")
+    protect_qp: bool = True
+    protect_buffer: int = 20
+    max_each: int = 50
+    max_multiples_per_card: int = 3
+    players_whitelist: Optional[List[str]] = None
+    players_blacklist: Optional[List[str]] = None
+    target_rivals: Optional[List[str]] = None
+    rival_score_weight: int = 250  # bump scoring if we dethrone a target rival
+
+class Suggestion(BaseModel):
+    card: str
+    card_number: str
+    players: List[str]
+    sp: int
+    take_n: int
+    my_qp_change: int
+    partner_qp_change: int
+    my_impacts: List[Dict[str, Any]]
+    partner_impacts: List[Dict[str, Any]]
+    rival_impacts: List[Dict[str, Any]]
+    score: int
+
+
+@app.post("/suggest_give_from_collection_by_urls_easystreet31")
+def suggest_give_from_collection(req: SuggestGiveReq):
     try:
-        result = compute_offers(
-            leaderboard_url=payload["leaderboard_url"],
-            holdings_url=payload["holdings_url"],
-            my_collection_url=payload["my_collection_url"],
-            partner=payload.get("partner", ""),
-            defend_buffer=int(payload.get("defend_buffer", 20)),
-            prefer_hurt_rivals=bool(payload.get("prefer_hurt_rivals", True)),
-            target_rivals=payload.get("target_rivals") or [],
-            max_each=int(payload.get("max_each", 0)),
-            max_multiples_per_card=int(payload.get("max_multiples_per_card", 3)),
-            multi_subject_rule=payload.get("multi_subject_rule","full_each_unique"),
-        )
-        return JSONResponse(result)
+        me = "Easystreet31"
+        partner = _norm_user(req.partner)
+
+        # Load data
+        lb = parse_leaderboard(req.leaderboard_url)
+        my = parse_holdings(req.holdings_url, me=me)
+        coll = parse_my_collection(req.my_collection_url)
+
+        # map by player
+        lb_map = leaderboard_map(lb)
+        my_map = {r["player"]: {"you_sp": int(r["you_sp"]), "rank": int(r["rank"]) if pd.notna(r["rank"]) else None,
+                                "you_qp": int(r["you_qp"])} for _, r in my.iterrows()}
+
+        # helper for filtering players
+        allow = None
+        if req.players_whitelist:
+            wl = set([p.lower().strip() for p in req.players_whitelist])
+            allow = lambda p: p.lower().strip() in wl
+        elif req.players_blacklist:
+            bl = set([p.lower().strip() for p in req.players_blacklist])
+            allow = lambda p: p.lower().strip() not in bl
+        else:
+            allow = lambda p: True
+
+        suggestions: List[Suggestion] = []
+        diag_errors: List[Dict[str, Any]] = []
+
+        # iterate cards
+        for _, row in coll.iterrows():
+            card_name = str(row.get("card_name", "") or "").strip()
+            card_no   = str(row.get("card_number", "") or "").strip()
+            sp        = int(row.get("sp", 0) or 0)
+            qty       = int(row.get("qty", 1) or 1)
+
+            if sp <= 0 or qty <= 0:
+                continue
+
+            players = _split_players(row.get("players_raw", ""))
+            if req.multi_subject_rule == "full_each_unique":
+                players = list(dict.fromkeys(players))  # unique, preserve order
+            else:
+                players = players[:1]  # safest fallback
+
+            # Apply whitelist/blacklist
+            players = [p for p in players if allow(p)]
+            if not players:
+                continue
+
+            # Compute max copies we can safely give without hurting QP/buffer
+            # For each player, compute max copies allowed
+            max_copies_allowed = qty
+            for p in players:
+                mine = my_map.get(p, {"you_sp":0, "rank":None, "you_qp":0})
+                cur_sp = int(mine["you_sp"] or 0)
+                cur_rank = int(mine["rank"]) if mine["rank"] is not None else None
+                cur_qp = int(mine["you_qp"] or 0)
+
+                if req.protect_qp:
+                    # test copies from 0..qty and find largest safe n
+                    safe_n = 0
+                    for n in range(0, min(qty, req.max_multiples_per_card)+1):
+                        new_sp = max(0, cur_sp - n*sp)
+                        rnk, qp, mg, sec_sp = qp_for(me, p, lb_map, new_sp)
+                        if qp < cur_qp:
+                            break
+                        if cur_qp == 5 and req.protect_buffer:
+                            # when first, ensure margin >= protect_buffer
+                            # margin computed as new_sp - second_sp
+                            if (new_sp - sec_sp) < req.protect_buffer:
+                                break
+                        safe_n = n
+                    max_copies_allowed = min(max_copies_allowed, safe_n)
+                else:
+                    # only enforce non-negative SP
+                    safe_n = min(qty, req.max_multiples_per_card)
+                    max_copies_allowed = min(max_copies_allowed, safe_n)
+
+            max_copies_allowed = min(max_copies_allowed, req.max_multiples_per_card)
+            if max_copies_allowed <= 0:
+                continue
+
+            # Evaluate 1..max_copies_allowed
+            for take_n in range(1, max_copies_allowed+1):
+                my_total_qp_delta = 0
+                partner_total_qp_delta = 0
+                my_imp, partner_imp = [], []
+                rival_imp = []
+                score = 0
+
+                # Evaluate per player effect
+                for p in players:
+                    mine = my_map.get(p, {"you_sp":0, "rank":None, "you_qp":0})
+                    my_sp_before = int(mine["you_sp"] or 0)
+                    my_rank_b = int(mine["rank"]) if mine["rank"] is not None else None
+                    my_qp_b = int(mine["you_qp"] or 0)
+
+                    # Me after
+                    my_sp_after = max(0, my_sp_before - take_n*sp)
+                    my_rank_a, my_qp_a, my_mg_a, my_sec_after = qp_for(me, p, lb_map, my_sp_after)
+                    my_total_qp_delta += (my_qp_a - my_qp_b)
+
+                    my_imp.append({
+                        "player": p,
+                        "my_sp": my_sp_before,
+                        "my_sp_after": my_sp_after,
+                        "rank_before": my_rank_b,
+                        "rank_after": my_rank_a,
+                        "qp_before": my_qp_b,
+                        "qp_after": my_qp_a,
+                        "margin_if_first_after": (my_sp_after - my_sec_after) if my_rank_a == 1 else None
+                    })
+
+                    # Partner before/after
+                    part_sp_b = current_sp_of(partner, p, lb_map)  # 0 if not in top-5
+                    part_rank_b, part_qp_b, _, _ = qp_for(partner, p, lb_map, part_sp_b)
+                    part_sp_a = part_sp_b + take_n*sp
+                    part_rank_a, part_qp_a, _, _ = qp_for(partner, p, lb_map, part_sp_a)
+                    partner_total_qp_delta += (part_qp_a - part_qp_b)
+
+                    partner_imp.append({
+                        "player": p,
+                        "partner_sp": part_sp_b,
+                        "partner_sp_after": part_sp_a,
+                        "rank_before": part_rank_b,
+                        "rank_after": part_rank_a,
+                        "qp_before": part_qp_b,
+                        "qp_after": part_qp_a
+                    })
+
+                    # rival impact: if the dethroned user is in target_rivals, add weight
+                    if req.target_rivals:
+                        rivals = set([_norm_user(x).lower() for x in req.target_rivals])
+                        # if partner enters top-3 or improves rank over someone in rivals
+                        arr = lb_map.get(p, [])
+                        # who owned the place partner is taking?
+                        if part_qp_a > part_qp_b:
+                            # we can infer the loser: rank that decreased among existing records
+                            # Approx: if partner enters 3rd, previous 3rd drops to 4th -> identify that user
+                            # We'll simply check: among current top3, any rival whose SP < partner_sp_after and whose rank >= part_rank_a
+                            affected = []
+                            for u, sp_old, r_old in arr:
+                                u0 = _norm_user(u).lower()
+                                if u0 in rivals and sp_old < part_sp_a and r_old >= part_rank_a and r_old <= 3:
+                                    affected.append(u)
+                            if affected:
+                                for rv in affected:
+                                    rival_imp.append({"player": p, "rival": _norm_user(rv), "note": "partner overtakes rival in top-3"})
+                                    score += req.rival_score_weight
+
+                # Enforce "do not hurt me"
+                if req.protect_qp and my_total_qp_delta < 0:
+                    continue
+
+                # Only keep if partner gains QP
+                if partner_total_qp_delta <= 0:
+                    continue
+
+                score += partner_total_qp_delta * 1000  # primary sort key
+                score += -abs(my_total_qp_delta) * 100  # small bias to zero-change
+
+                suggestions.append(Suggestion(
+                    card=card_name or "(unnamed)",
+                    card_number=card_no,
+                    players=players,
+                    sp=sp,
+                    take_n=take_n,
+                    my_qp_change=int(my_total_qp_delta),
+                    partner_qp_change=int(partner_total_qp_delta),
+                    my_impacts=my_imp,
+                    partner_impacts=partner_imp,
+                    rival_impacts=rival_imp,
+                    score=int(score)
+                ))
+
+        # order & truncate
+        suggestions.sort(key=lambda s: (-s.score, -s.partner_qp_change, s.card, -s.take_n))
+        omitted = max(0, len(suggestions) - max(0, req.max_each))
+        if req.max_each > 0:
+            suggestions = suggestions[:req.max_each]
+
+        result = {
+            "params": {
+                "multi_subject_rule": req.multi_subject_rule,
+                "protect_qp": req.protect_qp,
+                "protect_buffer": req.protect_buffer,
+                "max_each": req.max_each,
+                "max_multiples_per_card": req.max_multiples_per_card,
+                "players_whitelist": req.players_whitelist or [],
+                "players_blacklist": req.players_blacklist or [],
+                "partner": partner,
+                "target_rivals": req.target_rivals or [],
+                "rival_score_weight": req.rival_score_weight
+            },
+            "my_collection_counts": {
+                "card_types": int(coll.shape[0]),
+                "total_units": int(coll["qty"].fillna(1).astype(int).sum())
+            },
+            "safe_gives": [s.dict() for s in suggestions],
+            "omitted": int(omitted)
+        }
+        return _clean_json(result)
+
     except Exception as e:
-        return JSONResponse({"detail": f"Offer planner failed: {e}"}, status_code=500)
+        return {"detail": f"Partner safe-give failed: {e}"}
+
+
+# ---------------------------
+# Health / Info
+# ---------------------------
+
+@app.get("/health")
+def health():
+    return {"ok": True, "version": APP_VERSION}
+
+@app.get("/info")
+def info():
+    return {
+        "version": APP_VERSION,
+        "routes": [
+            "/docs",
+            "/docs/oauth2-redirect",
+            "/health",
+            "/info",
+            "/suggest_give_from_collection_by_urls_easystreet31"
+        ]
+    }
