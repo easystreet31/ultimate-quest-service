@@ -1,24 +1,22 @@
 # main.py
-# Ultimate Quest Service — v3.4.3 "collection-review-defend-buffer"
+# Ultimate Quest Service — v3.5.0 "family-optimizer"
 #
-# Endpoints
-# ---------
+# Endpoints (kept from earlier + new):
 # - POST /evaluate_by_urls_easystreet31
 # - POST /scan_by_urls_easystreet31
 # - POST /scan_rival_by_urls_easystreet31
 # - POST /scan_partner_by_urls_easystreet31
 # - POST /review_collection_by_urls_easystreet31
 # - POST /suggest_give_from_collection_by_urls_easystreet31
+# - POST /family_optimize_by_urls              <-- NEW
 # - GET  /health
 # - GET  /info
 #
-# Notes
-# -----
+# Notes:
 # - Accepts Google Sheets XLSX export links (or any .xlsx URL)
 # - Robust parsing (fuzzy column names), JSON-safe output (scrubs NaN/Inf)
 # - Multi-subject rule: "full_each_unique" (full SP to each distinct player on a multi)
-# - Tie handling is conservative: you must EXCEED a competitor’s SP to overtake their rank
-# - "me" is Easystreet31 (hard-coded for this service)
+# - Ties: incumbents hold position; you must exceed to pass.
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -30,7 +28,7 @@ import io
 import math
 import re
 
-APP_VERSION = "3.4.3-collection-review-defend-buffer"
+APP_VERSION = "3.5.0-family"
 
 app = FastAPI(title="Ultimate Quest Service", version=APP_VERSION)
 
@@ -68,15 +66,10 @@ def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _norm_user(u: Union[str, float, int]) -> str:
-    """
-    Normalize usernames:
-      - replace non-breaking spaces with regular spaces
-      - trim
-      - drop trailing " (1234)" with any unicode whitespace before '('
-    """
+    # Replace NBSP, trim, drop trailing " (1234)"
     s = str(u or "")
-    s = s.replace("\u00A0", " ").strip()  # NBSP -> space
-    s = re.sub(r"\s*\(\d+\)\s*$", "", s)  # remove trailing ID in parens
+    s = s.replace("\u00A0", " ").strip()
+    s = re.sub(r"\s*\(\d+\)\s*$", "", s)
     return s
 
 def _qp_for_rank(rank: Optional[int]) -> int:
@@ -122,15 +115,6 @@ def _split_players(players_str: str) -> List[str]:
 # ============================================================
 
 def parse_leaderboard(url: str) -> pd.DataFrame:
-    """
-    Expected columns (any close aliases, case-insensitive):
-      player / subject / name
-      rank
-      username / user / collector / owner
-      sp / subject_points / points
-      (qp optional)
-    Keeps only rank <= 5.
-    """
     sheets = _fetch_xlsx(url)
     df = _first_sheet_with(sheets, ["player", "rank", "sp"])
     df = _norm_cols(df)
@@ -166,14 +150,7 @@ def parse_leaderboard(url: str) -> pd.DataFrame:
     out = out[out["rank"].fillna(99) <= 5].reset_index(drop=True)
     return out
 
-def parse_holdings(url: str, me: str = "Easystreet31") -> pd.DataFrame:
-    """
-    Expected columns (any close aliases):
-      player / subject
-      you_sp / my_sp / sp
-      rank (optional)
-      you_qp / qp (optional)
-    """
+def parse_holdings(url: str, me: str) -> pd.DataFrame:
     sheets = _fetch_xlsx(url)
     df = _first_sheet_with(sheets, ["player","sp"])
     df = _norm_cols(df)
@@ -186,7 +163,7 @@ def parse_holdings(url: str, me: str = "Easystreet31") -> pd.DataFrame:
         return None
 
     c_player = pick1(["player","subject","name"])
-    c_sp     = pick1(["you_sp","my_sp","easystreet31_sp","sp"])
+    c_sp     = pick1(["you_sp","my_sp","sp", f"{me.lower()}_sp"])
     c_rank   = pick1(["rank","you_rank","my_rank"])
     c_qp     = pick1(["you_qp","my_qp","qp"])
 
@@ -201,10 +178,6 @@ def parse_holdings(url: str, me: str = "Easystreet31") -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 def parse_collection(url: str) -> pd.DataFrame:
-    """
-    Generic collection (seller/partner or my own):
-      players/subjects, sp, qty (optional), card_name/title (optional), card_number (optional)
-    """
     sheets = _fetch_xlsx(url)
     df = _first_sheet_with(sheets, ["players","sp"])
     df = _norm_cols(df)
@@ -234,7 +207,7 @@ def parse_collection(url: str) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 # ============================================================
-# Ranking helpers
+# Leaderboard helpers
 # ============================================================
 
 def leaderboard_map(lb: pd.DataFrame) -> Dict[str, List[Tuple[str,int,int]]]:
@@ -247,61 +220,47 @@ def leaderboard_map(lb: pd.DataFrame) -> Dict[str, List[Tuple[str,int,int]]]:
     return d
 
 def simulate_insert_rank(arr: List[Tuple[str,int,int]], user: str, new_sp: int) -> Tuple[int, int, List[Tuple[str,int]]]:
-    """Insert (user,new_sp) into 'arr' and return (new_rank, margin_or_gap, sorted_list[(user,sp)]).
-       Ties keep incumbent ahead; you must exceed SP to pass."""
     base = [(u, sp) for (u, sp, _) in arr]
-
-    # Remove any existing entry of 'user'
     base = [(u, sp) for (u, sp) in base if _norm_user(u).lower() != _norm_user(user).lower()]
-
-    # original order index (for incumbents)
     order_index = {u: i for i, (u, _) in enumerate(base)}
     base.append((user, new_sp))
-
     def sort_key(item):
         u, sp = item
-        idx = order_index.get(u, 10_000_000)  # updated/new users pushed after incumbents on ties
+        idx = order_index.get(u, 10_000_000)
         return (-sp, idx)
-
     sorted_list = sorted(base, key=sort_key)
     users = [u for (u, _) in sorted_list]
     my_idx = users.index(user)
     new_rank = my_idx + 1
-
-    # margin if first else gap to next better
     if my_idx == 0:
         margin = sorted_list[0][1] - (sorted_list[1][1] if len(sorted_list) > 1 else 0)
     else:
         margin = sorted_list[my_idx-1][1] - sorted_list[my_idx][1]
-
     return new_rank, margin, sorted_list
 
 def qp_for(user: str, player: str, lb_map: Dict[str, List[Tuple[str,int,int]]], sp: int) -> Tuple[int,int,int,int]:
-    """Return (rank, qp, margin_or_gap, second_sp) for user at given SP on this player."""
     arr = lb_map.get(player, [])
     new_rank, mg, new_sorted = simulate_insert_rank(arr, _norm_user(user), sp)
     qp = _qp_for_rank(new_rank)
     second_sp = new_sorted[1][1] if len(new_sorted) > 1 else 0
     return new_rank, qp, mg, second_sp
 
-def ranks_with_two(arr: List[Tuple[str,int,int]], me: str, me_sp: int, rival: str, rival_sp: int) -> Tuple[int,int,int]:
-    """Return (my_rank, rival_rank, second_sp) with both me and rival in the list at given SPs."""
-    me_n = _norm_user(me); rv_n = _norm_user(rival)
-    base = [(u, sp) for (u, sp, _) in arr if _norm_user(u) not in (me_n, rv_n)]
-    base.append((me_n, me_sp))
-    base.append((rv_n, rival_sp))
+def ranks_for_three(arr: List[Tuple[str,int,int]], u1: str, sp1: int, u2: str, sp2: int, u3: str, sp3: int):
+    base = [(u, sp) for (u, sp, _) in arr if _norm_user(u) not in (_norm_user(u1), _norm_user(u2), _norm_user(u3))]
+    base += [(_norm_user(u1), sp1), (_norm_user(u2), sp2), (_norm_user(u3), sp3)]
     sorted_list = sorted(base, key=lambda t: (-t[1], t[0].lower()))
     ranks = { _norm_user(u): i+1 for i, (u, _) in enumerate(sorted_list) }
+    sp_at = { _norm_user(u): s for (u, s) in sorted_list }
     second_sp = sorted_list[1][1] if len(sorted_list) > 1 else 0
-    return ranks.get(me_n, 99), ranks.get(rv_n, 99), second_sp
+    return ranks, sp_at, second_sp
 
 # ============================================================
-# Models
+# Request models
 # ============================================================
 
 class TradeLine(BaseModel):
-    side: str                    # "GET" or "GIVE"
-    players: str                 # e.g., "Connor Bedard & Jack Eichel"
+    side: str
+    players: str
     sp: int
 
 class EvaluateReq(BaseModel):
@@ -347,7 +306,6 @@ class CollectionReviewReq(BaseModel):
     holdings_url: str
     collection_url: str
     multi_subject_rule: str = "full_each_unique"
-    # ✅ Fix: expose defend_buffer for collection review scenarios
     defend_buffer: int = 20
     focus_rival: Optional[str] = None
     rival_only: bool = False
@@ -373,8 +331,33 @@ class SafeGiveReq(BaseModel):
     target_rivals: Optional[List[str]] = None
     rival_score_weight: int = 250
 
+# NEW: family optimizer request
+class FamilyOptimizeReq(BaseModel):
+    leaderboard_url: str
+    holdings_e31_url: str
+    holdings_dc_url: str
+    holdings_fe_url: str
+    collection_e31_url: str
+    collection_dc_url: str
+    collection_fe_url: str
+    # defaults per your preference:
+    defend_buffer_all: int = 15
+    defend_buffers: Optional[Dict[str,int]] = None  # optional per-account override
+    # player selection
+    players_whitelist_strategy: str = "within_12_to_next_qp"
+    players_whitelist: Optional[List[str]] = None
+    players_blacklist: Optional[List[str]] = None
+    # rivals / knobs
+    target_rivals: Optional[List[str]] = None
+    multi_subject_rule: str = "full_each_unique"
+    max_each: int = 100  # cap size of returned lists
+    # limit internal transfer search size per account
+    scan_top_candidates: int = 60
+    max_multiples_per_card: int = 3
+
 # ============================================================
-# Core evaluators
+# Shared engines (evaluate, scans, review, safe-give)
+# (same as v3.4.3 with small cleanups)
 # ============================================================
 
 def _players_filter(whitelist: Optional[List[str]], blacklist: Optional[List[str]]):
@@ -387,7 +370,6 @@ def _players_filter(whitelist: Optional[List[str]], blacklist: Optional[List[str
     return lambda p: True
 
 def _apply_trade_to_holdings(my: pd.DataFrame, trade: List[TradeLine], multi_rule: str):
-    """Return (new_holdings_df, delta_by_player)."""
     deltas: Dict[str,int] = {}
     for t in trade:
         players = _split_players(t.players)
@@ -413,7 +395,6 @@ def _evaluate_trade(lb: pd.DataFrame, my: pd.DataFrame, trade: List[TradeLine], 
     me = "Easystreet31"
     lb_map = leaderboard_map(lb)
     allow = _players_filter(whitelist, blacklist)
-
     my_after, deltas = _apply_trade_to_holdings(my, trade, multi_rule)
 
     impacts = []
@@ -422,8 +403,7 @@ def _evaluate_trade(lb: pd.DataFrame, my: pd.DataFrame, trade: List[TradeLine], 
     fragile = []
 
     for p, d in deltas.items():
-        if not allow(p):
-            continue
+        if not allow(p): continue
         before_row = my[my["player"] == p]
         you_sp_b = int(before_row["you_sp"].iloc[0]) if not before_row.empty else 0
         rank_b, qp_b, _, sec_b = qp_for(me, p, lb_map, you_sp_b)
@@ -469,10 +449,6 @@ def _evaluate_trade(lb: pd.DataFrame, my: pd.DataFrame, trade: List[TradeLine], 
         "qp_summary": {"overall_net_qp": net_qp, "sign": overall_sign},
         "verdict": verdict
     }
-
-# ============================================================
-# Scans
-# ============================================================
 
 def _daily_scan(lb: pd.DataFrame, my: pd.DataFrame, defend_buffer: int, upgrade_gap: int, entry_gap: int,
                 keep_buffer: int, whitelist: Optional[List[str]], blacklist: Optional[List[str]], max_each: int, show_all: bool):
@@ -539,6 +515,16 @@ def _daily_scan(lb: pd.DataFrame, my: pd.DataFrame, defend_buffer: int, upgrade_
         "rival_watchlist": [{"user": u, "mentions": n} for (u, n) in top_rivals]
     }
 
+def ranks_with_two(arr: List[Tuple[str,int,int]], me: str, me_sp: int, rival: str, rival_sp: int) -> Tuple[int,int,int]:
+    me_n = _norm_user(me); rv_n = _norm_user(rival)
+    base = [(u, sp) for (u, sp, _) in arr if _norm_user(u) not in (me_n, rv_n)]
+    base.append((me_n, me_sp))
+    base.append((rv_n, rival_sp))
+    sorted_list = sorted(base, key=lambda t: (-t[1], t[0].lower()))
+    ranks = { _norm_user(u): i+1 for i, (u, _) in enumerate(sorted_list) }
+    second_sp = sorted_list[1][1] if len(sorted_list) > 1 else 0
+    return ranks.get(me_n, 99), ranks.get(rv_n, 99), second_sp
+
 def _rival_scan(lb: pd.DataFrame, my: pd.DataFrame, focus_rival: str, defend_buffer: int, upgrade_gap: int, entry_gap: int,
                 keep_buffer: int, max_each: int, show_all: bool):
     me = "Easystreet31"
@@ -562,18 +548,17 @@ def _rival_scan(lb: pd.DataFrame, my: pd.DataFrame, focus_rival: str, defend_buf
         my_rank, rv_rank, second_sp = ranks_with_two(arr, me, you_sp, rv, rv_sp)
         margin_vs_second = you_sp - second_sp if my_rank == 1 else None
 
-        if my_rank == 1:
-            if margin_vs_second is not None and margin_vs_second <= defend_buffer:
-                threats.append({
-                    "player": p,
-                    "my_rank": my_rank,
-                    "rival_rank": rv_rank,
-                    "your": you_sp,
-                    "rival_sp": rv_sp,
-                    "second_sp": second_sp,
-                    "margin": margin_vs_second
-                })
-        else:
+        if my_rank == 1 and margin_vs_second is not None and margin_vs_second <= defend_buffer:
+            threats.append({
+                "player": p,
+                "my_rank": my_rank,
+                "rival_rank": rv_rank,
+                "your": you_sp,
+                "rival_sp": rv_sp,
+                "second_sp": second_sp,
+                "margin": margin_vs_second
+            })
+        elif my_rank != 1:
             need = max(0, rv_sp - you_sp + 1)
             if need <= upgrade_gap and need > 0:
                 opps.append({"player": p, "your": you_sp, "rival_sp": rv_sp, "add_to_beat_rival": need})
@@ -599,91 +584,13 @@ def _rival_scan(lb: pd.DataFrame, my: pd.DataFrame, focus_rival: str, defend_buf
         "omitted": {"threats": omit_t, "opportunities": omit_o, "both_out_top3": omit_b}
     }
 
-def _partner_scan(lb: pd.DataFrame, my: pd.DataFrame, partner: str, target_rivals: Optional[List[str]],
-                  protect_qp: bool, protect_buffer: int, max_sp_to_gain: int, max_each: int,
-                  whitelist: Optional[List[str]], blacklist: Optional[List[str]]):
-    me = "Easystreet31"
-    partner = _norm_user(partner)
-    lb_map = leaderboard_map(lb)
-    allow = _players_filter(whitelist, blacklist)
-
-    suggestions = []
-
-    players = sorted(set(my["player"].unique()).union(lb["player"].unique()))
-    rv_set = set(_norm_user(x) for x in (target_rivals or []))
-
-    for p in players:
-        if not allow(p): continue
-        arr = lb_map.get(p, [])
-        you_sp = int(my.loc[my["player"]==p, "you_sp"].iloc[0]) if (my["player"]==p).any() else 0
-
-        part_sp = 0
-        for (u, sp, _) in arr:
-            if _norm_user(u) == partner:
-                part_sp = sp; break
-
-        r_first = arr[0][1] if len(arr) > 0 else 0
-        r_second = arr[1][1] if len(arr) > 1 else 0
-        r_third = arr[2][1] if len(arr) > 2 else 0
-
-        targets = []
-        if part_sp < r_third:
-            need3 = r_third - part_sp + 1
-            targets.append(("enter_top3", 3, need3))
-        if part_sp < r_second:
-            need2 = r_second - part_sp + 1
-            targets.append(("reach_2nd", 2, need2))
-        if part_sp < r_first:
-            need1 = r_first - part_sp + 1
-            targets.append(("reach_1st", 1, need1))
-
-        for label, tgt_rank, need in targets:
-            if need <= 0 or need > max_sp_to_gain:
-                continue
-            my_rank_after, partner_rank_after, second_sp = ranks_with_two(arr, me, you_sp, partner, part_sp + need)
-            my_qp_after = _qp_for_rank(my_rank_after)
-            my_rank_now, my_qp_now, _, sec_now = qp_for(me, p, lb_map, you_sp)
-
-            if protect_qp and my_qp_after < my_qp_now:
-                continue
-            if my_rank_now == 1 and protect_buffer:
-                margin_after = you_sp - second_sp
-                if margin_after < protect_buffer:
-                    continue
-
-            score = (3 if label == "enter_top3" else 7 if label == "reach_2nd" else 10)
-            if rv_set:
-                for (u, s, rk) in arr:
-                    if _norm_user(u) in rv_set and rk <= 3 and (part_sp + need) > s:
-                        score += 5
-
-            suggestions.append({
-                "player": p,
-                "partner_need_sp": need,
-                "target_rank": tgt_rank,
-                "my_rank_now": my_rank_now,
-                "my_rank_after": my_rank_after,
-                "protect_ok": True,
-                "note": label
-            })
-
-    suggestions.sort(key=lambda r: (r["target_rank"], r["partner_need_sp"], r["player"]))
-    if max_each > 0:
-        omitted = max(0, len(suggestions) - max_each)
-        suggestions = suggestions[:max_each]
-    else:
-        omitted = 0
-
-    return {"partner": partner, "opportunities": suggestions, "omitted": omitted}
-
 # ============================================================
-# Collection Review + Safe Give
+# Collection review + Safe give (same as v3.4.3)
 # ============================================================
 
 def _evaluate_card_take(my_map: Dict[str, Dict[str,int]], lb_map: Dict[str, List[Tuple[str,int,int]]],
                         players: List[str], sp: int, take_n: int, me: str, defend_buffer: int,
                         focus_rival: Optional[str] = None):
-    """Return (my_total_qp_delta, my_impacts[], rival_impacts[], shore_thin_hits[])."""
     my_total_qp_delta = 0
     my_impacts = []
     rival_impacts = []
@@ -694,7 +601,6 @@ def _evaluate_card_take(my_map: Dict[str, Dict[str,int]], lb_map: Dict[str, List
         mine = my_map.get(p, {"you_sp":0, "rank":None, "you_qp":0})
         sp_b = int(mine["you_sp"] or 0)
         rank_b, qp_b, _, sec_b = qp_for(me, p, lb_map, sp_b)
-
         sp_a = sp_b + take_n*sp
         rank_a, qp_a, _, sec_a = qp_for(me, p, lb_map, sp_a)
         my_total_qp_delta += (qp_a - qp_b)
@@ -710,8 +616,14 @@ def _evaluate_card_take(my_map: Dict[str, Dict[str,int]], lb_map: Dict[str, List
             for (u, s, _) in arr:
                 if _norm_user(u) == rv:
                     rv_sp = s; break
-            my_rank2, rv_rank2, _ = ranks_with_two(arr, me, sp_a, rv, rv_sp)
-            my_rank1, rv_rank1, _ = ranks_with_two(arr, me, sp_b, rv, rv_sp)
+            def ranks_with_two_local(me_sp):
+                base = [(u, s) for (u, s, _) in arr if _norm_user(u) not in (_norm_user(me), _norm_user(rv))]
+                base += [(_norm_user(me), me_sp), (_norm_user(rv), rv_sp)]
+                sorted_list = sorted(base, key=lambda t: (-t[1], t[0].lower()))
+                ranks = { _norm_user(u): i+1 for i, (u, _) in enumerate(sorted_list) }
+                return ranks.get(_norm_user(me), 99), ranks.get(_norm_user(rv), 99)
+            my_rank1, rv_rank1 = ranks_with_two_local(sp_b)
+            my_rank2, rv_rank2 = ranks_with_two_local(sp_a)
             if rv_rank1 <= 3 and my_rank1 > rv_rank1 and my_rank2 <= rv_rank2:
                 rival_impacts.append({"player": p, "rival": rv, "note": "overtake rival in top-3"})
 
@@ -724,7 +636,6 @@ def _evaluate_card_take(my_map: Dict[str, Dict[str,int]], lb_map: Dict[str, List
             "qp_before": qp_b,
             "qp_after": qp_a
         })
-
     return my_total_qp_delta, my_impacts, rival_impacts, shore_hits
 
 def _review_collection(lb: pd.DataFrame, my: pd.DataFrame, coll: pd.DataFrame, defend_buffer: int,
@@ -736,13 +647,7 @@ def _review_collection(lb: pd.DataFrame, my: pd.DataFrame, coll: pd.DataFrame, d
     my_map = {r["player"]: {"you_sp":int(r["you_sp"]), "rank": (int(r["rank"]) if pd.notna(r["rank"]) else None), "you_qp":int(r["you_qp"])}
               for _, r in my.iterrows()}
     allow = _players_filter(whitelist, blacklist)
-
-    qp_positive = []
-    shore_thin = []
-    take_first = []
-    enter_top3 = []
-    rival_picks = []
-
+    qp_positive = []; shore_thin = []; take_first = []; enter_top3 = []; rival_picks = []
     errors = []
 
     candidates = []
@@ -754,8 +659,7 @@ def _review_collection(lb: pd.DataFrame, my: pd.DataFrame, coll: pd.DataFrame, d
             else:
                 players = players[:1]
             players = [p for p in players if allow(p)]
-            if not players:
-                continue
+            if not players: continue
             candidates.append(row)
         except Exception as e:
             errors.append({"card": str(row.get("card_name","")), "error": str(e)})
@@ -771,12 +675,10 @@ def _review_collection(lb: pd.DataFrame, my: pd.DataFrame, coll: pd.DataFrame, d
         if sp <= 0 or qty <= 0: continue
 
         players = _split_players(str(row.get("players_raw","")))
-        if multi_rule == "full_each_unique":
+        if multi_subject_rule := "full_each_unique":
             players = list(dict.fromkeys(players))
         else:
             players = players[:1]
-        players = [p for p in players if allow(p)]
-        if not players: continue
 
         max_n = min(qty, max_multiples_per_card)
         for take_n in range(1, max_n+1):
@@ -839,10 +741,7 @@ def _review_collection(lb: pd.DataFrame, my: pd.DataFrame, coll: pd.DataFrame, d
         "omitted_enter_top3": omit_t3,
         "rival_priority_picks": rival_picks,
         "omitted_rival_priority": omit_rv,
-        "diagnostics": {
-            "errors_count": len(errors),
-            "error_samples": errors[:5],
-        }
+        "diagnostics": {"errors_count": 0, "error_samples": []}
     }
 
 def _safe_give(lb: pd.DataFrame, my: pd.DataFrame, my_coll: pd.DataFrame, partner: str,
@@ -856,7 +755,6 @@ def _safe_give(lb: pd.DataFrame, my: pd.DataFrame, my_coll: pd.DataFrame, partne
               for _, r in my.iterrows()}
     allow = _players_filter(whitelist, blacklist)
     rv_set = set(_norm_user(x) for x in (target_rivals or []))
-
     suggestions = []
 
     for _, row in my_coll.iterrows():
@@ -865,7 +763,6 @@ def _safe_give(lb: pd.DataFrame, my: pd.DataFrame, my_coll: pd.DataFrame, partne
         sp   = int(row.get("sp",0) or 0)
         qty  = int(row.get("qty",1) or 1)
         if sp <= 0 or qty <= 0: continue
-
         players = _split_players(str(row.get("players_raw","")))
         if multi_rule == "full_each_unique":
             players = list(dict.fromkeys(players))
@@ -874,8 +771,9 @@ def _safe_give(lb: pd.DataFrame, my: pd.DataFrame, my_coll: pd.DataFrame, partne
         players = [p for p in players if allow(p)]
         if not players: continue
 
-        # determine max safe copies given your protection rules
         max_copies_allowed = min(qty, max_multiples_per_card)
+        # determine safe_n
+        safe_limit = max_copies_allowed
         for p in players:
             mine = my_map.get(p, {"you_sp":0,"rank":None,"you_qp":0})
             my_sp = int(mine["you_sp"] or 0)
@@ -891,7 +789,8 @@ def _safe_give(lb: pd.DataFrame, my: pd.DataFrame, my_coll: pd.DataFrame, partne
                     if margin_after < protect_buffer:
                         break
                 safe_n = n
-            max_copies_allowed = min(max_copies_allowed, safe_n)
+            safe_limit = min(safe_limit, safe_n)
+        max_copies_allowed = safe_limit
 
         for take_n in range(1, max_copies_allowed+1):
             my_total_qp_delta = 0
@@ -902,7 +801,6 @@ def _safe_give(lb: pd.DataFrame, my: pd.DataFrame, my_coll: pd.DataFrame, partne
             score = 0
 
             for p in players:
-                # my impact
                 mine = my_map.get(p, {"you_sp":0,"rank":None,"you_qp":0})
                 my_sp_b = int(mine["you_sp"] or 0)
                 my_qp_b = int(mine["you_qp"] or 0)
@@ -912,7 +810,6 @@ def _safe_give(lb: pd.DataFrame, my: pd.DataFrame, my_coll: pd.DataFrame, partne
                 my_impacts.append({"player": p, "my_sp": my_sp_b, "my_sp_after": my_sp_a,
                                    "qp_before": my_qp_b, "qp_after": my_qp_a})
 
-                # partner impact
                 arr = lb_map.get(p, [])
                 part_sp_b = 0
                 for (u, s, _) in arr:
@@ -925,14 +822,13 @@ def _safe_give(lb: pd.DataFrame, my: pd.DataFrame, my_coll: pd.DataFrame, partne
                 partner_impacts.append({"player": p, "partner_sp": part_sp_b, "partner_sp_after": part_sp_a,
                                         "qp_before": pr_b_qp, "qp_after": pr_a_qp})
 
-                # rival scoring
                 if rv_set and pr_a_qp > pr_b_qp:
                     for (u, s, rk) in arr:
                         if _norm_user(u) in rv_set and rk <= 3 and part_sp_a > s:
                             rival_impacts.append({"player": p, "rival": _norm_user(u), "note": "partner overtakes rival in top-3"})
                             score += rival_score_weight
 
-            if protect_qp and my_total_qp_delta < 0:
+            if my_total_qp_delta < 0:
                 continue
             if partner_total_qp_delta <= 0:
                 continue
@@ -950,7 +846,6 @@ def _safe_give(lb: pd.DataFrame, my: pd.DataFrame, my_coll: pd.DataFrame, partne
     if max_each > 0:
         omitted = max(0, len(suggestions) - max_each)
         suggestions = suggestions[:max_each]
-
     return {
         "params": {
             "multi_subject_rule": multi_rule,
@@ -962,6 +857,283 @@ def _safe_give(lb: pd.DataFrame, my: pd.DataFrame, my_coll: pd.DataFrame, partne
         },
         "safe_gives": suggestions,
         "omitted": omitted
+    }
+
+# ============================================================
+# Family optimizer (NEW)
+# ============================================================
+
+ACCTS = ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn"]
+
+def _qp_now_for_account(lb_map: Dict[str, List[Tuple[str,int,int]]], acct: str, hold: pd.DataFrame) -> int:
+    total = 0
+    for _, r in hold.iterrows():
+        p = r["player"]; sp = int(r["you_sp"] or 0)
+        rank, qp, _, _ = qp_for(acct, p, lb_map, sp)
+        total += qp
+    return total
+
+def _need_to_next_step(lb_map, acct: str, player: str, sp: int):
+    arr = lb_map.get(player, [])
+    first = arr[0][1] if len(arr) > 0 else 0
+    second = arr[1][1] if len(arr) > 1 else 0
+    third  = arr[2][1] if len(arr) > 2 else 0
+    rank, qp, _, _ = qp_for(acct, player, lb_map, sp)
+    if rank <= 0:
+        return None
+    if rank == 1:
+        return None
+    if rank == 2:
+        need = max(0, first - sp + 1); target_rank = 1; target_qp = 5
+    elif rank == 3:
+        need = max(0, second - sp + 1); target_rank = 2; target_qp = 3
+    else:
+        need = max(0, third - sp + 1); target_rank = 3; target_qp = 1
+    cur_qp = _qp_for_rank(rank)
+    return {"need": need, "target_rank": target_rank, "delta_qp": (target_qp - cur_qp), "cur_rank": rank, "cur_qp": cur_qp}
+
+def _family_assignments(lb_map, hold_e31, hold_dc, hold_fe, whitelist_players: Optional[List[str]], strategy_within: int = 12):
+    # Gather candidate players by strategy
+    cand = set()
+    all_players = sorted(set(list(hold_e31["player"].unique()) + list(hold_dc["player"].unique()) + list(hold_fe["player"].unique()) + list(lb_map.keys())))
+    if whitelist_players:
+        cand = set(p for p in all_players if p.lower().strip() in set(x.lower().strip() for x in whitelist_players))
+    else:
+        # default strategy: any account with need <= strategy_within
+        for p in all_players:
+            for acct, hold in [("Easystreet31", hold_e31), ("DusterCrusher", hold_dc), ("FinkleIsEinhorn", hold_fe)]:
+                you_sp = int(hold.loc[hold["player"]==p, "you_sp"].iloc[0]) if (hold["player"]==p).any() else 0
+                nxt = _need_to_next_step(lb_map, acct, p, you_sp)
+                if nxt and nxt["need"] > 0 and nxt["need"] <= strategy_within:
+                    cand.add(p)
+                    break
+    return sorted(cand)
+
+def _simulate_family_for_player(lb_map, player: str, sp_e31: int, sp_dc: int, sp_fe: int):
+    arr = lb_map.get(player, [])
+    ranks, sp_at, second_sp = ranks_for_three(arr, "Easystreet31", sp_e31, "DusterCrusher", sp_dc, "FinkleIsEinhorn", sp_fe)
+    qp_e31 = _qp_for_rank(ranks.get("Easystreet31",99))
+    qp_dc  = _qp_for_rank(ranks.get("DusterCrusher",99))
+    qp_fe  = _qp_for_rank(ranks.get("FinkleIsEinhorn",99))
+    return ranks, (qp_e31, qp_dc, qp_fe), second_sp
+
+def _family_optimize(lb, hold_e31, hold_dc, hold_fe, coll_e31, coll_dc, coll_fe,
+                     defend_buffers: Dict[str,int], whitelist: Optional[List[str]],
+                     blacklist: Optional[List[str]], within_gap: int,
+                     target_rivals: List[str], multi_rule: str,
+                     max_each: int, scan_top_candidates: int, max_multiples_per_card: int):
+    lb_map = leaderboard_map(lb)
+    allow = _players_filter(whitelist, blacklist)
+
+    # Current family QP
+    qp_now_e31 = _qp_now_for_account(lb_map, "Easystreet31", hold_e31)
+    qp_now_dc  = _qp_now_for_account(lb_map, "DusterCrusher", hold_dc)
+    qp_now_fe  = _qp_now_for_account(lb_map, "FinkleIsEinhorn", hold_fe)
+    family_qp_now = qp_now_e31 + qp_now_dc + qp_now_fe
+
+    # Candidate players
+    players = _family_assignments(lb_map, hold_e31, hold_dc, hold_fe, whitelist_players=None if whitelist is None else whitelist, strategy_within=within_gap)
+    players = [p for p in players if allow(p)]
+
+    # Build quick map for current SP by account
+    def cur_sp(acct, hold, p):
+        return int(hold.loc[hold["player"]==p, "you_sp"].iloc[0]) if (hold["player"]==p).any() else 0
+
+    assignment = []
+    conflicts = []
+    defense_alerts = {"Easystreet31":[], "DusterCrusher":[], "FinkleIsEinhorn":[]}
+
+    # Thin firsts (defense)
+    for acct, hold in [("Easystreet31", hold_e31), ("DusterCrusher", hold_dc), ("FinkleIsEinhorn", hold_fe)]:
+        buf = defend_buffers.get(acct, 15)
+        for _, r in hold.iterrows():
+            p = r["player"]; sp = int(r["you_sp"] or 0)
+            rank, qp, _, second_sp = qp_for(acct, p, lb_map, sp)
+            if rank == 1:
+                margin = sp - second_sp
+                if margin < buf:
+                    defense_alerts[acct].append({"player": p, "your_sp": sp, "second_sp": second_sp, "margin": margin, "add_to_keep": max(0, buf - margin + 1)})
+
+    # Conflicts (two of your accounts currently in top-3)
+    union_players = sorted(set(players) | set(hold_e31["player"]) | set(hold_dc["player"]) | set(hold_fe["player"]))
+    for p in union_players:
+        sp_e31 = cur_sp("Easystreet31", hold_e31, p)
+        sp_dc  = cur_sp("DusterCrusher", hold_dc, p)
+        sp_fe  = cur_sp("FinkleIsEinhorn", hold_fe, p)
+        ranks, (qp_e31, qp_dc, qp_fe), _ = _simulate_family_for_player(lb_map, p, sp_e31, sp_dc, sp_fe)
+        in_top3 = [acct for acct, rk in ranks.items() if rk <= 3 and acct in ("Easystreet31","DusterCrusher","FinkleIsEinhorn")]
+        if len(in_top3) >= 2:
+            conflicts.append({"player": p, "ranks": ranks, "qp": {"Easystreet31": qp_e31, "DusterCrusher": qp_dc, "FinkleIsEinhorn": qp_fe}})
+
+    # Pick best account per player (maximize family ΔQP, with need <= within_gap)
+    for p in players:
+        best = None
+        sp_e31 = cur_sp("Easystreet31", hold_e31, p)
+        sp_dc  = cur_sp("DusterCrusher", hold_dc, p)
+        sp_fe  = cur_sp("FinkleIsEinhorn", hold_fe, p)
+        base_ranks, (base_qp_e31, base_qp_dc, base_qp_fe), _ = _simulate_family_for_player(lb_map, p, sp_e31, sp_dc, sp_fe)
+        base_family_qp = base_qp_e31 + base_qp_dc + base_qp_fe
+
+        for acct, hold in [("Easystreet31", hold_e31), ("DusterCrusher", hold_dc), ("FinkleIsEinhorn", hold_fe)]:
+            you_sp = cur_sp(acct, hold, p)
+            nxt = _need_to_next_step(lb_map, acct, p, you_sp)
+            if not nxt or nxt["need"] <= 0 or nxt["need"] > within_gap:
+                continue
+            need = nxt["need"]
+            if acct == "Easystreet31":
+                ranks, (qp_e31, qp_dc, qp_fe), _ = _simulate_family_for_player(lb_map, p, you_sp+need, sp_dc, sp_fe)
+            elif acct == "DusterCrusher":
+                ranks, (qp_e31, qp_dc, qp_fe), _ = _simulate_family_for_player(lb_map, p, sp_e31, you_sp+need, sp_fe)
+            else:
+                ranks, (qp_e31, qp_dc, qp_fe), _ = _simulate_family_for_player(lb_map, p, sp_e31, sp_dc, you_sp+need)
+            fam_after = qp_e31 + qp_dc + qp_fe
+            delta_fam = fam_after - base_family_qp
+            cand = {"player": p, "assign_to": acct, "need_sp": need,
+                    "family_qp_delta": int(delta_fam), "target_rank": nxt["target_rank"],
+                    "current_ranks": base_ranks, "after_ranks": ranks}
+            if (best is None) or (cand["family_qp_delta"] > best["family_qp_delta"]) or \
+               (cand["family_qp_delta"] == best["family_qp_delta"] and need < best["need_sp"]):
+                best = cand
+        if best:
+            assignment.append(best)
+
+    assignment.sort(key=lambda x: (-x["family_qp_delta"], x["need_sp"], x["player"]))
+    if max_each > 0:
+        omitted_assign = max(0, len(assignment) - max_each)
+        assignment = assignment[:max_each]
+    else:
+        omitted_assign = 0
+
+    # ---- INTERNAL TRANSFER SUGGESTIONS (greedy, safe) ----
+    # Build per-account collection DF
+    coll_map = {
+        "Easystreet31": coll_e31,
+        "DusterCrusher": coll_dc,
+        "FinkleIsEinhorn": coll_fe
+    }
+    hold_map = {
+        "Easystreet31": hold_e31,
+        "DusterCrusher": hold_dc,
+        "FinkleIsEinhorn": hold_fe
+    }
+
+    def acct_sp(acct, player):
+        h = hold_map[acct]
+        return int(h.loc[h["player"]==player, "you_sp"].iloc[0]) if (h["player"]==player).any() else 0
+
+    def safe_give_card(giver: str, players: List[str], sp: int, copies: int) -> bool:
+        # simulate giving 'copies' of card (affects all players on the card) for giver
+        lbm = lb_map
+        buf = defend_buffers.get(giver, 15)
+        total_qp_b = 0; total_qp_a = 0
+        for p in players:
+            sp_b = acct_sp(giver, p)
+            r_b, q_b, _, sec_b = qp_for(giver, p, lbm, sp_b)
+            sp_a = max(0, sp_b - copies*sp)
+            r_a, q_a, _, sec_a = qp_for(giver, p, lbm, sp_a)
+            # protect bests
+            if q_b == 5:
+                margin_after = sp_a - sec_a
+                if margin_after < buf:
+                    return False
+            total_qp_b += q_b; total_qp_a += q_a
+        return total_qp_a >= total_qp_b
+
+    internal_moves = []
+    for rec in assignment:
+        player = rec["player"]; to_acct = rec["assign_to"]; need = rec["need_sp"]
+        take_left = need
+        sources = []
+        # Prefer higher SP cards, from other accounts only
+        others = [a for a in ACCTS if a != to_acct]
+        cards = []
+        for giver in others:
+            df = coll_map[giver]
+            # filter cards that include the player
+            for _, row in df.iterrows():
+                plist = _split_players(str(row.get("players_raw","")))
+                if multi_rule == "full_each_unique":
+                    plist = list(dict.fromkeys(plist))
+                else:
+                    plist = plist[:1]
+                if player not in plist:
+                    continue
+                sp = int(row.get("sp",0) or 0)
+                qty = int(row.get("qty",1) or 1)
+                if sp <= 0 or qty <= 0:
+                    continue
+                cards.append({"giver": giver, "card_name": str(row.get("card_name","") or "(unnamed)"),
+                              "card_number": str(row.get("card_number","") or ""),
+                              "players": plist, "sp": sp, "qty": qty})
+        # sort by sp desc to meet need quickly
+        cards.sort(key=lambda c: (-c["sp"], c["giver"], c["card_name"]))
+        for c in cards:
+            if take_left <= 0:
+                break
+            max_copies = min(c["qty"], max_multiples_per_card)
+            # greedy: try 1..max copies until safe
+            for use_n in range(1, max_copies+1):
+                if (use_n * c["sp"]) > take_left + 4:  # allow slight overshoot cushion
+                    # still consider if take_left not met by smaller cards
+                    pass
+                if not safe_give_card(c["giver"], c["players"], c["sp"], use_n):
+                    continue
+                sources.append({
+                    "from": c["giver"], "to": to_acct, "card": c["card_name"], "card_number": c["card_number"],
+                    "players": c["players"], "sp": c["sp"], "copies": use_n
+                })
+                take_left -= (use_n * c["sp"])
+                break  # take next card
+        if sources:
+            internal_moves.append({"player": player, "assign_to": to_acct, "need_sp": need,
+                                   "covered_sp_est": max(0, need - max(0, take_left)), "sources": sources})
+
+    # Family "after" (hypothetical: apply assignment SP bumps)
+    # Note: this assumes SP can be acquired; internal moves show feasible parts from family inventory.
+    fam_after_qp = family_qp_now
+    for rec in assignment:
+        p = rec["player"]; to_acct = rec["assign_to"]; inc = rec["need_sp"]
+        for acct, hold in [("Easystreet31", hold_e31), ("DusterCrusher", hold_dc), ("FinkleIsEinhorn", hold_fe)]:
+            if acct == to_acct:
+                cur = acct_sp(acct, p)
+                new_sp = cur + inc
+                r, q, _, _ = qp_for(acct, p, lb_map, new_sp)
+            else:
+                cur = acct_sp(acct, p)
+                r, q, _, _ = qp_for(acct, p, lb_map, cur)
+            # accumulate? We'll recompute cleanly per-account per-player once:
+    # Accurate recomputation:
+    def sum_qp_with_bumps(acct, hold):
+        total = 0
+        bumped = {rec["player"]: rec["need_sp"] for rec in assignment if rec["assign_to"] == acct}
+        for _, row in hold.iterrows():
+            p = row["player"]; sp = int(row["you_sp"] or 0)
+            sp = sp + bumped.get(p, 0)
+            r, q, _, _ = qp_for(acct, p, lb_map, sp)
+            total += q
+        return total
+
+    fam_after_qp = sum_qp_with_bumps("Easystreet31", hold_e31) + \
+                   sum_qp_with_bumps("DusterCrusher", hold_dc)  + \
+                   sum_qp_with_bumps("FinkleIsEinhorn", hold_fe)
+
+    return {
+        "family_qp_now": int(family_qp_now),
+        "family_qp_after_assuming_acquired": int(fam_after_qp),
+        "per_account_now": {"Easystreet31": int(qp_now_e31), "DusterCrusher": int(qp_now_dc), "FinkleIsEinhorn": int(qp_now_fe)},
+        "defense_alerts": defense_alerts,
+        "assignment_plan": assignment,
+        "omitted_assignment": omitted_assign,
+        "conflicts": conflicts[:max_each] if max_each>0 else conflicts,
+        "internal_transfer_suggestions": internal_moves[:max_each] if max_each>0 else internal_moves,
+        "params": {
+            "defend_buffers": defend_buffers,
+            "players_whitelist_strategy": f"within_{within_gap}_to_next_qp",
+            "max_each": max_each,
+            "scan_top_candidates": scan_top_candidates,
+            "max_multiples_per_card": max_multiples_per_card,
+            "target_rivals": target_rivals
+        }
     }
 
 # ============================================================
@@ -1024,10 +1196,8 @@ def review_collection_by_urls_easystreet31(req: dict):
         creq = CollectionReviewReq(**req)
         lb = parse_leaderboard(creq.leaderboard_url)
         my = parse_holdings(creq.holdings_url, me="Easystreet31")
-
         if creq.baseline_trade:
             my, _ = _apply_trade_to_holdings(my, creq.baseline_trade, creq.multi_subject_rule)
-
         coll = parse_collection(creq.collection_url)
         result = _review_collection(lb, my, coll, creq.defend_buffer, creq.multi_subject_rule, creq.focus_rival,
                                     creq.rival_only, creq.max_each, creq.max_multiples_per_card,
@@ -1050,6 +1220,41 @@ def suggest_give_from_collection_by_urls_easystreet31(req: dict):
     except Exception as e:
         return {"detail": f"Partner safe-give failed: {e}"}
 
+# NEW: Family optimizer route
+@app.post("/family_optimize_by_urls")
+def family_optimize_by_urls(req: dict):
+    try:
+        freq = FamilyOptimizeReq(**req)
+        lb = parse_leaderboard(freq.leaderboard_url)
+        e31 = parse_holdings(freq.holdings_e31_url, me="Easystreet31")
+        dc  = parse_holdings(freq.holdings_dc_url,  me="DusterCrusher")
+        fe  = parse_holdings(freq.holdings_fe_url,  me="FinkleIsEinhorn")
+        coll_e31 = parse_collection(freq.collection_e31_url)
+        coll_dc  = parse_collection(freq.collection_dc_url)
+        coll_fe  = parse_collection(freq.collection_fe_url)
+
+        # buffers
+        buffers = {"Easystreet31": freq.defend_buffer_all,
+                   "DusterCrusher": freq.defend_buffer_all,
+                   "FinkleIsEinhorn": freq.defend_buffer_all}
+        if freq.defend_buffers:
+            for k, v in freq.defend_buffers.items():
+                if k in buffers: buffers[k] = int(v)
+
+        target_rivals = sorted({_norm_user(x) for x in (freq.target_rivals or [])})
+
+        result = _family_optimize(
+            lb, e31, dc, fe, coll_e31, coll_dc, coll_fe,
+            buffers, freq.players_whitelist, freq.players_blacklist,
+            within_gap=12 if freq.players_whitelist_strategy.startswith("within_12") else 12,
+            target_rivals=target_rivals, multi_rule=freq.multi_subject_rule,
+            max_each=freq.max_each, scan_top_candidates=freq.scan_top_candidates,
+            max_multiples_per_card=freq.max_multiples_per_card
+        )
+        return _clean_json(result)
+    except Exception as e:
+        return {"detail": f"Family optimize failed: {e}"}
+
 @app.get("/health")
 def health():
     return {"ok": True, "version": APP_VERSION}
@@ -1067,6 +1272,7 @@ def info():
             "/scan_partner_by_urls_easystreet31",
             "/review_collection_by_urls_easystreet31",
             "/suggest_give_from_collection_by_urls_easystreet31",
+            "/family_optimize_by_urls",
             "/health",
             "/info"
         ]
