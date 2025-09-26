@@ -1,6 +1,6 @@
-# main.py  (v4.0.0-phase23)
+# main.py  (v4.0.1-phase23)
 import io, re, math, json, sys
-from typing import List, Dict, Any, Optional, Tuple, Set
+from typing import List, Dict, Any, Optional, Tuple, Set, Literal
 from collections import defaultdict, Counter
 
 import requests
@@ -16,7 +16,7 @@ try:
 except Exception:
     HAS_ORTOOLS = False
 
-APP_VERSION = "4.0.0-phase23"
+APP_VERSION = "4.0.1-phase23"
 
 app = FastAPI(title="Ultimate Quest Service", version=APP_VERSION)
 
@@ -36,7 +36,6 @@ def fetch_xlsx(url: str) -> Dict[str, pd.DataFrame]:
         sheets = {}
         for name in xls.sheet_names:
             df = xls.parse(name)
-            # Normalize headers: strip, lower
             df.columns = [str(c).strip() for c in df.columns]
             sheets[name] = df
         return sheets
@@ -88,10 +87,8 @@ def split_multi_subject_players(players_text: str) -> List[str]:
     if not players_text:
         return []
     s = str(players_text)
-    # Common separators
     parts = re.split(r"\s*(?:/|&|\+|,| and |\||—|–)\s*", s)
     parts = [_norm_player(p) for p in parts if _norm_player(p)]
-    # Unique only
     unique = []
     seen = set()
     for p in parts:
@@ -108,8 +105,6 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
     Normalize leaderboard to: {player: [{user, sp}, ...]} sorted by sp desc.
     Supports either long form (player,user,sp[,rank]) or wide top-N with owner/sp columns.
     """
-    # Try to find a plausible sheet
-    # Heuristic: pick the first sheet with a 'player' column (case-insensitive)
     candidate = None
     for name, df in sheets.items():
         cols_lower = [c.lower() for c in df.columns]
@@ -117,28 +112,21 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
             candidate = df
             break
     if candidate is None:
-        # Just take the first sheet
         name0 = list(sheets.keys())[0]
         candidate = sheets[name0]
 
     df = candidate.copy()
-    # Standardize column names
     df.columns = [c.strip() for c in df.columns]
-    lower_cols = {c.lower(): c for c in df.columns}
 
     out: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
-    # LONG FORM?
-    # columns containing player & user & sp
     lower = [c.lower() for c in df.columns]
     has_player = any("player" in c for c in lower)
     has_user   = any(("user" in c or "owner" in c or "name" in c) for c in lower)
     has_sp     = any(("sp" in c or "points" in c or "subject" in c) for c in lower)
 
     if has_player and has_user and has_sp:
-        # guess columns
         player_col = next(c for c in df.columns if "player" in c.lower())
-        # choose first user-like col
         user_col = next(c for c in df.columns if any(k in c.lower() for k in ["user","owner","name"]))
         sp_col   = next(c for c in df.columns if any(k in c.lower() for k in ["sp","points","subject"]))
         for _, row in df.iterrows():
@@ -147,13 +135,10 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
             sp = _as_int(row.get(sp_col, 0))
             if p and u:
                 out[p].append(dict(user=u, sp=sp))
-        # sort per-player
         for p in list(out.keys()):
             out[p].sort(key=lambda x: (-x["sp"], x["user"].lower()))
         return out
 
-    # WIDE FORM?
-    # Look for paired columns like "<k> <something user>" and "<k> <something sp>"
     player_col = None
     for c in df.columns:
         if "player" in c.lower():
@@ -162,17 +147,12 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
     if player_col is None:
         player_col = df.columns[0]
 
-    # Build pairs
     pairs = []
     cols = df.columns.tolist()
     for c in cols:
         cl = c.lower()
         if any(k in cl for k in ["user","owner","name"]):
-            # find a sibling 'sp' col near it
-            # prefer same prefix number like '1' or 'first'
-            # fallback: next column with 'sp'
             spcol = None
-            # try exact index+1
             idx = cols.index(c)
             if idx + 1 < len(cols):
                 if "sp" in cols[idx+1].lower() or "points" in cols[idx+1].lower():
@@ -180,7 +160,6 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
             if spcol is None:
                 for c2 in cols:
                     if "sp" in c2.lower() or "points" in c2.lower():
-                        # cheap heuristic: distance small and shares a number digit
                         if any(d.isdigit() for d in c) and any(d.isdigit() for d in c2):
                             d1 = "".join(d for d in c if d.isdigit())
                             d2 = "".join(d for d in c2 if d.isdigit())
@@ -188,14 +167,12 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
                                 spcol = c2
                                 break
                 if spcol is None:
-                    # fallback: first sp col not used
                     for c2 in cols:
                         if ("sp" in c2.lower() or "points" in c2.lower()) and c2 != player_col:
                             spcol = c2
                             break
             pairs.append((c, spcol))
 
-    # Build long from wide
     for _, row in df.iterrows():
         p = _norm_player(row.get(player_col, ""))
         if not p:
@@ -210,7 +187,6 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
             bucket.sort(key=lambda x: (-x["sp"], x["user"].lower()))
             out[p].extend(bucket)
 
-    # Deduplicate per player by user (keep max sp)
     for p, lst in out.items():
         best = {}
         for e in lst:
@@ -225,7 +201,6 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
 
 def parse_holdings(sheets: Dict[str, pd.DataFrame]) -> Dict[str, int]:
     """Return {player: total_sp} from a holdings workbook with columns like player|players, sp|subject points."""
-    # pick the first sheet with a player column
     df = None
     for name, d in sheets.items():
         cols = [c.lower() for c in d.columns]
@@ -233,26 +208,19 @@ def parse_holdings(sheets: Dict[str, pd.DataFrame]) -> Dict[str, int]:
             df = d
             break
     if df is None:
-        # fallback to first sheet
         df = list(sheets.values())[0]
     df = df.copy()
     df.columns = [c.strip() for c in df.columns]
-    lower = [c.lower() for c in df.columns]
-    # guess player + sp columns
     pcol = next((c for c in df.columns if any(k in c.lower() for k in ["player","players"])), df.columns[0])
     scol = next((c for c in df.columns if any(k in c.lower() for k in ["sp","subject"])), None)
     if scol is None:
-        # try total sp col
         scol = next((c for c in df.columns if "total" in c.lower() and "sp" in c.lower()), df.columns[-1])
     totals: Dict[str, int] = defaultdict(int)
     for _, row in df.iterrows():
         plist = split_multi_subject_players(row.get(pcol, ""))
-        # holdings rows are per-player usually; but we tolerate multi
         sp = _as_int(row.get(scol, 0))
         if not plist:
             continue
-        # Treat holdings as already collapsed per player: add evenly if multi? No—assume per player rows
-        # If multi, assume full each unique (most of your holdings sheets are per-player; safe fallback)
         unique = plist
         if len(unique) == 1:
             totals[unique[0]] += sp
@@ -266,7 +234,6 @@ def parse_collection(sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     Expect columns for: card name/number, players, sp, qty.
     We'll normalize to: ['card','no','players','sp','qty']
     """
-    # choose first non-empty sheet
     df = None
     for name, d in sheets.items():
         if len(d.index) > 0:
@@ -276,9 +243,6 @@ def parse_collection(sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         return pd.DataFrame(columns=["card","no","players","sp","qty"])
     df = df.copy()
     df.columns = [c.strip() for c in df.columns]
-    cols_lower = [c.lower() for c in df.columns]
-
-    # Map likely columns
     col_card = next((c for c in df.columns if any(k in c.lower() for k in ["card", "title", "name"])), df.columns[0])
     col_no   = next((c for c in df.columns if any(k in c.lower() for k in ["no", "number", "card #"])), None)
     col_pl   = next((c for c in df.columns if any(k in c.lower() for k in ["player", "players", "subject"])), None)
@@ -297,7 +261,6 @@ def parse_collection(sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     out["no"] = out["no"].fillna("").astype(str)
     out["sp"] = out["sp"].fillna(0).astype(int)
     out["qty"] = out["qty"].fillna(1).astype(int)
-    # drop empties
     out = out[out["card"].str.strip() != ""].copy()
     out.reset_index(drop=True, inplace=True)
     return out
@@ -309,9 +272,7 @@ def compute_rank_and_margins(leader: Dict[str, List[Dict[str, Any]]],
     For a given player, compute rank, qp, and margins for each family account.
     Returns: {acct: {sp, rank, qp, margin_if_first, gap_to_first}}
     """
-    # Base competitors excluding family accounts
     comp = [(e["user"], e["sp"]) for e in leader.get(player, []) if e["user"] not in FAMILY_ACCOUNTS]
-    # add family accounts
     rows = []
     for (u, s) in comp:
         rows.append(("__competitor__", u, s))
@@ -319,9 +280,7 @@ def compute_rank_and_margins(leader: Dict[str, List[Dict[str, Any]]],
         s = accounts_sp.get(acct, {}).get(player, 0)
         rows.append(("__family__", acct, s))
 
-    # Sort desc by sp, tie by name
     rows.sort(key=lambda x: (-x[2], x[1].lower()))
-    # Build rank list
     ranks: Dict[str, int] = {}
     ordered = []
     last_sp = None
@@ -336,10 +295,7 @@ def compute_rank_and_margins(leader: Dict[str, List[Dict[str, Any]]],
         if typ == "__family__":
             ranks[name] = current_rank
 
-    # Compute margins / gap_to_first for each family
-    # find first place sp
     first_sp = ordered[0][2] if ordered else 0
-    # find second_sp (for margin)
     second_sp = ordered[1][2] if len(ordered) >= 2 else 0
 
     out: Dict[str, Dict[str, Any]] = {}
@@ -352,31 +308,6 @@ def compute_rank_and_margins(leader: Dict[str, List[Dict[str, Any]]],
         out[acct] = dict(sp=s, rank=r or 9999, qp=qp, margin_if_first=margin_if_first, gap_to_first=gap_to_first)
     return out
 
-def total_qp_for_account(leader: Dict[str, List[Dict[str, Any]]],
-                         acct_sp: Dict[str, int]) -> Tuple[int, Dict[str, Dict[str, Any]]]:
-    """Return (sum_qp, per-player details)."""
-    details = {}
-    qp_sum = 0
-    # We need the other family accounts SP as well to compute ranks correctly; pass empty for others
-    family_map = {a: {} for a in FAMILY_ACCOUNTS}
-    # Fill only this account
-    for p, sp in acct_sp.items():
-        family_map[FAMILY_ACCOUNTS[0]] = {}  # placeholder
-    # We'll compute per player with local map; simpler: pass minimal map containing just this account
-    for player, sp in acct_sp.items():
-        tmp_accounts = {a: {} for a in FAMILY_ACCOUNTS}
-        tmp_accounts["Easystreet31"] = {}  # default
-        # Use the given account name for key
-    # Better: compute with a wrapper that sets the account under its own name
-    # We'll instead compute qp player by player on full context:
-    # Build accounts_sp full context: only this account has values
-    accounts_sp = {a: {} for a in FAMILY_ACCOUNTS}
-    # fill
-    for p, sp in acct_sp.items():
-        accounts_sp[FAMILY_ACCOUNTS[0]][p] = sp  # We'll override per call outside
-    # The above helper is too constrained for multi-accounts; we won't use this function in multi context.
-    return 0, {}
-
 def compute_family_qp(leader: Dict[str, List[Dict[str, Any]]],
                       accounts_sp: Dict[str, Dict[str, int]]) -> Tuple[int, Dict[str, int], Dict[str, Dict[str, Any]]]:
     """
@@ -385,7 +316,6 @@ def compute_family_qp(leader: Dict[str, List[Dict[str, Any]]],
     """
     per_account_qp: Dict[str, int] = {a: 0 for a in FAMILY_ACCOUNTS}
     per_player_details: Dict[str, Dict[str, Dict[str, Any]]] = {a: {} for a in FAMILY_ACCOUNTS}
-    # Collect all players that appear in leaderboard or any account holdings
     all_players: Set[str] = set(leader.keys())
     for a in FAMILY_ACCOUNTS:
         all_players.update(accounts_sp.get(a, {}).keys())
@@ -406,14 +336,12 @@ def apply_card_sp_to_account(acct_sp: Dict[str, int], players: List[str], sp: in
         return
     if rule == "full_each_unique":
         if len(unique) == 1:
-            # same player repeated (e.g., Bedard quad) => only once
             p = unique[0]
             acct_sp[p] = acct_sp.get(p, 0) + (sp if add else -sp)
         else:
             for p in unique:
                 acct_sp[p] = acct_sp.get(p, 0) + (sp if add else -sp)
     else:
-        # default: same as full_each_unique
         if len(unique) == 1:
             p = unique[0]
             acct_sp[p] = acct_sp.get(p, 0) + (sp if add else -sp)
@@ -436,8 +364,8 @@ def holdings_from_urls(e31_url: str, dc_url: Optional[str] = None, fe_url: Optio
 # ---------------------------
 
 class TradeLine(BaseModel):
-    side: str = Field(description="GET or GIVE", regex="^(GET|GIVE)$")
-    players: str = Field(description="Single or multi-subject list")
+    side: Literal["GET","GIVE"] = Field(description="GET or GIVE")
+    players: str
     sp: int
 
 class EvaluateReqSingle(BaseModel):
@@ -524,7 +452,7 @@ class FamilyEvaluateTradeReq(BaseModel):
     holdings_dc_url: str
     holdings_fe_url: str
     trade: List[TradeLine]
-    trade_account: str = "Easystreet31"  # gives are debited here (no best-giver logic)
+    trade_account: str = "Easystreet31"
     multi_subject_rule: str = "full_each_unique"
     defend_buffers: Dict[str, int] = Field(default_factory=lambda: {
         "Easystreet31": 15, "DusterCrusher": 15, "FinkleIsEinhorn": 15
@@ -573,9 +501,8 @@ class FamilyTransferReq(BaseModel):
     scan_top_candidates: int = 60
     max_multiples_per_card: int = 3
     target_rivals: Optional[List[str]] = None
-    # result shaping
-    return_sections: Optional[List[str]] = None  # ["assignments","internal_transfers","conflicts","defense_alerts"]
-    assignment_account_filter: str = "all"       # "Easystreet31" | "DusterCrusher" | "FinkleIsEinhorn" | "all"
+    return_sections: Optional[List[str]] = None
+    assignment_account_filter: str = "all"
     min_assignment_qp: int = 0
     limit: int = 100
     offset: int = 0
@@ -600,10 +527,8 @@ def apply_trade_lines_to_accounts(accounts_sp: Dict[str, Dict[str, int]],
     """
     alloc_plan = []
     cur = clone_accounts_sp(accounts_sp)
-    # Precompute baseline family QP
     fam_qp0, _, _ = compute_family_qp(leader, cur)
 
-    # Process GET lines (allocate to best)
     for line in [l for l in trade if l.side == "GET"]:
         players = split_multi_subject_players(line.players)
         best_acct = None
@@ -626,7 +551,6 @@ def apply_trade_lines_to_accounts(accounts_sp: Dict[str, Dict[str, int]],
         fam_qp0, _, _ = compute_family_qp(leader, cur)
         alloc_plan.append(dict(type="GET", players=players, sp=line.sp, to=best_acct, family_qp_gain=best_gain))
 
-    # Process GIVE lines (debit trade_account only)
     for line in [l for l in trade if l.side == "GIVE"]:
         players = split_multi_subject_players(line.players)
         for p in players:
@@ -663,13 +587,12 @@ def evaluate_by_urls_easystreet31(req: EvaluateReqSingle):
     acct = parse_holdings(fetch_xlsx(req.holdings_url))
     accounts = {a: {} for a in FAMILY_ACCOUNTS}
     accounts["Easystreet31"] = acct
-    # Treat as single-account evaluation (legacy)
     alloc, cur = apply_trade_lines_to_accounts(accounts, req.trade, req.multi_subject_rule, leader,
                                                allocate_get_to_best=False, trade_account="Easystreet31")
     fam_before, per_qp_before, det_before = compute_family_qp(leader, accounts)
     fam_after, per_qp_after, det_after = compute_family_qp(leader, cur)
     return _safe_json({
-        "params": req.dict(),
+        "params": req.model_dump(),
         "player_impact_table": alloc,
         "qp_summary": {
             "Easystreet31_before": per_qp_before["Easystreet31"],
@@ -686,23 +609,16 @@ def scan_by_urls_easystreet31(req: ScanReq):
     accounts = {a: {} for a in FAMILY_ACCOUNTS}
     accounts["Easystreet31"] = acct
     fam_qp, per_qp, details = compute_family_qp(leader, accounts)
-    # Build simple buckets
     thin, upgrades, entries, overs = [], [], [], []
     for player, d in details["Easystreet31"].items():
         rank = d["rank"]; sp = d["sp"]
-        # thin firsts
         if rank == 1 and (d["margin_if_first"] or 0) <= req.defend_buffer:
             thin.append(dict(player=player, margin=d["margin_if_first"], sp=sp))
-        # upgrade to 1st
         if rank > 1 and d["gap_to_first"] <= req.upgrade_gap:
             upgrades.append(dict(player=player, need=d["gap_to_first"], sp=sp))
-        # enter top3 (approx)
         if rank > 3 and d["gap_to_first"] <= (d["gap_to_first"] if d["gap_to_first"] else 999999) and d["gap_to_first"] <= (req.entry_gap + 20):
             entries.append(dict(player=player, gap_to_first=d["gap_to_first"]))
-        # overshoot (tradable slack)
-        # compute second sp
         comps = leader.get(player, [])
-        second = comps[0]["sp"] if comps else 0
         if rank == 1:
             slack = (d["margin_if_first"] or 0) - req.keep_buffer
             if slack > 0:
@@ -726,7 +642,6 @@ def scan_rival_by_urls_easystreet31(req: RivalScanReq):
     fam_qp, per_qp, details = compute_family_qp(leader, accounts)
     threats = []
     for player, lst in leader.items():
-        # rival sp
         rival = next((e for e in lst if e["user"].lower() == req.focus_rival.lower()), None)
         you = details["Easystreet31"].get(player, {"sp": 0})
         if rival:
@@ -738,24 +653,19 @@ def scan_rival_by_urls_easystreet31(req: RivalScanReq):
 
 @app.post("/scan_partner_by_urls_easystreet31")
 def scan_partner_by_urls_easystreet31(req: PartnerScanReq):
-    # Simple heuristic: find players where partner can move into 1st/2nd/3rd without dropping your QP
     leader = normalize_leaderboard(fetch_xlsx(req.leaderboard_url))
     acct = parse_holdings(fetch_xlsx(req.holdings_url))
-    # Your QP before
     accounts = {a: {} for a in FAMILY_ACCOUNTS}
     accounts["Easystreet31"] = acct
     fam_qp0, per_qp0, details0 = compute_family_qp(leader, accounts)
     suggestions = []
     for player, lst in leader.items():
         you = details0["Easystreet31"].get(player, {"rank": 999, "sp": 0})
-        # partner current sp (if on board)
         partner = next((e for e in lst if e["user"].lower() == req.partner.lower()), None)
         psp = partner["sp"] if partner else 0
-        # gap to 1st
         first_sp = lst[0]["sp"] if lst else 0
         need_to_first = max(0, first_sp - psp + 1)
         if need_to_first <= req.max_sp_to_gain:
-            # ensure not hurting your 1st buffer if you are first
             if you.get("rank", 999) == 1:
                 margin = you.get("margin_if_first", 0)
                 if margin - need_to_first < req.protect_buffer:
@@ -772,7 +682,6 @@ def review_collection_by_urls_easystreet31(req: CollectionReviewReq):
     acct = parse_holdings(fetch_xlsx(req.holdings_url))
     col = parse_collection(fetch_xlsx(req.collection_url))
     if req.baseline_trade:
-        # apply baseline to your account (single-account path)
         tmp_accounts = {a: {} for a in FAMILY_ACCOUNTS}
         tmp_accounts["Easystreet31"] = dict(acct)
         _, tmp_accounts = apply_trade_lines_to_accounts(tmp_accounts, req.baseline_trade, req.multi_subject_rule, leader, False, "Easystreet31")
@@ -790,8 +699,6 @@ def review_collection_by_urls_easystreet31(req: CollectionReviewReq):
         qty = int(row["qty"])
         if not players or sp <= 0 or qty <= 0:
             continue
-        gain_count = 0
-        # Try buying 1 copy at a time up to max_multiples_per_card
         take = min(qty, req.max_multiples_per_card)
         sim_accounts = {a: dict(v) for a, v in accounts.items()}
         for t in range(1, take+1):
@@ -801,7 +708,6 @@ def review_collection_by_urls_easystreet31(req: CollectionReviewReq):
             if delta > 0:
                 picks.append(dict(card=row["card"], no=row["no"], players=players, take_n=t, sp=sp, family_delta_qp=delta))
             else:
-                # stop if no gains observed on incremental copies
                 break
 
     picks.sort(key=lambda x: (-x["family_delta_qp"], x["card"]))
@@ -814,7 +720,6 @@ def suggest_give_from_collection_by_urls_easystreet31(req: SafeGiveReq):
     leader = normalize_leaderboard(fetch_xlsx(req.leaderboard_url))
     acct = parse_holdings(fetch_xlsx(req.holdings_url))
     mycol = parse_collection(fetch_xlsx(req.my_collection_url))
-    # Your QP baseline
     accounts = {a: {} for a in FAMILY_ACCOUNTS}
     accounts["Easystreet31"] = acct
     fam0, per0, det0 = compute_family_qp(leader, accounts)
@@ -825,19 +730,14 @@ def suggest_give_from_collection_by_urls_easystreet31(req: SafeGiveReq):
         sp = int(row["sp"]); qty = int(row["qty"])
         if not players or sp <= 0 or qty <= 0:
             continue
-        # Check safe give of exactly 1 copy
         sim = {a: dict(v) for a, v in accounts.items()}
-        # Remove from you
         apply_card_sp_to_account(sim["Easystreet31"], players, sp, add=False, rule=req.multi_subject_rule)
         fam_after, per_after, det_after = compute_family_qp(leader, sim)
-        # protect
         if req.protect_qp and per_after["Easystreet31"] < per0["Easystreet31"]:
             continue
-        # protect buffer for any 1sts
         frag_after = fragile_firsts(det_after["Easystreet31"], req.protect_buffer)
         if frag_after:
             continue
-        # Heuristic partner gain (without modeling partner holdings): how many SP would partner need on these players?
         suggestions.append(dict(card=row["card"], no=row["no"], players=players, give_n=1, sp=sp))
     suggestions = suggestions[:req.max_each] if req.max_each > 0 else suggestions
     return _safe_json({"partner": req.partner, "safe_give": suggestions})
@@ -856,13 +756,12 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
                                                           allocate_get_to_best=True, trade_account=req.trade_account)
     fam1, per1, det1 = compute_family_qp(leader, after_accounts)
 
-    # Fragile lists after
     frag = {a: fragile_firsts(det1[a], req.defend_buffers.get(a, 15)) for a in FAMILY_ACCOUNTS}
     decision = "ACCEPT" if (fam1 - fam0) > 0 and all(len(f)==0 for f in frag.values()) else (
                "CAUTION" if (fam1 - fam0) >= 0 else "DECLINE")
 
     return _safe_json({
-        "params": req.dict(),
+        "params": req.model_dump(),
         "allocation_plan": alloc,
         "per_account": {
             a: {"qp_before": per0[a], "qp_after": per1[a], "delta_qp": per1[a]-per0[a], "fragile_after": frag[a]}
@@ -892,7 +791,6 @@ def collection_review_family_by_urls(req: CollectionReviewFamilyReq):
         best_gain = 0
         best_t = 0
         for acct in FAMILY_ACCOUNTS:
-            # Try taking 1..take_max copies
             for t in range(1, take_max+1):
                 sim = clone_accounts_sp(accounts)
                 for _ in range(t):
@@ -918,7 +816,6 @@ def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
     today = normalize_leaderboard(fetch_xlsx(req.leaderboard_today_url))
     yday = normalize_leaderboard(fetch_xlsx(req.leaderboard_yesterday_url))
 
-    # Track changes for our family accounts
     changes = []
     players = sorted(set(list(today.keys()) + list(yday.keys())))
     for p in players:
@@ -926,30 +823,18 @@ def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
         y = yday.get(p, [])
         def as_map(lst): return {e["user"]: e["sp"] for e in lst}
         tm = as_map(t); ym = as_map(y)
-        # rank grid for family in both days (approx by SP vs competitors)
-        # Build synthesized holdings for "both days" as 0 (we don't change our SP here; just compare competitors)
-        # Simply report competitor SP changes & new rival entrants
-        # New threat: rival in top3 today but not yesterday
         rivals = set([r.lower() for r in (req.rivals or [])])
         top3_today = [e["user"] for e in t[:3]]
         top3_yday  = [e["user"] for e in y[:3]]
         new_rival_top3 = [u for u in top3_today if u.lower() in rivals and u not in top3_yday]
-        # SP movement summary
         for u, tsp in tm.items():
             ysp = ym.get(u, 0)
             dsp = tsp - ysp
-            if u in req.me_accounts:
-                # Our account movement (rarely in competitor list), include anyway
-                pass
             if abs(dsp) >= req.min_sp_delta:
                 changes.append(dict(player=p, user=u, sp_today=tsp, sp_yday=ysp, delta_sp=dsp))
         if new_rival_top3:
             changes.append(dict(player=p, new_rival_top3=new_rival_top3))
 
-    # Compact
-    if req.show_only_changes:
-        pass  # already only changes
-    # Aggregate rival heatmap
     rival_heat = Counter()
     for c in changes:
         if "user" in c and "delta_sp" in c:
@@ -964,17 +849,13 @@ def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
 
 def is_transfer_safe(leader, accounts_sp, giver, card_players, card_sp, buffer_val) -> bool:
     """Ensure giver keeps QP and any 1sts keep margin ≥ buffer, across ALL players on the card."""
-    # compute before
     fam0, per0, det0 = compute_family_qp(leader, accounts_sp)
     before_qp = per0[giver]
-    # simulate remove
     sim = clone_accounts_sp(accounts_sp)
     apply_card_sp_to_account(sim[giver], card_players, card_sp, add=False)
     fam1, per1, det1 = compute_family_qp(leader, sim)
-    # QP must not drop
     if per1[giver] < before_qp:
         return False
-    # any 1st margins must remain ≥ buffer
     frag = fragile_firsts(det1[giver], buffer_val)
     if frag:
         return False
@@ -1003,16 +884,13 @@ def family_transfer_suggestions_by_urls(req: FamilyTransferReq):
             sp = int(row["sp"]); qty = int(row["qty"])
             if not players or sp <= 0 or qty <= 0:
                 continue
-            # try moving a single copy to any other account, if safe for giver
             if not is_transfer_safe(leader, accounts, giver, players, sp, req.defend_buffer_all):
                 continue
             for recv in FAMILY_ACCOUNTS:
                 if recv == giver:
                     continue
                 sim = clone_accounts_sp(accounts)
-                # giver loses
                 apply_card_sp_to_account(sim[giver], players, sp, add=False)
-                # receiver gains
                 apply_card_sp_to_account(sim[recv], players, sp, add=True)
                 fam, per, det = compute_family_qp(leader, sim)
                 gain = fam - fam0
@@ -1022,7 +900,7 @@ def family_transfer_suggestions_by_urls(req: FamilyTransferReq):
 
     moves.sort(key=lambda x: (-x["family_delta_qp"], x["card"]))
     out_moves = moves[:req.limit] if req.limit > 0 else moves
-    fam_after = fam0 + sum(m["family_delta_qp"] for m in out_moves)  # optimistic (not exact if overlapping)
+    fam_after = fam0 + sum(m["family_delta_qp"] for m in out_moves)
     return _safe_json({
         "family_qp_now": fam0,
         "family_qp_after_naive_sum": fam_after,
@@ -1035,7 +913,6 @@ def family_transfer_suggestions_by_urls(req: FamilyTransferReq):
 @app.post("/family_transfer_optimize_by_urls")
 def family_transfer_optimize_by_urls(req: FamilyTransferReq):
     if not HAS_ORTOOLS:
-        # Fallback to greedy suggestions if OR-Tools unavailable
         return family_transfer_suggestions_by_urls(req)
 
     leader = normalize_leaderboard(fetch_xlsx(req.leaderboard_url))
@@ -1051,10 +928,7 @@ def family_transfer_optimize_by_urls(req: FamilyTransferReq):
         "FinkleIsEinhorn": col_fe.head(req.scan_top_candidates)
     }
 
-    # Build candidate single-copy moves that are safe for the giver and profitable for the family.
     candidates = []
-    unit_id = 0
-    # Track resource usage per (giver, card, unit_index) to prevent double-use
     unit_keys = []
     for giver in FAMILY_ACCOUNTS:
         df = collections[giver]
@@ -1065,10 +939,8 @@ def family_transfer_optimize_by_urls(req: FamilyTransferReq):
                 continue
             if not is_transfer_safe(leader, accounts, giver, players, sp, req.defend_buffer_all):
                 continue
-            # create unit slots
             for u in range(min(qty, req.max_multiples_per_card)):
                 unit_keys.append((giver, row["card"], row["no"], u, players, sp))
-                # Test move to each receiver
                 for recv in FAMILY_ACCOUNTS:
                     if recv == giver:
                         continue
@@ -1086,18 +958,15 @@ def family_transfer_optimize_by_urls(req: FamilyTransferReq):
                             "gain": gain
                         })
 
-    # ILP: choose at most one assignment for each unit_idx; maximize sum(gain * y)
     model = cp_model.CpModel()
-    y = {}  # decision vars
+    y = {}
     for i, cand in enumerate(candidates):
         y[i] = model.NewBoolVar(f"y_{i}")
-    # one-use constraints per unit
     by_unit: Dict[int, List[int]] = defaultdict(list)
     for i, cand in enumerate(candidates):
         by_unit[cand["unit_idx"]].append(i)
     for unit_idx, inds in by_unit.items():
         model.Add(sum(y[i] for i in inds) <= 1)
-    # objective
     model.Maximize(sum(int(c["gain"]*1000) * y[i] for i, c in enumerate(candidates)))
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 10.0
@@ -1110,7 +979,6 @@ def family_transfer_optimize_by_urls(req: FamilyTransferReq):
             if solver.Value(y[i]) == 1:
                 chosen.append(cand)
 
-    # Apply chosen to compute exact after family QP
     sim = clone_accounts_sp(accounts)
     for c in chosen:
         apply_card_sp_to_account(sim[c["giver"]], c["players"], c["sp"], add=False)
