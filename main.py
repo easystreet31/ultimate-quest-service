@@ -24,9 +24,6 @@ DEFAULT_LINKS = {
     # Leaderboard (Top-5 per player workbook)
     "leaderboard": os.getenv("DEFAULT_LEADERBOARD_URL",
         "https://docs.google.com/spreadsheets/d/1aRBznhcgaw8wCYaYAsdC14JxC3DwJJzB/export?format=xlsx"),
-    # 1 day lag leaderboard
-    "1 day lag leaderboard": os.getenv("DEFAULT_LEADERBOARD_YDAY_URL",
-        "https://docs.google.com/spreadsheets/d/1MRpJWiO9qBPuz5CGfLXgS8t4DWooyeN2/export?format=xlsx"),
     # Primary account
     "holdings_e31": os.getenv("DEFAULT_HOLDINGS_E31_URL",
         "https://docs.google.com/spreadsheets/d/1J3jf8c5M0oYbhStLLOS-ItRSAvOTvfkS5ggp0yl5XgY/export?format=xlsx"),
@@ -44,7 +41,6 @@ DEFAULT_LINKS = {
     # Seller/pool collection
     "pool_collection": os.getenv("DEFAULT_POOL_COLLECTION_URL",
         "https://docs.google.com/spreadsheets/d/1tto_9aow568dSm-3Wqk-S-YaCh7tQg_UmFJEyIjL6DQ/export?format=xlsx"),
-
 }
 
 DEFAULT_RIVALS = [
@@ -763,9 +759,10 @@ def collection_review_family_by_urls(req: CollectionReviewFamilyReq):
 @app.post("/leaderboard_delta_by_urls")
 def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
     today = normalize_leaderboard(fetch_xlsx(_default(req.leaderboard_today_url, "leaderboard")))
-    yday_url = body.get("leaderboard_yesterday_url") or DEFAULT_LEADERBOARD_YDAY_URL
+    # Yesterday is not auto-defaulted because it varies day to day; require explicit or env
+    yday_url = req.leaderboard_yesterday_url or os.getenv("DEFAULT_LEADERBOARD_YDAY_URL", "")
     if not yday_url:
-        raise HTTPException(status_code=400, detail="Missing yesterday URL")
+        raise HTTPException(status_code=400, detail="Please provide leaderboard_yesterday_url (or set DEFAULT_LEADERBOARD_YDAY_URL).")
     yday = normalize_leaderboard(fetch_xlsx(yday_url))
 
     changes = []
