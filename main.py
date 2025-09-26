@@ -1,10 +1,11 @@
 """
-main.py — thin wrapper that injects default URLs & knobs from environment variables
-into request bodies when callers omit them, then forwards to your original app.
+main.py — wrapper that injects default URLs/knobs from environment variables
+into request bodies (only when fields are omitted), then forwards to your
+original FastAPI app.
 
-HOW TO USE:
-1) Rename your existing working app file from `main.py` to `app_core.py`.
-2) Place this file as `main.py`.
+HOW TO DEPLOY:
+1) Rename your previous working file from `main.py` to `app_core.py` (same directory).
+2) Add this file as `main.py`.
 3) No other changes needed. Start command remains: uvicorn main:app --host 0.0.0.0 --port $PORT
 """
 
@@ -16,20 +17,28 @@ from typing import Any, Dict, List, Optional, Callable
 
 from fastapi import FastAPI, Request
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.types import ASGIApp, Receive, Scope, Send
 
 # ------------------------------------------------------------------------------
 # 1) Import your original app (now in app_core.py)
 # ------------------------------------------------------------------------------
+_core_import_error = None
+core_app = None
 try:
-    import app_core  # <-- this is your previous `main.py` renamed to `app_core.py`
-except Exception as exc:
-    # Give a very clear error if the rename step was missed.
-    raise RuntimeError(
-        "Could not import `app_core`. Please rename your previous working main.py to app_core.py"
-    ) from exc
+    # Your previous app file, renamed.
+    from app_core import app as core_app  # type: ignore
+except Exception as e:
+    _core_import_error = e
 
-app: FastAPI = app_core.app  # use your existing FastAPI instance
+if core_app is None:
+    # Helpful guidance if the rename was missed or path is wrong.
+    raise RuntimeError(
+        "Could not import your original FastAPI app from `app_core.py`.\n"
+        "Please rename your previous working `main.py` to `app_core.py` and commit it at the repo root.\n"
+        f"Original import error: {repr(_core_import_error)}"
+    )
+
+# This is the FastAPI instance uvicorn will serve.
+app: FastAPI = core_app
 
 
 # ------------------------------------------------------------------------------
@@ -69,16 +78,10 @@ DEFAULT_DEFEND_BUFFER_ALL = _to_int(_env("DEFAULT_DEFEND_BUFFER_ALL", "15"), 15)
 
 
 # ------------------------------------------------------------------------------
-# 3) Known POST endpoints that can accept defaults when a field is omitted
+# 3) Endpoint-specific default mergers (called only if a field is missing)
 # ------------------------------------------------------------------------------
 
-# NOTE: We *do not* change bodies that already include a field; we only fill in missing ones.
-# This keeps behavior 100% backward compatible with your working logic.
-
-POST_PATHS: Dict[str, Callable[[Dict[str, Any]], None]] = {}
-
 def _merge_list(value: Any) -> Optional[List[str]]:
-    """Coerce CSV string → list[str], pass through list, ignore otherwise."""
     if value is None:
         return None
     if isinstance(value, list):
@@ -89,29 +92,28 @@ def _merge_list(value: Any) -> Optional[List[str]]:
     return None
 
 def _apply_common_defaults(body: Dict[str, Any]) -> None:
-    # single-account convenience
+    # Single-account convenience
     body.setdefault("leaderboard_url", DEFAULT_LEADERBOARD_URL)
-    body.setdefault("holdings_url", DEFAULT_HOLDINGS_E31_URL)
+    body.setdefault("holdings_url",    DEFAULT_HOLDINGS_E31_URL)
 
-    # partner/seller collections
-    body.setdefault("collection_url", DEFAULT_POOL_COLLECTION_URL)
+    # Partner/seller collections
+    body.setdefault("collection_url",    DEFAULT_POOL_COLLECTION_URL)
     body.setdefault("my_collection_url", DEFAULT_COLLECTION_E31_URL)
 
-    # rival targets
+    # Rivals
     if not body.get("target_rivals"):
         if DEFAULT_TARGET_RIVALS:
             body["target_rivals"] = DEFAULT_TARGET_RIVALS
     else:
-        # normalize if user passed CSV string
         maybe = _merge_list(body.get("target_rivals"))
         if maybe is not None:
             body["target_rivals"] = maybe
 
-    # default defend buffer knobs (only where a single value is expected)
+    # Defend buffer
     body.setdefault("defend_buffer", DEFAULT_DEFEND_BUFFER_ALL)
 
 def _apply_family_defaults(body: Dict[str, Any]) -> None:
-    # family (three accounts)
+    # Three-account defaults
     body.setdefault("leaderboard_url", DEFAULT_LEADERBOARD_URL)
 
     body.setdefault("holdings_e31_url", DEFAULT_HOLDINGS_E31_URL)
@@ -122,65 +124,42 @@ def _apply_family_defaults(body: Dict[str, Any]) -> None:
     body.setdefault("collection_dc_url",  DEFAULT_COLLECTION_DC_URL)
     body.setdefault("collection_fe_url",  DEFAULT_COLLECTION_FE_URL)
 
-    # default defend buffer for "all" if not provided
     body.setdefault("defend_buffer_all", DEFAULT_DEFEND_BUFFER_ALL)
 
-# Endpoint-specific mergers
-def _merge_evaluate(body: Dict[str, Any]) -> None:
-    _apply_common_defaults(body)
-
-def _merge_scan(body: Dict[str, Any]) -> None:
-    _apply_common_defaults(body)
-
+def _merge_evaluate(body: Dict[str, Any]) -> None:               _apply_common_defaults(body)
+def _merge_scan(body: Dict[str, Any]) -> None:                   _apply_common_defaults(body)
 def _merge_scan_rival(body: Dict[str, Any]) -> None:
     _apply_common_defaults(body)
-    # Normalize focus_rival to a simple string if someone passes ["name"]
     if isinstance(body.get("focus_rival"), list):
         arr = [s for s in body["focus_rival"] if isinstance(s, str) and s.strip()]
         if arr:
             body["focus_rival"] = arr[0]
-
-def _merge_partner(body: Dict[str, Any]) -> None:
-    _apply_common_defaults(body)
-
-def _merge_review_collection(body: Dict[str, Any]) -> None:
-    _apply_common_defaults(body)
-
-def _merge_safe_give(body: Dict[str, Any]) -> None:
-    _apply_common_defaults(body)
-
-def _merge_family_eval_trade(body: Dict[str, Any]) -> None:
-    _apply_family_defaults(body)
-
-def _merge_collection_family(body: Dict[str, Any]) -> None:
-    _apply_family_defaults(body)
-
+def _merge_partner(body: Dict[str, Any]) -> None:                _apply_common_defaults(body)
+def _merge_review_collection(body: Dict[str, Any]) -> None:      _apply_common_defaults(body)
+def _merge_safe_give(body: Dict[str, Any]) -> None:              _apply_common_defaults(body)
+def _merge_family_eval_trade(body: Dict[str, Any]) -> None:      _apply_family_defaults(body)
+def _merge_collection_family(body: Dict[str, Any]) -> None:      _apply_family_defaults(body)
+def _merge_family_transfers(body: Dict[str, Any]) -> None:       _apply_family_defaults(body)
 def _merge_leaderboard_delta(body: Dict[str, Any]) -> None:
     body.setdefault("leaderboard_today_url",     DEFAULT_LEADERBOARD_URL)
     body.setdefault("leaderboard_yesterday_url", DEFAULT_LEADERBOARD_YDAY_URL)
-    # also allow body.leaderboard_url as alias for "today"
     if not body.get("leaderboard_today_url"):
         body["leaderboard_today_url"] = body.get("leaderboard_url") or DEFAULT_LEADERBOARD_URL
 
-def _merge_family_transfers(body: Dict[str, Any]) -> None:
-    _apply_family_defaults(body)
-
-# Register the endpoints you use (paths must match your server exactly)
-POST_PATHS["/evaluate_by_urls_easystreet31"]          = _merge_evaluate
-POST_PATHS["/scan_by_urls_easystreet31"]              = _merge_scan
-POST_PATHS["/scan_rival_by_urls_easystreet31"]        = _merge_scan_rival
-POST_PATHS["/scan_partner_by_urls_easystreet31"]      = _merge_partner
-POST_PATHS["/review_collection_by_urls_easystreet31"] = _merge_review_collection
-POST_PATHS["/suggest_give_from_collection_by_urls_easystreet31"] = _merge_safe_give
-
-# Family routes
-POST_PATHS["/family_evaluate_trade_by_urls"]          = _merge_family_eval_trade
-POST_PATHS["/collection_review_family_by_urls"]       = _merge_collection_family
-POST_PATHS["/family_transfer_suggestions_by_urls"]    = _merge_family_transfers
-POST_PATHS["/family_transfer_optimize_by_urls"]       = _merge_family_transfers
-
-# Deltas
-POST_PATHS["/leaderboard_delta_by_urls"]              = _merge_leaderboard_delta
+# Map exactly to your server routes
+POST_PATHS: Dict[str, Callable[[Dict[str, Any]], None]] = {
+    "/evaluate_by_urls_easystreet31":          _merge_evaluate,
+    "/scan_by_urls_easystreet31":              _merge_scan,
+    "/scan_rival_by_urls_easystreet31":        _merge_scan_rival,
+    "/scan_partner_by_urls_easystreet31":      _merge_partner,
+    "/review_collection_by_urls_easystreet31": _merge_review_collection,
+    "/suggest_give_from_collection_by_urls_easystreet31": _merge_safe_give,
+    "/family_evaluate_trade_by_urls":          _merge_family_eval_trade,
+    "/collection_review_family_by_urls":       _merge_collection_family,
+    "/family_transfer_suggestions_by_urls":    _merge_family_transfers,
+    "/family_transfer_optimize_by_urls":       _merge_family_transfers,
+    "/leaderboard_delta_by_urls":              _merge_leaderboard_delta,
+}
 
 
 # ------------------------------------------------------------------------------
@@ -189,7 +168,6 @@ POST_PATHS["/leaderboard_delta_by_urls"]              = _merge_leaderboard_delta
 
 class MergeDefaultsMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Only for POST JSON requests targeting one of the known endpoints.
         if request.method.upper() != "POST":
             return await call_next(request)
 
@@ -198,48 +176,48 @@ class MergeDefaultsMiddleware(BaseHTTPMiddleware):
         if not merger:
             return await call_next(request)
 
-        # Read body once
         try:
             raw = await request.body()
+            body: Dict[str, Any]
             if not raw:
                 body = {}
             else:
-                body = json.loads(raw.decode("utf-8"))
-                if not isinstance(body, dict):
-                    # If a different schema (e.g., list) comes in, don't modify.
+                body_json = json.loads(raw.decode("utf-8"))
+                if not isinstance(body_json, dict):
+                    # Only merge into object bodies; otherwise pass through unchanged.
                     return await call_next(request)
+                body = body_json
         except Exception:
             return await call_next(request)
 
-        # Apply defaults
+        # Apply defaults (no override of user-provided fields)
         try:
             merger(body)
         except Exception:
-            # Never block a request due to default merge logic—just pass through.
+            # Never block a request due to default-merger issues—pass through.
             return await call_next(request)
 
-        # Re-inject modified body
+        # Re-inject the modified body for downstream handlers
         new_raw = json.dumps(body).encode("utf-8")
 
-        async def receive() -> dict:
+        async def receive():
             return {"type": "http.request", "body": new_raw, "more_body": False}
 
-        # Monkey-patch the request stream for downstream handlers
+        # Monkey-patch the request receive stream
         request._receive = receive  # type: ignore[attr-defined]
 
         return await call_next(request)
 
-# Attach the middleware to YOUR existing app
+# Attach middleware to your existing app
 app.add_middleware(MergeDefaultsMiddleware)
 
 
 # ------------------------------------------------------------------------------
-# 5) Optional: simple /defaults echo endpoint for quick checks (non-invasive)
+# 5) Diagnostics — quick way to confirm defaults are active
 # ------------------------------------------------------------------------------
 
 @app.get("/defaults")
 def defaults_echo() -> Dict[str, Any]:
-    """Quick diagnostic: returns which defaults are currently active."""
     return {
         "leaderboard_url": DEFAULT_LEADERBOARD_URL,
         "leaderboard_yesterday_url": DEFAULT_LEADERBOARD_YDAY_URL,
@@ -256,5 +234,5 @@ def defaults_echo() -> Dict[str, Any]:
         },
         "target_rivals": DEFAULT_TARGET_RIVALS,
         "defend_buffer_all": DEFAULT_DEFEND_BUFFER_ALL,
-        "note": "Defaults only apply when a field is omitted in the request body."
+        "note": "Defaults only apply when a field is omitted in the POST body."
     }
