@@ -1,4 +1,4 @@
-# main.py  (v4.0.1-phase23)
+# main.py  (v4.0.2-phase23) -- canonical users + correct thin-first margin
 import io, re, math, json, sys
 from typing import List, Dict, Any, Optional, Tuple, Set, Literal
 from collections import defaultdict, Counter
@@ -16,7 +16,7 @@ try:
 except Exception:
     HAS_ORTOOLS = False
 
-APP_VERSION = "4.0.1-phase23"
+APP_VERSION = "4.0.2-phase23"
 
 app = FastAPI(title="Ultimate Quest Service", version=APP_VERSION)
 
@@ -49,6 +49,13 @@ def _norm_player(p: Any) -> str:
 def _norm_user(u: Any) -> str:
     if pd.isna(u): return ""
     return re.sub(r"\s+", " ", str(u).strip())
+
+def _canon_user(u: Any) -> str:
+    """Canonicalize usernames: remove trailing numeric IDs like ' (1018)' and normalize whitespace/case."""
+    s = _norm_user(u)
+    s = re.sub(r"\s*\(\d+\)\s*$", "", s)  # strip ' (digits)' at end
+    s = s.strip()
+    return s
 
 def _as_int(x: Any) -> int:
     try:
@@ -103,6 +110,7 @@ def qp_for_rank(rank: int) -> int:
 def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dict[str, Any]]]:
     """
     Normalize leaderboard to: {player: [{user, sp}, ...]} sorted by sp desc.
+    Applies canonicalization to usernames so 'Easystreet31 (1018)' -> 'Easystreet31'.
     Supports either long form (player,user,sp[,rank]) or wide top-N with owner/sp columns.
     """
     candidate = None
@@ -131,12 +139,21 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
         sp_col   = next(c for c in df.columns if any(k in c.lower() for k in ["sp","points","subject"]))
         for _, row in df.iterrows():
             p = _norm_player(row.get(player_col, ""))
-            u = _norm_user(row.get(user_col, ""))
+            u_raw = row.get(user_col, "")
+            u = _canon_user(u_raw)
             sp = _as_int(row.get(sp_col, 0))
             if p and u:
                 out[p].append(dict(user=u, sp=sp))
         for p in list(out.keys()):
-            out[p].sort(key=lambda x: (-x["sp"], x["user"].lower()))
+            # merge duplicates by canonical user -> keep max sp
+            best = {}
+            for e in out[p]:
+                u = e["user"]
+                if u not in best or e["sp"] > best[u]:
+                    best[u] = e["sp"]
+            merged = [dict(user=u, sp=best[u]) for u in best]
+            merged.sort(key=lambda x: (-x["sp"], x["user"].lower()))
+            out[p] = merged
         return out
 
     player_col = None
@@ -179,7 +196,8 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
             continue
         bucket = []
         for name_col, sp_col in pairs:
-            u = _norm_user(row.get(name_col, ""))
+            u_raw = row.get(name_col, "")
+            u = _canon_user(u_raw)
             sp = _as_int(row.get(sp_col, 0) if sp_col else 0)
             if u:
                 bucket.append(dict(user=u, sp=sp))
@@ -187,6 +205,7 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
             bucket.sort(key=lambda x: (-x["sp"], x["user"].lower()))
             out[p].extend(bucket)
 
+    # merge duplicates by canonical user
     for p, lst in out.items():
         best = {}
         for e in lst:
@@ -270,11 +289,16 @@ def compute_rank_and_margins(leader: Dict[str, List[Dict[str, Any]]],
                              player: str) -> Dict[str, Dict[str, Any]]:
     """
     For a given player, compute rank, qp, and margins for each family account.
+    - Ranks are computed vs everyone (family + competitors).
+    - margin_if_first compares against the BEST NON-FAMILY competitor (not 'second overall').
     Returns: {acct: {sp, rank, qp, margin_if_first, gap_to_first}}
     """
-    comp = [(e["user"], e["sp"]) for e in leader.get(player, []) if e["user"] not in FAMILY_ACCOUNTS]
+    # competitors only (canonicalized in normalize_leaderboard already)
+    comp_entries = [(e["user"], e["sp"]) for e in leader.get(player, []) if e["user"] not in FAMILY_ACCOUNTS]
+    comp_max_sp = max([s for _, s in comp_entries], default=0)
+
     rows = []
-    for (u, s) in comp:
+    for (u, s) in comp_entries:
         rows.append(("__competitor__", u, s))
     for acct in FAMILY_ACCOUNTS:
         s = accounts_sp.get(acct, {}).get(player, 0)
@@ -296,14 +320,14 @@ def compute_rank_and_margins(leader: Dict[str, List[Dict[str, Any]]],
             ranks[name] = current_rank
 
     first_sp = ordered[0][2] if ordered else 0
-    second_sp = ordered[1][2] if len(ordered) >= 2 else 0
 
     out: Dict[str, Dict[str, Any]] = {}
     for acct in FAMILY_ACCOUNTS:
         s = accounts_sp.get(acct, {}).get(player, 0)
         r = ranks.get(acct, None)
         qp = qp_for_rank(r) if r else 0
-        margin_if_first = s - second_sp if r == 1 else None
+        # margin vs BEST competitor only (not family)
+        margin_if_first = s - comp_max_sp if r == 1 else None
         gap_to_first = first_sp - s if r and r > 1 else (first_sp - s if s < first_sp else 0)
         out[acct] = dict(sp=s, rank=r or 9999, qp=qp, margin_if_first=margin_if_first, gap_to_first=gap_to_first)
     return out
@@ -620,6 +644,7 @@ def scan_by_urls_easystreet31(req: ScanReq):
             entries.append(dict(player=player, gap_to_first=d["gap_to_first"]))
         comps = leader.get(player, [])
         if rank == 1:
+            # overshoot relative to keep_buffer vs best competitor margin
             slack = (d["margin_if_first"] or 0) - req.keep_buffer
             if slack > 0:
                 overs.append(dict(player=player, slack=slack))
@@ -640,16 +665,18 @@ def scan_rival_by_urls_easystreet31(req: RivalScanReq):
     accounts = {a: {} for a in FAMILY_ACCOUNTS}
     accounts["Easystreet31"] = acct
     fam_qp, per_qp, details = compute_family_qp(leader, accounts)
+
+    focus = _canon_user(req.focus_rival)
     threats = []
     for player, lst in leader.items():
-        rival = next((e for e in lst if e["user"].lower() == req.focus_rival.lower()), None)
-        you = details["Easystreet31"].get(player, {"sp": 0})
+        rival = next((e for e in lst if _canon_user(e["user"]).lower() == focus.lower()), None)
+        you = details["Easystreet31"].get(player, {"sp": 0, "rank": 9999})
         if rival:
-            margin = (you.get("sp", 0) - rival["sp"])
-            if you.get("rank", 999) == 1 and margin <= req.defend_buffer:
-                threats.append(dict(player=player, your_sp=you.get("sp", 0), rival_sp=rival["sp"], margin=margin))
+            margin_vs_rival = you.get("sp", 0) - rival["sp"]
+            if you.get("rank", 999) == 1 and margin_vs_rival <= req.defend_buffer:
+                threats.append(dict(player=player, your_sp=you.get("sp", 0), rival_sp=rival["sp"], margin=margin_vs_rival))
     threats.sort(key=lambda x: x["margin"])
-    return _safe_json({"rival": req.focus_rival, "threats": threats})
+    return _safe_json({"rival": focus, "threats": threats})
 
 @app.post("/scan_partner_by_urls_easystreet31")
 def scan_partner_by_urls_easystreet31(req: PartnerScanReq):
@@ -658,11 +685,13 @@ def scan_partner_by_urls_easystreet31(req: PartnerScanReq):
     accounts = {a: {} for a in FAMILY_ACCOUNTS}
     accounts["Easystreet31"] = acct
     fam_qp0, per_qp0, details0 = compute_family_qp(leader, accounts)
+
+    partner = _canon_user(req.partner)
     suggestions = []
     for player, lst in leader.items():
         you = details0["Easystreet31"].get(player, {"rank": 999, "sp": 0})
-        partner = next((e for e in lst if e["user"].lower() == req.partner.lower()), None)
-        psp = partner["sp"] if partner else 0
+        rival = next((e for e in lst if _canon_user(e["user"]).lower() == partner.lower()), None)
+        psp = rival["sp"] if rival else 0
         first_sp = lst[0]["sp"] if lst else 0
         need_to_first = max(0, first_sp - psp + 1)
         if need_to_first <= req.max_sp_to_gain:
@@ -674,7 +703,7 @@ def scan_partner_by_urls_easystreet31(req: PartnerScanReq):
     suggestions.sort(key=lambda x: x["add_sp"])
     if req.max_each > 0:
         suggestions = suggestions[:req.max_each]
-    return _safe_json({"partner": req.partner, "suggestions": suggestions})
+    return _safe_json({"partner": partner, "suggestions": suggestions})
 
 @app.post("/review_collection_by_urls_easystreet31")
 def review_collection_by_urls_easystreet31(req: CollectionReviewReq):
@@ -740,7 +769,7 @@ def suggest_give_from_collection_by_urls_easystreet31(req: SafeGiveReq):
             continue
         suggestions.append(dict(card=row["card"], no=row["no"], players=players, give_n=1, sp=sp))
     suggestions = suggestions[:req.max_each] if req.max_each > 0 else suggestions
-    return _safe_json({"partner": req.partner, "safe_give": suggestions})
+    return _safe_json({"partner": _canon_user(req.partner), "safe_give": suggestions})
 
 # ---------------------------
 # New Endpoints (Phase 2 + 3)
@@ -818,15 +847,16 @@ def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
 
     changes = []
     players = sorted(set(list(today.keys()) + list(yday.keys())))
+    rivals_set = set([_canon_user(r).lower() for r in (req.rivals or [])])
+
     for p in players:
         t = today.get(p, [])
         y = yday.get(p, [])
-        def as_map(lst): return {e["user"]: e["sp"] for e in lst}
+        def as_map(lst): return { _canon_user(e["user"]): e["sp"] for e in lst }
         tm = as_map(t); ym = as_map(y)
-        rivals = set([r.lower() for r in (req.rivals or [])])
-        top3_today = [e["user"] for e in t[:3]]
-        top3_yday  = [e["user"] for e in y[:3]]
-        new_rival_top3 = [u for u in top3_today if u.lower() in rivals and u not in top3_yday]
+        top3_today = [ _canon_user(e["user"]) for e in t[:3] ]
+        top3_yday  = [ _canon_user(e["user"]) for e in y[:3] ]
+        new_rival_top3 = [u for u in top3_today if u.lower() in rivals_set and u not in top3_yday]
         for u, tsp in tm.items():
             ysp = ym.get(u, 0)
             dsp = tsp - ysp
