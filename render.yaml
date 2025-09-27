@@ -2,9 +2,11 @@ services:
   - type: web
     name: ultimate-quest-service
     env: python
+    plan: starter   # <— avoid free plan resets
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      # Defaults you set in Render’s dashboard may remain there; these are safe to keep here too:
       - key: DEFAULT_LEADERBOARD_URL
         value: https://docs.google.com/spreadsheets/d/1aRBznhcgaw8wCYaYAsdC14JxC3DwJJzB/export?format=xlsx
       - key: DEFAULT_LEADERBOARD_YDAY_URL
@@ -27,5 +29,9 @@ services:
         value: chfkyle,Tfunite,FireRanger,VJV5,Erikk,tommyknockrs76
       - key: DEFAULT_DEFEND_BUFFER_ALL
         value: "15"
+      - key: TRADE_FRAGILITY_DEFAULT
+        value: trade_delta (strict; traded players only)
+      - key: FORCE_FAMILY_URLS
+        value: "true"
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
