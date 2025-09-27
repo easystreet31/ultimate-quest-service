@@ -1,94 +1,65 @@
-# baseline_gets_filter.py — request body fixer for trade/counter flows
+# baseline_gets_filter.py — request filter for "trade-only" fragility
+# Safe: if payloads don’t match assumptions, it no-ops.
 from __future__ import annotations
 import json
-from typing import Any, Dict, List, Callable, Awaitable
-from starlette.types import ASGIApp, Receive, Scope, Send
+import re
+from typing import Iterable, List, Dict, Any
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
+from starlette.responses import Response
 
-_TRADE_ENDPOINTS = {
-    "/evaluate_by_urls_easystreet31",
+_TRADE_PATHS = {
     "/family_evaluate_trade_by_urls",
-}
-_COUNTER_ENDPOINTS = {
     "/family_eval_and_counter_by_urls",
-    "/review_collection_by_urls_easystreet31",
-    "/family_review_collection_by_urls",
+    "/evaluate_by_urls_easystreet31",      # harmless here; mostly the family endpoints matter
 }
 
-def _lower(s: str) -> str:
-    return (s or "").strip().lower()
+def _split_players(s: str) -> List[str]:
+    # Handles "A/B/C" and trims whitespace; keeps distinct names.
+    parts = [p.strip() for p in re.split(r"/", s or "") if p.strip()]
+    return list(dict.fromkeys(parts))  # stable unique
 
-def _extract_get_players(payload: Dict[str, Any]) -> List[str]:
-    out: List[str] = []
-    trade = payload.get("trade") or payload.get("baseline_trade")
-    if isinstance(trade, list):
-        for line in trade:
-            try:
-                if _lower(line.get("side")) == "get":
-                    players = line.get("players")
-                    if not players:
-                        continue
-                    # support multi-subject "A/B/C"
-                    for p in [x.strip() for x in str(players).split("/")]:
-                        if p and p not in out:
-                            out.append(p)
-            except Exception:
-                continue
-    return out
+def _extract_trade_players(trade_list: Iterable[Dict[str, Any]]) -> List[str]:
+    pool: Dict[str, None] = {}
+    for line in trade_list or []:
+        ps = _split_players(str(line.get("players", "")))
+        for p in ps:
+            pool[p] = None
+    return list(pool.keys())
 
 class BaselineGetsFilterMiddleware(BaseHTTPMiddleware):
     """
-    - Injects fragility_mode='trade_delta' on trade endpoints if missing
-    - Adds skip_counter_players on counter endpoints using GET players from trade
+    If a POST request targets one of the trade-eval endpoints and the body
+    includes fragility_mode ~ "trade_delta", injects a note listing the
+    traded players so the backend (or the assistant) can limit fragility
+    checks to only those players.
     """
 
-    async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Any]]):
-        if request.method != "POST":
-            return await call_next(request)
-
-        path = request.url.path
-        if path not in (_TRADE_ENDPOINTS | _COUNTER_ENDPOINTS):
-            return await call_next(request)
-
-        # Read the original body
+    async def dispatch(self, request: Request, call_next):
         try:
-            raw = await request.body()
-            if not raw:
-                return await call_next(request)
-            data = json.loads(raw.decode("utf-8"))
-            if not isinstance(data, dict):
-                return await call_next(request)
+            if request.method.upper() == "POST" and request.url.path in _TRADE_PATHS:
+                body_bytes = await request.body()
+                if body_bytes:
+                    data = json.loads(body_bytes.decode("utf-8"))
+                else:
+                    data = {}
+
+                frag = str(data.get("fragility_mode", "")).lower()
+                if "trade_delta" in frag:
+                    trade_players = _extract_trade_players(data.get("trade", []))
+                    notes = data.get("_notes") or {}
+                    notes["fragility_filter"] = "trade_delta"
+                    notes["trade_players"] = trade_players
+                    data["_notes"] = notes
+                    # Optional hint the backend may read:
+                    data["fragility_players"] = trade_players
+                    # Re-serialize into request body
+                    new_bytes = json.dumps(data, separators=(",", ":")).encode("utf-8")
+                    async def receive():
+                        return {"type": "http.request", "body": new_bytes, "more_body": False}
+                    request._receive = receive  # patch the stream for downstream
         except Exception:
-            return await call_next(request)
+            # Silently ignore; never block the request
+            pass
 
-        changed = False
-
-        # 1) Trade-only fragility (default)
-        if path in _TRADE_ENDPOINTS and "fragility_mode" not in data:
-            data["fragility_mode"] = "trade_delta"
-            changed = True
-
-        # 2) Exclude GET players from counter collections
-        if path in _COUNTER_ENDPOINTS:
-            skip = set(data.get("skip_counter_players") or [])
-            # prefer baseline_trade if present; fall back to trade
-            get_players = _extract_get_players({"trade": data.get("trade")}) or \
-                          _extract_get_players({"baseline_trade": data.get("baseline_trade")})
-            for p in get_players:
-                skip.add(p)
-            if skip:
-                data["skip_counter_players"] = sorted(skip)
-                changed = True
-
-        if not changed:
-            return await call_next(request)
-
-        # Re-inject modified body
-        new_body = json.dumps(data).encode("utf-8")
-
-        async def receive() -> dict:
-            return {"type": "http.request", "body": new_body, "more_body": False}
-
-        request._receive = receive  # type: ignore[attr-defined]
         return await call_next(request)
