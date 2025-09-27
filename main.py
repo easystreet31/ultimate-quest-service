@@ -1,18 +1,19 @@
 # main.py — wrapper around your core FastAPI app (app_core.py)
 # Adds:
-#  * Env-default merging (unchanged)
-#  * Optional "prefer_env_defaults" override (unchanged)
-#  * FragilityFilterMiddleware: for trade eval endpoints, show only trade-created fragility (delta) on traded players.
+#   • MergeDefaultsMiddleware — fills/overrides request with env defaults (supports prefer_env_defaults=true)
+#   • FragilityFilterMiddleware — for trade endpoints, show only trade-created fragility on traded players
+#       - deep, recursive filtering (handles nested lists)
+#   • /defaults endpoint to echo current env defaults (for quick diagnostics)
 
 from __future__ import annotations
 import os, json
-from typing import Any, Dict, List, Tuple, Callable, Optional
+from typing import Any, Dict, List, Tuple, Callable, Optional, Union
 
 from fastapi import FastAPI, Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
-# ---- import the real app ----
+# ========= import the real app =========
 _core_err = None
 try:
     from app_core import app as core_app
@@ -25,7 +26,7 @@ if core_app is None:
 
 app: FastAPI = core_app
 
-# ---------- env helpers ----------
+# ========= env helpers =========
 def _env(k: str, default: Optional[str] = None) -> Optional[str]:
     v = os.getenv(k)
     return v if (v is not None and v != "") else default
@@ -41,7 +42,7 @@ def _to_list_csv(v: Optional[str]) -> List[str]:
         return []
     return [p.strip() for p in v.split(",") if p.strip()]
 
-# ---------- URLs / defaults from env ----------
+# ========= URLs / defaults from env =========
 DEFAULT_LEADERBOARD_URL       = _env("DEFAULT_LEADERBOARD_URL")
 DEFAULT_LEADERBOARD_YDAY_URL  = _env("DEFAULT_LEADERBOARD_YDAY_URL")
 DEFAULT_HOLDINGS_E31_URL      = _env("DEFAULT_HOLDINGS_E31_URL")
@@ -54,7 +55,7 @@ DEFAULT_POOL_COLLECTION_URL   = _env("DEFAULT_POOL_COLLECTION_URL")
 DEFAULT_TARGET_RIVALS         = _to_list_csv(_env("DEFAULT_TARGET_RIVALS", ""))
 DEFAULT_DEFEND_BUFFER_ALL     = _to_int(_env("DEFAULT_DEFEND_BUFFER_ALL", "15"), 15)
 
-# ---------- request merging / override ----------
+# ========= request merging / override =========
 def _merge_common(body: Dict[str, Any]) -> None:
     body.setdefault("leaderboard_url", DEFAULT_LEADERBOARD_URL)
     body.setdefault("holdings_url", DEFAULT_HOLDINGS_E31_URL)
@@ -166,21 +167,21 @@ class MergeDefaultsMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(MergeDefaultsMiddleware)
 
-# ---------- Fragility filter (trade-only, delta-by-default) ----------
+# ========= Fragility filter (trade-only, deep, delta-by-default) =========
 TRADE_ENDPOINTS = {"/evaluate_by_urls_easystreet31", "/family_evaluate_trade_by_urls"}
 
-def _trade_players_from_body(body: Dict[str, Any]) -> List[str]:
+def _expand_trade_players(body: Dict[str, Any]) -> List[str]:
     names: List[str] = []
     for line in body.get("trade", []) or []:
         p = line.get("players")
         if isinstance(p, str) and p.strip():
             names.append(p.strip())
-    # Split multi-subject like "A/B" into separate names too
+    # split on slash or comma
     expanded: List[str] = []
     for n in names:
         parts = [s.strip() for s in n.replace(",", "/").split("/") if s.strip()]
         expanded.extend(parts if parts else [n])
-    # unique, case-insensitive
+    # unique case-insensitive
     seen = set()
     out: List[str] = []
     for n in expanded:
@@ -189,100 +190,107 @@ def _trade_players_from_body(body: Dict[str, Any]) -> List[str]:
             seen.add(k); out.append(n)
     return out
 
-def _normalize_frag_list(any_list) -> List[Dict[str, Any]]:
-    if not isinstance(any_list, list):
-        return []
-    out = []
-    for item in any_list:
-        if isinstance(item, dict):
-            out.append(item)
-    return out
+def _read_margin(d: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    # Accept multiple common field names
+    before = d.get("margin_before", d.get("before_margin"))
+    after  = d.get("margin_after",  d.get("after_margin", d.get("margin")))
+    try:
+        b = float(before) if before is not None else None
+    except:
+        b = None
+    try:
+        a = float(after) if after is not None else None
+    except:
+        a = None
+    return b, a
 
-def _filter_fragility(payload: Dict[str, Any], trade_players: List[str], defend_buffer: int, mode: str) -> Dict[str, Any]:
-    # Known fragility keys we may see from core
-    CAND_KEYS = [
-        "fragility_alerts", "fragile_firsts", "thin_firsts",
-        "post_trade_fragility", "fragility", "fragility_after"
-    ]
-    tset = {p.lower() for p in trade_players}
+def _is_frag_item(x: Any) -> bool:
+    return isinstance(x, dict) and any(k in x for k in ("player", "name", "players"))
 
-    def keep_item(d: Dict[str, Any]) -> bool:
-        # Extract player name and margins
-        nm = d.get("player") or d.get("name") or d.get("players")
-        if not isinstance(nm, str):
-            return False
-        nm_l = nm.lower()
-        if nm_l not in tset:
-            return False  # only players in the trade
-        # margins
-        before = d.get("margin_before") or d.get("before_margin")
-        after  = d.get("margin_after")  or d.get("after_margin") or d.get("margin")
-        try:
-            after_val = float(after) if after is not None else None
-            before_val = float(before) if before is not None else None
-        except:
-            after_val = before_val = None
+def _get_item_name(x: Dict[str, Any]) -> Optional[str]:
+    nm = x.get("player") or x.get("name") or x.get("players")
+    return nm if isinstance(nm, str) and nm.strip() else None
 
-        if mode == "trade_delta":
-            if after_val is None or before_val is None:
-                # cannot compute delta; drop to trade_only behavior
-                return bool(after_val is not None and after_val <= defend_buffer)
-            return (before_val > defend_buffer) and (after_val <= defend_buffer)
-        elif mode == "trade_only":
-            return bool(after_val is not None and after_val <= defend_buffer)
-        elif mode == "none":
-            return False
-        else:  # "all"
+def _looks_like_frag_list(lst: List[Any]) -> bool:
+    # Heuristic: list of dicts; majority have a name field; some have margin fields
+    if not lst or not isinstance(lst, list):
+        return False
+    dicts = [x for x in lst if isinstance(x, dict)]
+    if not dicts:
+        return False
+    namey = [x for x in dicts if _get_item_name(x)]
+    if not namey:
+        return False
+    # If any dict has margin fields, treat as frag list
+    for x in dicts:
+        if any(k in x for k in ("margin", "margin_after", "margin_before", "before_margin", "after_margin")):
             return True
+    # Sometimes core sends just names + tags; we won't filter those to avoid false positives
+    return False
 
-    # Apply filter
-    found_any = False
-    for k in CAND_KEYS:
-        if k in payload:
-            lst = _normalize_frag_list(payload.get(k))
-            if mode == "none":
-                payload[k] = []
-                found_any = True
-                continue
-            filtered = [d for d in lst if keep_item(d)]
-            payload[k] = filtered
-            found_any = True
+def _keep_item(x: Dict[str, Any], tset: set, defend_buffer: int, mode: str) -> bool:
+    nm = _get_item_name(x)
+    if not nm:
+        return False
+    if nm.lower() not in tset:
+        return False  # keep only traded players
+    b, a = _read_margin(x)
+    if mode == "trade_delta":
+        if a is None or b is None:
+            # if we can't compute delta, fallback to trade_only
+            return bool(a is not None and a <= defend_buffer)
+        # became thin because of the trade?
+        return (b > defend_buffer) and (a <= defend_buffer)
+    elif mode == "trade_only":
+        return bool(a is not None and a <= defend_buffer)
+    elif mode == "none":
+        return False
+    else:  # "all"
+        return True
 
-    # If core used some other key, leave it as-is (we won't mutate unknown shapes)
-    # Add a marker so you know filter ran
-    payload.setdefault("_notes", [])
-    payload["_notes"].append({"fragility_filter": mode, "trade_players": trade_players})
-
-    # If we removed all fragility items, also surface a clean note for the UI
-    if found_any:
-        # check if every known list is empty
-        empties = True
-        for k in CAND_KEYS:
-            if isinstance(payload.get(k), list) and len(payload.get(k)) > 0:
-                empties = False; break
-        if empties:
-            payload["_notes"].append({"fragility_result": "suppressed_or_none"})
-    return payload
+def _deep_filter(obj: Any, tset: set, defend_buffer: int, mode: str) -> Any:
+    # Recurse dicts/lists and filter any list that looks like frag entries
+    if isinstance(obj, list):
+        # If this list itself looks like frag entries, filter it;
+        # otherwise map recursively.
+        if _looks_like_frag_list(obj):
+            return [x for x in obj if isinstance(x, dict) and _keep_item(x, tset, defend_buffer, mode)]
+        else:
+            return [_deep_filter(x, tset, defend_buffer, mode) for x in obj]
+    elif isinstance(obj, dict):
+        newd: Dict[str, Any] = {}
+        for k, v in obj.items():
+            if isinstance(v, list) and _looks_like_frag_list(v):
+                newd[k] = [x for x in v if isinstance(x, dict) and _keep_item(x, tset, defend_buffer, mode)]
+            else:
+                newd[k] = _deep_filter(v, tset, defend_buffer, mode)
+        return newd
+    else:
+        return obj
 
 class FragilityFilterMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
         try:
-            if (request.method.upper() == "POST" and
-                request.url.path in TRADE_ENDPOINTS and
-                getattr(request, "state", None) and
-                isinstance(request.state.merged_body, dict)):
+            if (request.method.upper() == "POST"
+                and request.url.path in TRADE_ENDPOINTS
+                and getattr(request, "state", None)
+                and isinstance(request.state.merged_body, dict)):
 
                 body = request.state.merged_body
                 mode = str(body.get("fragility_mode") or "trade_delta").lower()
-                # pull defend buffer: single-account "defend_buffer" or family "defend_buffer_all"
+                # per-endpoint buffer field
                 defend_buffer = int(body.get("defend_buffer") or body.get("defend_buffer_all") or DEFAULT_DEFEND_BUFFER_ALL or 15)
-                trade_players = _trade_players_from_body(body)
+                trade_players = _expand_trade_players(body)
+                tset = {p.lower() for p in trade_players}
 
-                # Only attempt to mutate JSON responses
+                # If no traded players, do nothing
+                if not tset:
+                    return response
+
+                # Read original response body
                 raw = b""
                 if hasattr(response, "body_iterator"):
-                    # Read existing body
                     chunks = []
                     async for chunk in response.body_iterator:  # type: ignore[attr-defined]
                         chunks.append(chunk)
@@ -290,29 +298,41 @@ class FragilityFilterMiddleware(BaseHTTPMiddleware):
                 else:
                     raw = getattr(response, "body", b"") or b""
 
-                # decode and filter
-                if raw:
-                    try:
-                        payload = json.loads(raw.decode("utf-8"))
-                        if isinstance(payload, dict) and trade_players:
-                            new_payload = _filter_fragility(payload, trade_players, defend_buffer, mode)
-                            new_raw = json.dumps(new_payload, ensure_ascii=False).encode("utf-8")
-                            response = Response(content=new_raw, status_code=response.status_code, media_type="application/json")
-                        else:
-                            # not a dict or no trade players; leave as is
-                            response = Response(content=raw, status_code=response.status_code, media_type="application/json")
-                    except Exception:
-                        # not JSON → return raw
-                        response = Response(content=raw, status_code=response.status_code, media_type=response.media_type)
-                # else: no body; return as is
+                if not raw:
+                    return response
+
+                try:
+                    payload = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    return Response(content=raw, status_code=response.status_code, media_type=response.media_type)
+
+                if not isinstance(payload, dict):
+                    return Response(content=raw, status_code=response.status_code, media_type="application/json")
+
+                # Apply deep filter
+                filtered = _deep_filter(payload, tset, defend_buffer, mode)
+
+                # Add small note for debugging (the GPT won’t show it unless asked)
+                notes = filtered.setdefault("_notes", [])
+                if isinstance(notes, list):
+                    notes.append({
+                        "fragility_filter": mode,
+                        "trade_players": sorted(list(tset)),
+                        "defend_buffer_used": defend_buffer
+                    })
+
+                new_raw = json.dumps(filtered, ensure_ascii=False).encode("utf-8")
+                return Response(content=new_raw, status_code=response.status_code, media_type="application/json")
+
         except Exception:
-            # On any error, do not block the response
+            # Never block if the filter blows up
             return response
+
         return response
 
 app.add_middleware(FragilityFilterMiddleware)
 
-# ---------- Diagnostics ----------
+# ========= diagnostics =========
 @app.get("/defaults")
 def defaults():
     return {
@@ -331,5 +351,5 @@ def defaults():
         },
         "target_rivals": DEFAULT_TARGET_RIVALS,
         "defend_buffer_all": DEFAULT_DEFEND_BUFFER_ALL,
-        "trade_fragility_default": "trade_delta (only show trade-created fragility on traded players)"
+        "trade_fragility_default": "trade_delta (deep filter on traded players only)"
     }
