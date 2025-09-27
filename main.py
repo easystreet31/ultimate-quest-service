@@ -1,61 +1,47 @@
-"""
-main.py — wrapper that:
-  (a) injects default URLs/knobs from environment into request bodies when omitted,
-  (b) augments /evaluate_by_urls_easystreet31 responses with BUFFER IMPACT + buffer-aware verdict.
-
-HOW TO DEPLOY
-1) Ensure your previous working app is in app_core.py and defines: app = FastAPI(...)
-2) Replace your current main.py with this file.
-3) Render start command stays: uvicorn main:app --host 0.0.0.0 --port $PORT
-
-This file does NOT change your core business logic; it post-processes responses to value "building buffer".
-"""
+# main.py — wrapper around your core FastAPI app (app_core.py)
+# Adds:
+#  * Env-default merging (unchanged)
+#  * Optional "prefer_env_defaults" override (unchanged)
+#  * FragilityFilterMiddleware: for trade eval endpoints, show only trade-created fragility (delta) on traded players.
 
 from __future__ import annotations
+import os, json
+from typing import Any, Dict, List, Tuple, Callable, Optional
 
-import io
-import os
-import re
-import json
-from typing import Any, Dict, List, Optional, Callable, Tuple
-from collections import defaultdict
-
-import pandas as pd
-import requests
 from fastapi import FastAPI, Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
-# ------------------------------------------------------------------------------
-# 0) Import your original FastAPI app (unchanged business logic)
-# ------------------------------------------------------------------------------
-_core_import_error = None
-core_app = None
+# ---- import the real app ----
+_core_err = None
 try:
-    from app_core import app as core_app  # your working app lives here
+    from app_core import app as core_app
 except Exception as e:
-    _core_import_error = e
+    _core_err = e
+    core_app = None
 
 if core_app is None:
-    raise RuntimeError(
-        "Could not import your original app from `app_core.py`.\n"
-        "Please rename your previous working `main.py` to `app_core.py` at the repo root.\n"
-        f"Import error: {repr(_core_import_error)}"
-    )
+    raise RuntimeError(f"Could not import app_core.app: {_core_err!r}")
 
-# The FastAPI instance uvicorn will serve.
 app: FastAPI = core_app
 
-
-# ------------------------------------------------------------------------------
-# 1) Read environment defaults once (URLs and knobs)
-# ------------------------------------------------------------------------------
-
-def _env(key: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(key)
+# ---------- env helpers ----------
+def _env(k: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(k)
     return v if (v is not None and v != "") else default
 
-# URLs (already set up in your service)
+def _to_int(v: Optional[str], default: int) -> int:
+    try:
+        return int(v) if v is not None else default
+    except:
+        return default
+
+def _to_list_csv(v: Optional[str]) -> List[str]:
+    if not v:
+        return []
+    return [p.strip() for p in v.split(",") if p.strip()]
+
+# ---------- URLs / defaults from env ----------
 DEFAULT_LEADERBOARD_URL       = _env("DEFAULT_LEADERBOARD_URL")
 DEFAULT_LEADERBOARD_YDAY_URL  = _env("DEFAULT_LEADERBOARD_YDAY_URL")
 DEFAULT_HOLDINGS_E31_URL      = _env("DEFAULT_HOLDINGS_E31_URL")
@@ -65,63 +51,35 @@ DEFAULT_COLLECTION_E31_URL    = _env("DEFAULT_COLLECTION_E31_URL")
 DEFAULT_COLLECTION_DC_URL     = _env("DEFAULT_COLLECTION_DC_URL")
 DEFAULT_COLLECTION_FE_URL     = _env("DEFAULT_COLLECTION_FE_URL")
 DEFAULT_POOL_COLLECTION_URL   = _env("DEFAULT_POOL_COLLECTION_URL")
+DEFAULT_TARGET_RIVALS         = _to_list_csv(_env("DEFAULT_TARGET_RIVALS", ""))
+DEFAULT_DEFEND_BUFFER_ALL     = _to_int(_env("DEFAULT_DEFEND_BUFFER_ALL", "15"), 15)
 
-DEFAULT_TARGET_RIVALS_RAW     = _env("DEFAULT_TARGET_RIVALS", "")
-DEFAULT_TARGET_RIVALS: List[str] = (
-    [r.strip() for r in DEFAULT_TARGET_RIVALS_RAW.split(",") if r.strip()]
-    if DEFAULT_TARGET_RIVALS_RAW is not None else []
-)
-
-def _to_int(val: Optional[str], fallback: int) -> int:
-    try:
-        return int(val) if val is not None else fallback
-    except Exception:
-        return fallback
-
-DEFAULT_DEFEND_BUFFER_ALL = _to_int(_env("DEFAULT_DEFEND_BUFFER_ALL", "15"), 15)
-
-# Buffer dials (new)
-def _to_float(val: Optional[str], fallback: float) -> float:
-    try:
-        return float(val) if val is not None else fallback
-    except Exception:
-        return fallback
-
-BUFFER_WEIGHT_PER_SP = _to_float(_env("BUFFER_WEIGHT_PER_SP", "0.15"), 0.15)
-BUFFER_CREDIT_CAP_PER_PLAYER = _to_float(_env("BUFFER_CREDIT_CAP_PER_PLAYER", "3"), 3.0)
-BUFFER_ACCEPT_THRESHOLD = _to_float(_env("BUFFER_ACCEPT_THRESHOLD", "0.75"), 0.75)
-BUFFER_COUNT_UP_TO_DEFEND = bool(str(_env("BUFFER_COUNT_UP_TO_DEFEND", "true")).lower() == "true")
-
-
-# ------------------------------------------------------------------------------
-# 2) Defaults merger (keep your existing behavior: URLs optional in prompts)
-# ------------------------------------------------------------------------------
-
-def _merge_list(value: Any) -> Optional[List[str]]:
-    if value is None:
-        return None
-    if isinstance(value, list):
-        return value
-    if isinstance(value, str):
-        parts = [p.strip() for p in value.split(",")]
-        return [p for p in parts if p]
-    return None
-
-def _apply_common_defaults(body: Dict[str, Any]) -> None:
+# ---------- request merging / override ----------
+def _merge_common(body: Dict[str, Any]) -> None:
     body.setdefault("leaderboard_url", DEFAULT_LEADERBOARD_URL)
-    body.setdefault("holdings_url",    DEFAULT_HOLDINGS_E31_URL)
-    body.setdefault("collection_url",  DEFAULT_POOL_COLLECTION_URL)
+    body.setdefault("holdings_url", DEFAULT_HOLDINGS_E31_URL)
+    body.setdefault("collection_url", DEFAULT_POOL_COLLECTION_URL)
     body.setdefault("my_collection_url", DEFAULT_COLLECTION_E31_URL)
-    if not body.get("target_rivals"):
-        if DEFAULT_TARGET_RIVALS:
-            body["target_rivals"] = DEFAULT_TARGET_RIVALS
-    else:
-        maybe = _merge_list(body.get("target_rivals"))
-        if maybe is not None:
-            body["target_rivals"] = maybe
     body.setdefault("defend_buffer", DEFAULT_DEFEND_BUFFER_ALL)
+    if "target_rivals" not in body and DEFAULT_TARGET_RIVALS:
+        body["target_rivals"] = DEFAULT_TARGET_RIVALS
+    # default fragility behavior for trade eval (only when caller didn’t specify)
+    if body.get("fragility_mode") is None:
+        if body.get("trade") and isinstance(body["trade"], list):
+            body["fragility_mode"] = "trade_delta"
 
-def _apply_family_defaults(body: Dict[str, Any]) -> None:
+def _override_common(body: Dict[str, Any]) -> None:
+    body["leaderboard_url"] = DEFAULT_LEADERBOARD_URL
+    body["holdings_url"] = DEFAULT_HOLDINGS_E31_URL
+    body["collection_url"] = DEFAULT_POOL_COLLECTION_URL
+    body["my_collection_url"] = DEFAULT_COLLECTION_E31_URL
+    body["defend_buffer"] = DEFAULT_DEFEND_BUFFER_ALL
+    if DEFAULT_TARGET_RIVALS:
+        body["target_rivals"] = DEFAULT_TARGET_RIVALS
+    if body.get("trade") and isinstance(body["trade"], list) and body.get("fragility_mode") is None:
+        body["fragility_mode"] = "trade_delta"
+
+def _merge_family(body: Dict[str, Any]) -> None:
     body.setdefault("leaderboard_url", DEFAULT_LEADERBOARD_URL)
     body.setdefault("holdings_e31_url", DEFAULT_HOLDINGS_E31_URL)
     body.setdefault("holdings_dc_url",  DEFAULT_HOLDINGS_DC_URL)
@@ -130,34 +88,57 @@ def _apply_family_defaults(body: Dict[str, Any]) -> None:
     body.setdefault("collection_dc_url",  DEFAULT_COLLECTION_DC_URL)
     body.setdefault("collection_fe_url",  DEFAULT_COLLECTION_FE_URL)
     body.setdefault("defend_buffer_all", DEFAULT_DEFEND_BUFFER_ALL)
+    if body.get("fragility_mode") is None:
+        if body.get("trade") and isinstance(body["trade"], list):
+            body["fragility_mode"] = "trade_delta"
 
-# Map routes we auto-fill with defaults
-POST_PATHS: Dict[str, Callable[[Dict[str, Any]], None]] = {
-    "/evaluate_by_urls_easystreet31":          _apply_common_defaults,
-    "/scan_by_urls_easystreet31":              _apply_common_defaults,
-    "/scan_rival_by_urls_easystreet31":        _apply_common_defaults,
-    "/scan_partner_by_urls_easystreet31":      _apply_common_defaults,
-    "/review_collection_by_urls_easystreet31": _apply_common_defaults,
-    "/suggest_give_from_collection_by_urls_easystreet31": _apply_common_defaults,
-    "/family_evaluate_trade_by_urls":          _apply_family_defaults,
-    "/collection_review_family_by_urls":       _apply_family_defaults,
-    "/family_transfer_suggestions_by_urls":    _apply_family_defaults,
-    "/family_transfer_optimize_by_urls":       _apply_family_defaults,
-    "/leaderboard_delta_by_urls":              lambda b: (
-        b.setdefault("leaderboard_today_url", DEFAULT_LEADERBOARD_URL),
-        b.setdefault("leaderboard_yesterday_url", DEFAULT_LEADERBOARD_YDAY_URL),
-        b.setdefault("leaderboard_url", b.get("leaderboard_today_url") or DEFAULT_LEADERBOARD_URL)
-    )
+def _override_family(body: Dict[str, Any]) -> None:
+    body["leaderboard_url"]    = DEFAULT_LEADERBOARD_URL
+    body["holdings_e31_url"]   = DEFAULT_HOLDINGS_E31_URL
+    body["holdings_dc_url"]    = DEFAULT_HOLDINGS_DC_URL
+    body["holdings_fe_url"]    = DEFAULT_HOLDINGS_FE_URL
+    body["collection_e31_url"] = DEFAULT_COLLECTION_E31_URL
+    body["collection_dc_url"]  = DEFAULT_COLLECTION_DC_URL
+    body["collection_fe_url"]  = DEFAULT_COLLECTION_FE_URL
+    body["defend_buffer_all"]  = DEFAULT_DEFEND_BUFFER_ALL
+    if body.get("trade") and isinstance(body["trade"], list) and body.get("fragility_mode") is None:
+        body["fragility_mode"] = "trade_delta"
+
+def _merge_delta(body: Dict[str, Any]) -> None:
+    body.setdefault("leaderboard_today_url",     DEFAULT_LEADERBOARD_URL)
+    body.setdefault("leaderboard_yesterday_url", DEFAULT_LEADERBOARD_YDAY_URL)
+    body.setdefault("leaderboard_url",           body.get("leaderboard_today_url") or DEFAULT_LEADERBOARD_URL)
+
+def _override_delta(body: Dict[str, Any]) -> None:
+    body["leaderboard_today_url"]     = DEFAULT_LEADERBOARD_URL
+    body["leaderboard_yesterday_url"] = DEFAULT_LEADERBOARD_YDAY_URL
+    body["leaderboard_url"]           = DEFAULT_LEADERBOARD_URL
+
+POST_PATHS: Dict[str, Tuple[Callable[[Dict[str, Any]], None], Callable[[Dict[str, Any]], None]]] = {
+    "/evaluate_by_urls_easystreet31":          (_merge_common, _override_common),
+    "/scan_by_urls_easystreet31":              (_merge_common, _override_common),
+    "/scan_rival_by_urls_easystreet31":        (_merge_common, _override_common),
+    "/scan_partner_by_urls_easystreet31":      (_merge_common, _override_common),
+    "/review_collection_by_urls_easystreet31": (_merge_common, _override_common),
+    "/suggest_give_from_collection_by_urls_easystreet31": (_merge_common, _override_common),
+
+    "/family_evaluate_trade_by_urls":          (_merge_family, _override_family),
+    "/collection_review_family_by_urls":       (_merge_family, _override_family),
+    "/family_transfer_suggestions_by_urls":    (_merge_family, _override_family),
+    "/family_transfer_optimize_by_urls":       (_merge_family, _override_family),
+
+    "/leaderboard_delta_by_urls":              (_merge_delta,  _override_delta),
 }
 
 class MergeDefaultsMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method.upper() != "POST":
             return await call_next(request)
-        merger = POST_PATHS.get(request.url.path)
-        if not merger:
+        pair = POST_PATHS.get(request.url.path)
+        if not pair:
             return await call_next(request)
 
+        merge_fn, override_fn = pair
         try:
             raw = await request.body()
             body = {} if not raw else json.loads(raw.decode("utf-8"))
@@ -166,366 +147,174 @@ class MergeDefaultsMiddleware(BaseHTTPMiddleware):
         except Exception:
             return await call_next(request)
 
+        prefer_env = bool(body.get("prefer_env_defaults") is True)
         try:
-            merger(body)
+            if prefer_env:
+                override_fn(body)
+            else:
+                merge_fn(body)
         except Exception:
             pass
 
-        # Save merged body for downstream (buffer augmentation will use it)
         request.state.merged_body = body
-
         new_raw = json.dumps(body).encode("utf-8")
 
         async def receive():
             return {"type": "http.request", "body": new_raw, "more_body": False}
-
         request._receive = receive  # type: ignore[attr-defined]
         return await call_next(request)
 
 app.add_middleware(MergeDefaultsMiddleware)
 
+# ---------- Fragility filter (trade-only, delta-by-default) ----------
+TRADE_ENDPOINTS = {"/evaluate_by_urls_easystreet31", "/family_evaluate_trade_by_urls"}
 
-# ------------------------------------------------------------------------------
-# 3) Buffer augmentation on /evaluate_by_urls_easystreet31 (post-process response)
-# ------------------------------------------------------------------------------
-
-# --- Utilities to load & normalize data ---------------------------------------
-
-def _fetch_xlsx(url: str) -> io.BytesIO:
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    return io.BytesIO(r.content)
-
-def _norm_name(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip().lower()
-
-def _detect_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    cols = {c: _norm_name(c) for c in df.columns}
-    for c in df.columns:
-        low = cols[c]
-        for pat in candidates:
-            if re.search(pat, low):
-                return c
-    return None
-
-def _load_holdings_map(url: str) -> Dict[str, float]:
-    """
-    Returns {player_name_norm: you_sp}
-    Tries to find columns like: Player, SP / Subject Points / Total SP
-    """
-    buf = _fetch_xlsx(url)
-    df = pd.read_excel(buf, sheet_name=0, dtype=str)
-    # Try to coerce numerics later
-    pcol = _detect_col(df, [r"\bplayer\b", r"\bname\b"])
-    scol = _detect_col(df, [r"\bsp\b", r"subject\s*_?points", r"total\s*_?sp"])
-    if not pcol:
-        # Fallback: first column
-        pcol = df.columns[0]
-    if not scol:
-        # Fallback: try any column that looks numeric-heavy
-        num_candidates = [c for c in df.columns if c != pcol]
-        scol = num_candidates[0] if num_candidates else df.columns[0]
-
-    out: Dict[str, float] = {}
-    for _, row in df.iterrows():
-        pname = _norm_name(str(row.get(pcol, "")))
-        if not pname:
-            continue
-        try:
-            sp = float(str(row.get(scol, "0")).replace(",", "").strip())
-        except Exception:
-            sp = 0.0
-        out[pname] = out.get(pname, 0.0) + sp
+def _trade_players_from_body(body: Dict[str, Any]) -> List[str]:
+    names: List[str] = []
+    for line in body.get("trade", []) or []:
+        p = line.get("players")
+        if isinstance(p, str) and p.strip():
+            names.append(p.strip())
+    # Split multi-subject like "A/B" into separate names too
+    expanded: List[str] = []
+    for n in names:
+        parts = [s.strip() for s in n.replace(",", "/").split("/") if s.strip()]
+        expanded.extend(parts if parts else [n])
+    # unique, case-insensitive
+    seen = set()
+    out: List[str] = []
+    for n in expanded:
+        k = n.lower()
+        if k not in seen:
+            seen.add(k); out.append(n)
     return out
 
-def _load_leaderboard_competitors(url: str, my_user: str = "easystreet31") -> Dict[str, List[float]]:
-    """
-    Returns {player_name_norm: [competitor_sp1, competitor_sp2, ...]} excluding my_user.
-    Accepts either "long" (player,user,sp[,rank]) or "wide top-5" formats.
-    """
-    buf = _fetch_xlsx(url)
-    df = pd.read_excel(buf, sheet_name=0, dtype=str)
-    # Try "long" format
-    pcol = _detect_col(df, [r"\bplayer\b", r"\bsubject\b"])
-    ucol = _detect_col(df, [r"\buser\b", r"\bcollector\b", r"\bowner\b", r"\bname\b"])
-    scol = _detect_col(df, [r"\bsp\b", r"subject\s*_?points", r"\bpoints\b", r"total\s*_?sp"])
-    if pcol and ucol and scol:
-        comp: Dict[str, List[float]] = defaultdict(list)
-        for _, row in df.iterrows():
-            player = _norm_name(str(row.get(pcol, "")))
-            user = _norm_name(str(row.get(ucol, "")))
-            try:
-                sp = float(str(row.get(scol, "0")).replace(",", "").strip())
-            except Exception:
-                sp = 0.0
-            if player and user and user != _norm_name(my_user):
-                comp[player].append(sp)
-        # sort desc
-        return {k: sorted(v, reverse=True) for k, v in comp.items() if v}
+def _normalize_frag_list(any_list) -> List[Dict[str, Any]]:
+    if not isinstance(any_list, list):
+        return []
+    out = []
+    for item in any_list:
+        if isinstance(item, dict):
+            out.append(item)
+    return out
 
-    # Try "wide" top-5 format: Player + pairs of (N User, N SP)
-    pcol = _detect_col(df, [r"\bplayer\b", r"\bsubject\b"])
-    if not pcol:
-        pcol = df.columns[0]
-    # Collect all (user,sp) column pairs
-    col_lows = {c: _norm_name(c) for c in df.columns}
-    rank_pairs: List[Tuple[str, str]] = []
-    # Heuristic: find columns that look like "1 user" and "1 sp", ..."5 user","5 sp"
-    for n in range(1, 8):  # up to 7 in case
-        user_col = None
-        sp_col = None
-        for c, low in col_lows.items():
-            if re.search(rf"\b{n}\b.*(user|name|collector|owner)", low):
-                user_col = c
-            if re.search(rf"\b{n}\b.*(sp|points)", low):
-                sp_col = c
-        if user_col and sp_col:
-            rank_pairs.append((user_col, sp_col))
+def _filter_fragility(payload: Dict[str, Any], trade_players: List[str], defend_buffer: int, mode: str) -> Dict[str, Any]:
+    # Known fragility keys we may see from core
+    CAND_KEYS = [
+        "fragility_alerts", "fragile_firsts", "thin_firsts",
+        "post_trade_fragility", "fragility", "fragility_after"
+    ]
+    tset = {p.lower() for p in trade_players}
 
-    comp: Dict[str, List[float]] = defaultdict(list)
-    for _, row in df.iterrows():
-        player = _norm_name(str(row.get(pcol, "")))
-        if not player:
-            continue
-        for (uc, sc) in rank_pairs:
-            user = _norm_name(str(row.get(uc, "")))
-            try:
-                sp = float(str(row.get(sc, "0")).replace(",", "").strip())
-            except Exception:
-                sp = 0.0
-            if user and user != _norm_name(my_user) and sp > 0:
-                comp[player].append(sp)
-    return {k: sorted(v, reverse=True) for k, v in comp.items() if v}
+    def keep_item(d: Dict[str, Any]) -> bool:
+        # Extract player name and margins
+        nm = d.get("player") or d.get("name") or d.get("players")
+        if not isinstance(nm, str):
+            return False
+        nm_l = nm.lower()
+        if nm_l not in tset:
+            return False  # only players in the trade
+        # margins
+        before = d.get("margin_before") or d.get("before_margin")
+        after  = d.get("margin_after")  or d.get("after_margin") or d.get("margin")
+        try:
+            after_val = float(after) if after is not None else None
+            before_val = float(before) if before is not None else None
+        except:
+            after_val = before_val = None
 
-def _parse_trade_deltas(trade_lines: List[Dict[str, Any]], multi_rule: str = "full_each_unique") -> Dict[str, float]:
-    """
-    Returns net delta per player for your account: +sp for GET, -sp for GIVE.
-    multi_rule 'full_each_unique' => full SP to every distinct player on the card.
-    """
-    deltas: Dict[str, float] = defaultdict(float)
-    for line in trade_lines or []:
-        side = str(line.get("side", "")).strip().upper()
-        sp = float(line.get("sp", 0) or 0)
-        players_field = str(line.get("players", "") or "")
-        # Split on '/', '&', ',', ' and '
-        raw_names = re.split(r"\s*/\s*|\s*&\s*|,\s*|\s+and\s+", players_field.strip())
-        names = sorted(set(_norm_name(n) for n in raw_names if n))
-        if not names or sp <= 0:
-            continue
-        for nm in names:
-            if side == "GET":
-                deltas[nm] += sp
-            elif side == "GIVE":
-                deltas[nm] -= sp
-    return deltas
+        if mode == "trade_delta":
+            if after_val is None or before_val is None:
+                # cannot compute delta; drop to trade_only behavior
+                return bool(after_val is not None and after_val <= defend_buffer)
+            return (before_val > defend_buffer) and (after_val <= defend_buffer)
+        elif mode == "trade_only":
+            return bool(after_val is not None and after_val <= defend_buffer)
+        elif mode == "none":
+            return False
+        else:  # "all"
+            return True
 
-def _rank_and_qp(you_sp: float, comp_sps: List[float]) -> Tuple[int, int]:
-    """Conservative: any tie with a competitor counts as behind (you need +1)."""
-    greater = sum(1 for v in comp_sps if v > you_sp)
-    equal   = sum(1 for v in comp_sps if v == you_sp)
-    rank = 1 + greater + (1 if equal > 0 else 0)
-    qp = 5 if rank == 1 else (3 if rank == 2 else (1 if rank == 3 else 0))
-    return rank, qp
+    # Apply filter
+    found_any = False
+    for k in CAND_KEYS:
+        if k in payload:
+            lst = _normalize_frag_list(payload.get(k))
+            if mode == "none":
+                payload[k] = []
+                found_any = True
+                continue
+            filtered = [d for d in lst if keep_item(d)]
+            payload[k] = filtered
+            found_any = True
 
-def _buffer_credit(margin_before: float, margin_after: float, defend: int) -> float:
-    """
-    Compute buffer credit from margin delta, only counting up to defend if enabled.
-    """
-    mb = margin_before
-    ma = margin_after
-    if BUFFER_COUNT_UP_TO_DEFEND:
-        mb = min(mb, defend)
-        ma = min(ma, defend)
-    gain_sp = ma - mb  # can be negative
-    credit = gain_sp * BUFFER_WEIGHT_PER_SP
-    # Positive credit capped per player:
-    if credit > 0:
-        credit = min(credit, BUFFER_CREDIT_CAP_PER_PLAYER)
-    return credit
+    # If core used some other key, leave it as-is (we won't mutate unknown shapes)
+    # Add a marker so you know filter ran
+    payload.setdefault("_notes", [])
+    payload["_notes"].append({"fragility_filter": mode, "trade_players": trade_players})
 
-# --- Middleware that augments the evaluator response --------------------------
+    # If we removed all fragility items, also surface a clean note for the UI
+    if found_any:
+        # check if every known list is empty
+        empties = True
+        for k in CAND_KEYS:
+            if isinstance(payload.get(k), list) and len(payload.get(k)) > 0:
+                empties = False; break
+        if empties:
+            payload["_notes"].append({"fragility_result": "suppressed_or_none"})
+    return payload
 
-class BufferAugmentMiddleware(BaseHTTPMiddleware):
+class FragilityFilterMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Only target the single-account evaluator
-        if request.method.upper() != "POST" or request.url.path != "/evaluate_by_urls_easystreet31":
-            return await call_next(request)
-
-        # Grab the merged body from the defaults middleware
-        body = getattr(request.state, "merged_body", None)
-        if not isinstance(body, dict):
-            return await call_next(request)
-
-        # Call downstream first to get the original evaluation JSON
         response = await call_next(request)
+        try:
+            if (request.method.upper() == "POST" and
+                request.url.path in TRADE_ENDPOINTS and
+                getattr(request, "state", None) and
+                isinstance(request.state.merged_body, dict)):
 
-        # We only handle JSON responses
-        content_type = (response.headers.get("content-type") or "").lower()
-        if "application/json" not in content_type:
+                body = request.state.merged_body
+                mode = str(body.get("fragility_mode") or "trade_delta").lower()
+                # pull defend buffer: single-account "defend_buffer" or family "defend_buffer_all"
+                defend_buffer = int(body.get("defend_buffer") or body.get("defend_buffer_all") or DEFAULT_DEFEND_BUFFER_ALL or 15)
+                trade_players = _trade_players_from_body(body)
+
+                # Only attempt to mutate JSON responses
+                raw = b""
+                if hasattr(response, "body_iterator"):
+                    # Read existing body
+                    chunks = []
+                    async for chunk in response.body_iterator:  # type: ignore[attr-defined]
+                        chunks.append(chunk)
+                    raw = b"".join(chunks)
+                else:
+                    raw = getattr(response, "body", b"") or b""
+
+                # decode and filter
+                if raw:
+                    try:
+                        payload = json.loads(raw.decode("utf-8"))
+                        if isinstance(payload, dict) and trade_players:
+                            new_payload = _filter_fragility(payload, trade_players, defend_buffer, mode)
+                            new_raw = json.dumps(new_payload, ensure_ascii=False).encode("utf-8")
+                            response = Response(content=new_raw, status_code=response.status_code, media_type="application/json")
+                        else:
+                            # not a dict or no trade players; leave as is
+                            response = Response(content=raw, status_code=response.status_code, media_type="application/json")
+                    except Exception:
+                        # not JSON → return raw
+                        response = Response(content=raw, status_code=response.status_code, media_type=response.media_type)
+                # else: no body; return as is
+        except Exception:
+            # On any error, do not block the response
             return response
+        return response
 
-        # Read response body (consume iterator, then rebuild Response)
-        resp_bytes = b""
-        async for chunk in response.body_iterator:
-            resp_bytes += chunk
+app.add_middleware(FragilityFilterMiddleware)
 
-        try:
-            base = json.loads(resp_bytes.decode("utf-8"))
-        except Exception:
-            # If we can't parse, just return original
-            return Response(content=resp_bytes, status_code=response.status_code,
-                            headers=dict(response.headers), media_type="application/json")
-
-        # ----------------- Compute BUFFER IMPACT locally -----------------
-        try:
-            leaderboard_url = body.get("leaderboard_url") or DEFAULT_LEADERBOARD_URL
-            holdings_url    = body.get("holdings_url") or DEFAULT_HOLDINGS_E31_URL
-            defend_buffer   = int(body.get("defend_buffer") or DEFAULT_DEFEND_BUFFER_ALL)
-            trade_lines     = body.get("trade") or []
-            multi_rule      = body.get("multi_subject_rule") or "full_each_unique"
-
-            # Load data
-            you_map = _load_holdings_map(holdings_url)                    # {player: you_sp}
-            comp_map = _load_leaderboard_competitors(leaderboard_url)     # {player: [competitor sps...]}
-
-            # Which players are impacted by the trade
-            deltas = _parse_trade_deltas(trade_lines, multi_rule)
-            impacted = sorted(deltas.keys())
-
-            buffer_details: List[Dict[str, Any]] = []
-            total_buffer_credit = 0.0
-            total_buffer_penalty = 0.0
-            delta_qp_total = 0
-
-            for pname in impacted:
-                you_before = float(you_map.get(pname, 0.0))
-                you_after  = you_before + float(deltas.get(pname, 0.0))
-                comps = comp_map.get(pname, [])
-                top_comp = comps[0] if comps else 0.0
-
-                # Rank/QP before/after (for final ΔQP sanity per impacted player)
-                r_b, qp_b = _rank_and_qp(you_before, comps)
-                r_a, qp_a = _rank_and_qp(you_after,  comps)
-                d_qp = qp_a - qp_b
-                delta_qp_total += d_qp
-
-                # Buffer applies only if you were actually 1st strictly before
-                if you_before > top_comp:
-                    margin_before = you_before - top_comp
-                    margin_after  = max(0.0, you_after - top_comp)
-                    credit = _buffer_credit(margin_before, margin_after, defend_buffer)
-                    if credit >= 0:
-                        total_buffer_credit += credit
-                    else:
-                        total_buffer_penalty += credit  # negative
-                    buffer_details.append({
-                        "player": pname,
-                        "you_sp_before": you_before,
-                        "you_sp_after": you_after,
-                        "second_sp": top_comp,
-                        "margin_before": margin_before,
-                        "margin_after": margin_after,
-                        "buffer_delta_sp": (margin_after - margin_before) if BUFFER_COUNT_UP_TO_DEFEND else (you_after - you_before),
-                        "credit": round(credit, 3),
-                        "rank_before": r_b,
-                        "rank_after": r_a,
-                        "qp_before": qp_b,
-                        "qp_after": qp_a,
-                        "delta_qp": d_qp
-                    })
-                else:
-                    # Not 1st before → no buffer credit (but show rank/qp context)
-                    buffer_details.append({
-                        "player": pname,
-                        "you_sp_before": you_before,
-                        "you_sp_after": you_after,
-                        "second_sp": top_comp,
-                        "margin_before": you_before - top_comp,
-                        "margin_after": you_after - top_comp,
-                        "buffer_delta_sp": 0,
-                        "credit": 0.0,
-                        "rank_before": r_b,
-                        "rank_after": r_a,
-                        "qp_before": qp_b,
-                        "qp_after": qp_a,
-                        "delta_qp": d_qp
-                    })
-
-            buffer_net = total_buffer_credit + total_buffer_penalty  # penalty is ≤ 0
-            # Prefer ΔQP from base response if present; else fall back to our impacted-only ΔQP
-            base_qp_delta = None
-            try:
-                # Try common locations/keys used in your responses
-                if isinstance(base.get("qp_summary"), dict):
-                    base_qp_delta = base["qp_summary"].get("net_delta_qp")
-                if base_qp_delta is None and isinstance(base.get("summary"), dict):
-                    base_qp_delta = base["summary"].get("net_delta_qp")
-            except Exception:
-                pass
-            delta_qp_effective = base_qp_delta if isinstance(base_qp_delta, (int, float)) else delta_qp_total
-
-            composite = float(delta_qp_effective) + float(buffer_net)
-
-            # Build buffer block
-            buffer_block = {
-                "config": {
-                    "defend_buffer": defend_buffer,
-                    "weight_per_sp": BUFFER_WEIGHT_PER_SP,
-                    "cap_per_player": BUFFER_CREDIT_CAP_PER_PLAYER,
-                    "count_up_to_defend": BUFFER_COUNT_UP_TO_DEFEND,
-                    "accept_threshold_if_qp_zero": BUFFER_ACCEPT_THRESHOLD,
-                },
-                "details": buffer_details,
-                "totals": {
-                    "delta_qp_on_impacted_players": delta_qp_total,
-                    "buffer_credit_sum": round(total_buffer_credit, 3),
-                    "buffer_penalty_sum": round(total_buffer_penalty, 3),
-                    "buffer_net": round(buffer_net, 3),
-                    "composite_score": round(composite, 3),
-                }
-            }
-
-            # Attach to response
-            base["buffer_impact"] = buffer_block
-
-            # Verdict logic: if base verdict neutral/decline due to QP = 0 but composite strong, flip to accept
-            verdict_text = str(base.get("verdict") or "").strip().lower()
-            # Pull a numeric ΔQP if base exposed it, else our impacted-only ΔQP
-            dq = float(delta_qp_effective or 0.0)
-
-            if dq >= 1:
-                # Already a QP win; just annotate that buffer supports the win
-                base["verdict_note"] = f"QP-positive; buffer support {round(buffer_net,3)}."
-            elif dq <= -1:
-                # QP-loser stays a reject, but show buffer context
-                base["verdict_note"] = f"QP-negative; buffer impact {round(buffer_net,3)}."
-            else:
-                # ΔQP == 0 → use composite
-                if composite >= BUFFER_ACCEPT_THRESHOLD:
-                    base["verdict"] = "ACCEPT (buffer-positive)"
-                    base["verdict_note"] = f"Composite {round(composite,3)} ≥ {BUFFER_ACCEPT_THRESHOLD}; buffer nets {round(buffer_net,3)}."
-                else:
-                    # keep original; annotate
-                    base["verdict_note"] = f"ΔQP=0; composite {round(composite,3)} (< {BUFFER_ACCEPT_THRESHOLD})."
-
-            new_bytes = json.dumps(base, ensure_ascii=False).encode("utf-8")
-            return Response(content=new_bytes, status_code=response.status_code,
-                            headers={**dict(response.headers), "content-type": "application/json"})
-        except Exception:
-            # If anything goes wrong, return original response unchanged
-            return Response(content=resp_bytes, status_code=response.status_code,
-                            headers=dict(response.headers), media_type="application/json")
-
-# Attach the buffer augmentation middleware
-app.add_middleware(BufferAugmentMiddleware)
-
-
-# ------------------------------------------------------------------------------
-# 4) Diagnostics
-# ------------------------------------------------------------------------------
-
+# ---------- Diagnostics ----------
 @app.get("/defaults")
-def defaults_echo() -> Dict[str, Any]:
+def defaults():
     return {
         "leaderboard_url": DEFAULT_LEADERBOARD_URL,
         "leaderboard_yesterday_url": DEFAULT_LEADERBOARD_YDAY_URL,
@@ -542,11 +331,5 @@ def defaults_echo() -> Dict[str, Any]:
         },
         "target_rivals": DEFAULT_TARGET_RIVALS,
         "defend_buffer_all": DEFAULT_DEFEND_BUFFER_ALL,
-        "buffer": {
-            "weight_per_sp": BUFFER_WEIGHT_PER_SP,
-            "cap_per_player": BUFFER_CREDIT_CAP_PER_PLAYER,
-            "count_up_to_defend": BUFFER_COUNT_UP_TO_DEFEND,
-            "accept_threshold_if_qp_zero": BUFFER_ACCEPT_THRESHOLD,
-        },
-        "note": "Defaults apply only when a field is omitted in the POST body."
+        "trade_fragility_default": "trade_delta (only show trade-created fragility on traded players)"
     }
