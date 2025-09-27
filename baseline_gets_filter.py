@@ -1,14 +1,23 @@
-# baseline_gets_filter.py — middleware to avoid “double-dipping” on players already in the trade GET lines
+# baseline_gets_filter.py — middleware to avoid suggesting counter buys
+# for players already present in the trade's GET lines.
+#
+# Behavior:
+#  - Reads the request JSON to collect the set of "GET" players (splitting multi-subject "A/B" by "/").
+#  - Lets the app run.
+#  - If the JSON response contains a "counter" block with "picks": [...],
+#    remove any pick whose players intersect the GET players from the request.
+#  - If shapes differ, the middleware is a safe no-op.
+
 from __future__ import annotations
 import json
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Optional
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response, StreamingResponse, JSONResponse
+from starlette.responses import Response, JSONResponse
 from starlette.types import ASGIApp
 
-def _safe_json_loads(b: bytes) -> Any | None:
+def _safe_json_loads(b: bytes) -> Optional[Any]:
     try:
         return json.loads(b.decode("utf-8"))
     except Exception:
@@ -16,67 +25,81 @@ def _safe_json_loads(b: bytes) -> Any | None:
 
 def _collect_trade_get_players(payload: Any) -> Set[str]:
     """
-    Extract player names from trade GET lines in a request body.
-    Supports shapes like:
-      {"trade":[{"side":"GET","players":"A/B","sp":2}, ...]}
-      {"family_trade":{"trade":[...]}}
-    Returns a set of individual player names (split on '/' and trimmed).
+    Extract player names from trade GET lines in request payload.
+
+    Supported shapes:
+      { "trade": [{ "side":"GET", "players":"A/B", "sp":2 }, ...] }
+      { "family_trade": { "trade": [ ... ] } }
+
+    Returns a set of individual player names, split on '/' and stripped.
     """
     names: Set[str] = set()
     if not isinstance(payload, dict):
         return names
 
-    # most common shapes
     trade = None
-    if "trade" in payload and isinstance(payload["trade"], list):
+    if isinstance(payload.get("trade"), list):
         trade = payload["trade"]
-    elif "family_trade" in payload and isinstance(payload["family_trade"], dict):
-        ft = payload["family_trade"]
-        if "trade" in ft and isinstance(ft["trade"], list):
+    else:
+        ft = payload.get("family_trade")
+        if isinstance(ft, dict) and isinstance(ft.get("trade"), list):
             trade = ft["trade"]
 
     if not trade:
         return names
 
     for line in trade:
-        try:
-            if isinstance(line, dict) and str(line.get("side", "")).upper() == "GET":
-                players_field = str(line.get("players", "")).strip()
-                if not players_field:
-                    continue
-                # split multi-subject names by "/" and normalize
-                parts = [p.strip() for p in players_field.split("/") if p.strip()]
-                for p in parts:
-                    names.add(p)
-        except Exception:
-            # be lenient
+        if not isinstance(line, dict):
             continue
+        side = str(line.get("side", "")).strip().upper()
+        if side != "GET":
+            continue
+        players_field = str(line.get("players", "")).strip()
+        if not players_field:
+            continue
+        for p in players_field.split("/"):
+            p = p.strip()
+            if p:
+                names.add(p)
     return names
+
+def _normalize_pick_players(pick: Dict[str, Any]) -> List[str]:
+    """
+    Read players from a single counter pick.
+    Accepts either:
+      - "players": ["Name", "Name2"]
+      - "players": "Name/Name2"
+      - or sometimes "card_players": [...]
+    Returns a list of normalized player names (stripped).
+    """
+    raw = pick.get("players")
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    if isinstance(raw, str):
+        return [s.strip() for s in raw.split("/") if s.strip()]
+    # fallback alternate field some planners use
+    raw2 = pick.get("card_players")
+    if isinstance(raw2, list):
+        return [str(x).strip() for x in raw2 if str(x).strip()]
+    return []
 
 def _filter_counter_picks(body: Any, trade_get_players: Set[str]) -> Any:
     """
-    Given a response JSON body and the set of trade GET players,
+    Given a JSON response body and the set of GET players from the request,
     remove counter picks that duplicate those players.
 
-    Expected tolerant shapes:
+    Expected tolerant shape:
       {
         "counter": {
-          "picks": [
-             {"players": ["Brock Boeser"], "card_name": "...", ...},
-             {"players": ["John Tavares"], ...},
-             ...
-          ],
-          "omitted": N,
-          ...
+           "picks": [ { "players": [... or "A/B" ...], ... }, ... ],
+           "omitted": <int>?, ...
         },
         ...
       }
 
-    If the shape is different, return the body unchanged.
+    If the shape doesn't match, returns the original body unchanged.
     """
-    if not trade_get_players:
-        return body
-    if not isinstance(body, dict):
+    if not trade_get_players or not isinstance(body, dict):
         return body
 
     counter = body.get("counter")
@@ -87,34 +110,28 @@ def _filter_counter_picks(body: Any, trade_get_players: Set[str]) -> Any:
     if not isinstance(picks, list):
         return body
 
-    # Filter
     filtered: List[Dict[str, Any]] = []
     removed = 0
+
     for pick in picks:
         try:
-            players = pick.get("players")
-            # players may be a list ["Name", "Name"] or a single string "Name/Name"
-            if isinstance(players, list):
-                pl = [str(x).strip() for x in players if str(x).strip()]
-            else:
-                pl = [s.strip() for s in str(players or "").split("/") if s.strip()]
-
-            # if any of the players on this pick intersect the trade GET set, drop it
-            if any(p in trade_get_players for p in pl):
+            players = _normalize_pick_players(pick)
+            # If any overlap with GET players, drop this pick
+            if any(p in trade_get_players for p in players):
                 removed += 1
                 continue
-
             filtered.append(pick)
         except Exception:
-            # Be permissive; if unreadable, keep it rather than risk hiding info
+            # Be permissive — if anything goes wrong, keep the pick
             filtered.append(pick)
 
     counter["picks"] = filtered
-    # best-effort: bump an omitted count if present
-    if "omitted" in counter and isinstance(counter["omitted"], int):
-        counter["omitted"] += removed
-    else:
-        counter["omitted"] = removed
+    # keep or set 'omitted' to reflect removals
+    try:
+        prev = int(counter.get("omitted", 0))
+    except Exception:
+        prev = 0
+    counter["omitted"] = prev + removed
 
     body["counter"] = counter
     return body
@@ -122,59 +139,63 @@ def _filter_counter_picks(body: Any, trade_get_players: Set[str]) -> Any:
 class BaselineGetsFilterMiddleware(BaseHTTPMiddleware):
     """
     ASGI middleware:
-    - Reads the request body to collect trade GET players (if present).
-    - Lets the app handle the request.
-    - If the response is JSON and contains a “counter” block (family trade + counter),
-      removes counter picks that duplicate players already GET in the trade.
-    - For all other requests/shapes, passes through unchanged.
+      1) Read request body once → record GET players (best-effort).
+      2) Call downstream app.
+      3) If response is JSON and contains "counter.picks", remove picks for players already in GETs.
+      4) Otherwise pass through unchanged.
 
-    NOTE: This is non-invasive. If the request/response shapes differ from the
-    expectations above, nothing is modified.
+    It is deliberately conservative — if shapes differ, it does nothing.
     """
 
     async def dispatch(self, request: Request, call_next):
-        # 1) Peek at request body to collect trade GET players (best-effort)
+        # --- 1) Read the request body (so downstream can still read it later) ---
         try:
-            raw = await request.body()
+            raw_req = await request.body()
         except Exception:
-            raw = b""
+            raw_req = b""
 
-        trade_get_players = _collect_trade_get_players(_safe_json_loads(raw))
+        # Collect GET players from request (if any)
+        trade_get_players = _collect_trade_get_players(_safe_json_loads(raw_req))
 
-        # Rebuild the request stream for downstream (so FastAPI can read it again)
-        async def receive():
-            return {"type": "http.request", "body": raw, "more_body": False}
+        # Re-supply the original body to downstream handlers
+        async def _receive():
+            return {"type": "http.request", "body": raw_req, "more_body": False}
+        request._receive = _receive  # type: ignore[attr-defined]
 
-        request._receive = receive  # type: ignore[attr-defined]
-
-        # 2) Call downstream
+        # --- 2) Call downstream app ---
         response: Response = await call_next(request)
 
-        # 3) Only attempt to filter JSON responses with a body
-        try:
-            # If not JSON, pass through
-            if "application/json" not in (response.headers.get("content-type") or ""):
-                return response
-
-            # Read the existing body
-            if isinstance(response, (JSONResponse,)):
-                body_obj = response.body
-            else:
-                body_bytes = b""
-                async for chunk in response.body_iterator:  # type: ignore[attr-defined]
-                    body_bytes += chunk
-                body_obj = body_bytes
-
-            body_json = _safe_json_loads(body_obj if isinstance(body_obj, (bytes, bytearray)) else bytes(body_obj))
-            if body_json is None:
-                # Not JSON decodable → pass through
-                return response
-
-            # 4) Filter counter picks if applicable
-            new_body = _filter_counter_picks(body_json, trade_get_players)
-            # 5) Return a fresh JSON response
-            return JSONResponse(new_body, status_code=getattr(response, "status_code", 200), headers=dict(response.headers))
-
-        except Exception:
-            # Any failure → return the original response
+        # --- 3) Only post-process JSON responses ---
+        content_type = (response.headers.get("content-type") or "").lower()
+        if "application/json" not in content_type:
             return response
+
+        # Get the original JSON body safely
+        body_bytes: Optional[bytes] = None
+        try:
+            # JSONResponse has .body already as bytes
+            if isinstance(response, JSONResponse):
+                body_bytes = response.body
+            else:
+                # Starlette Response often has .body; if not, we won't touch it
+                body_attr = getattr(response, "body", None)
+                if isinstance(body_attr, (bytes, bytearray)):
+                    body_bytes = bytes(body_attr)
+        except Exception:
+            body_bytes = None
+
+        if body_bytes is None:
+            # Could be a streaming response — do not consume it; pass through
+            return response
+
+        body_json = _safe_json_loads(body_bytes)
+        if body_json is None:
+            return response
+
+        # Filter counter picks if applicable
+        new_body = _filter_counter_picks(body_json, trade_get_players)
+
+        # Rebuild a JSONResponse; copy headers except content-length (it'll be re-set)
+        new_headers = dict(response.headers)
+        new_headers.pop("content-length", None)
+        return JSONResponse(new_body, status_code=getattr(response, "status_code", 200), headers=new_headers)
