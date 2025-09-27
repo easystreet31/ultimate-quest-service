@@ -2,32 +2,28 @@
 # Version: 4.0.1-tradefrag-hard + baseline-gets filter hook
 
 from __future__ import annotations
-
-# --- standard imports
-from typing import Any
+from typing import Optional
 from fastapi import FastAPI
 
-# --- import your real application (all routes live there)
-# NOTE: do not change this; your service logic still resides in app_core.py
-_core_err: Exception | None = None
+# ---- import the real app (your domain logic & all routes) ----
+_core_err: Optional[Exception] = None
 try:
+    # Your existing application with all endpoints
     from app_core import app as core_app
 except Exception as e:
     _core_err = e
-    core_app = None
+    core_app = None  # type: ignore[assignment]
 
 if core_app is None:
-    # Fail fast with a clear error if app_core doesn't load
+    # Fail fast if app_core couldn't load
     raise RuntimeError(f"Could not import app_core.app: {_core_err!r}")
 
-# --- import the middleware (defined in baseline_gets_filter.py, see below)
-# This middleware is a safe no-op unless the combined “trade + counter” endpoint is used.
+# ---- our small response-filter middleware (defined in baseline_gets_filter.py) ----
 from baseline_gets_filter import BaselineGetsFilterMiddleware
 
-# --- bind the core app
+# ---- bind and augment the app ----
 app: FastAPI = core_app  # type: ignore[assignment]
 
-# --- attach middleware AFTER app is bound
-# (It will transparently pass through everything; on the combined trade+counter
-#  endpoint it will suppress counter suggestions that duplicate GET lines.)
+# Attach middleware AFTER the app is bound.
+# It is a safe no-op unless the response contains a "counter" block next to a trade with GET lines.
 app.add_middleware(BaselineGetsFilterMiddleware)
