@@ -1,202 +1,180 @@
-# baseline_gets_filter.py
-# Middleware that removes collection picks which duplicate baseline GETs from a trade.
-# - Excludes exact matches by (players set, SP)
-# - Excludes exact matches by card_number (if present)
-# - Only activates when:
-#     a) request JSON has {"exclude_baseline_gets": true, "baseline_trade":[...]}
-#     b) path is a collection-review endpoint
-
+# baseline_gets_filter.py — middleware to avoid “double-dipping” on players already in the trade GET lines
 from __future__ import annotations
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import json
+from typing import Any, Dict, List, Set
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response, JSONResponse
+from starlette.responses import Response, StreamingResponse, JSONResponse
+from starlette.types import ASGIApp
 
-# Endpoints whose JSON we will post-filter
-_FILTER_PATHS = {
-    "/review_collection_by_urls_easystreet31",
-    "/collection_review_family_by_urls",
-}
-
-# Keys we may need to filter in the JSON payloads (arrays of pick dicts)
-_PICK_LIST_KEYS = [
-    "qp_positive_picks",
-    "shore_thin_from_collection",
-    "take_first_from_collection",
-    "enter_top3_from_collection",
-    "rival_priority_picks",
-    "family_picks"
-]
-
-# -----------------------------
-# Helpers to normalize/compare
-# -----------------------------
-
-def _norm_players_key(players_value: Any) -> Optional[str]:
-    """
-    Accepts either a string 'A/B/C' or a list of names.
-    Returns canonical 'A|B|C' (sorted, stripped) or None.
-    """
-    if players_value is None:
+def _safe_json_loads(b: bytes) -> Any | None:
+    try:
+        return json.loads(b.decode("utf-8"))
+    except Exception:
         return None
-    if isinstance(players_value, (list, tuple, set)):
-        parts = [str(p).strip() for p in players_value if str(p).strip()]
-    else:
-        raw = str(players_value)
-        for sep in ['&', ',']:
-            raw = raw.replace(sep, '/')
-        parts = [p.strip() for p in raw.split('/') if p.strip()]
-    if not parts:
-        return None
-    return '|'.join(sorted(parts))
 
-
-def _make_trade_get_keys(baseline_trade: Iterable[Dict[str, Any]]) -> Tuple[Set[Tuple[str, int]], Set[str]]:
+def _collect_trade_get_players(payload: Any) -> Set[str]:
     """
-    Build exclusion keys from baseline trade GET lines.
-
-    Two flavors:
-      • players/SP key:   ( 'A|B|C', sp )
-      • card_number key:  'UI-87'   (uppercased)
+    Extract player names from trade GET lines in a request body.
+    Supports shapes like:
+      {"trade":[{"side":"GET","players":"A/B","sp":2}, ...]}
+      {"family_trade":{"trade":[...]}}
+    Returns a set of individual player names (split on '/' and trimmed).
     """
-    keys_players_sp: Set[Tuple[str, int]] = set()
-    keys_cardnum: Set[str] = set()
-    if not baseline_trade:
-        return keys_players_sp, keys_cardnum
+    names: Set[str] = set()
+    if not isinstance(payload, dict):
+        return names
 
-    for line in baseline_trade:
-        if not isinstance(line, dict):
-            continue
-        if str(line.get("side", "")).upper() != "GET":
-            continue
-        pk = _norm_players_key(line.get("players"))
-        sp_raw = line.get("sp")
-        sp_val = None
-        if sp_raw is not None:
-            try:
-                sp_val = int(float(sp_raw))
-            except Exception:
-                sp_val = None
-        if pk and sp_val is not None:
-            keys_players_sp.add((pk, sp_val))
+    # most common shapes
+    trade = None
+    if "trade" in payload and isinstance(payload["trade"], list):
+        trade = payload["trade"]
+    elif "family_trade" in payload and isinstance(payload["family_trade"], dict):
+        ft = payload["family_trade"]
+        if "trade" in ft and isinstance(ft["trade"], list):
+            trade = ft["trade"]
 
-        card_no = line.get("card_number")
-        if card_no:
-            keys_cardnum.add(str(card_no).strip().upper())
+    if not trade:
+        return names
 
-    return keys_players_sp, keys_cardnum
-
-
-def _pick_matches_exclusion(pick: Dict[str, Any],
-                            keys_players_sp: Set[Tuple[str, int]],
-                            keys_cardnum: Set[str]) -> bool:
-    """
-    True if a collection pick collides with baseline GETs by (players, SP) or card_number.
-    """
-    # players can be string or list
-    players_val = pick.get("players") or pick.get("players_list")
-    pk = _norm_players_key(players_val)
-
-    sp_val = pick.get("sp", pick.get("subject_points"))
-    sp = None
-    if sp_val is not None:
+    for line in trade:
         try:
-            sp = int(float(sp_val))
+            if isinstance(line, dict) and str(line.get("side", "")).upper() == "GET":
+                players_field = str(line.get("players", "")).strip()
+                if not players_field:
+                    continue
+                # split multi-subject names by "/" and normalize
+                parts = [p.strip() for p in players_field.split("/") if p.strip()]
+                for p in parts:
+                    names.add(p)
         except Exception:
-            sp = None
+            # be lenient
+            continue
+    return names
 
-    card_no = pick.get("card_number")
-    card_no_up = str(card_no).strip().upper() if card_no else None
-
-    if card_no_up and card_no_up in keys_cardnum:
-        return True
-    if pk and (sp is not None) and (pk, sp) in keys_players_sp:
-        return True
-    return False
-
-
-def _filter_picks_excluding_baseline_gets(picks: List[Dict[str, Any]],
-                                          baseline_trade: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _filter_counter_picks(body: Any, trade_get_players: Set[str]) -> Any:
     """
-    Filter a list of pick dicts, removing items that match the baseline GETs.
+    Given a response JSON body and the set of trade GET players,
+    remove counter picks that duplicate those players.
+
+    Expected tolerant shapes:
+      {
+        "counter": {
+          "picks": [
+             {"players": ["Brock Boeser"], "card_name": "...", ...},
+             {"players": ["John Tavares"], ...},
+             ...
+          ],
+          "omitted": N,
+          ...
+        },
+        ...
+      }
+
+    If the shape is different, return the body unchanged.
     """
-    if not picks or not baseline_trade:
-        return picks or []
+    if not trade_get_players:
+        return body
+    if not isinstance(body, dict):
+        return body
 
-    keys_players_sp, keys_cardnum = _make_trade_get_keys(baseline_trade)
-    if not keys_players_sp and not keys_cardnum:
-        return picks
+    counter = body.get("counter")
+    if not isinstance(counter, dict):
+        return body
 
+    picks = counter.get("picks")
+    if not isinstance(picks, list):
+        return body
+
+    # Filter
     filtered: List[Dict[str, Any]] = []
-    for p in picks:
+    removed = 0
+    for pick in picks:
         try:
-            if not _pick_matches_exclusion(p, keys_players_sp, keys_cardnum):
-                filtered.append(p)
+            players = pick.get("players")
+            # players may be a list ["Name", "Name"] or a single string "Name/Name"
+            if isinstance(players, list):
+                pl = [str(x).strip() for x in players if str(x).strip()]
+            else:
+                pl = [s.strip() for s in str(players or "").split("/") if s.strip()]
+
+            # if any of the players on this pick intersect the trade GET set, drop it
+            if any(p in trade_get_players for p in pl):
+                removed += 1
+                continue
+
+            filtered.append(pick)
         except Exception:
-            # If malformed, keep the pick (fail-open)
-            filtered.append(p)
-    return filtered
+            # Be permissive; if unreadable, keep it rather than risk hiding info
+            filtered.append(pick)
 
+    counter["picks"] = filtered
+    # best-effort: bump an omitted count if present
+    if "omitted" in counter and isinstance(counter["omitted"], int):
+        counter["omitted"] += removed
+    else:
+        counter["omitted"] = removed
 
-# -----------------------------
-# Middleware
-# -----------------------------
+    body["counter"] = counter
+    return body
 
 class BaselineGetsFilterMiddleware(BaseHTTPMiddleware):
     """
-    Intercepts POST JSON requests to collection-review endpoints.
-    If payload has {"exclude_baseline_gets": true, "baseline_trade": [...]},
-    removes any recommended picks that collide with the baseline GETs.
+    ASGI middleware:
+    - Reads the request body to collect trade GET players (if present).
+    - Lets the app handle the request.
+    - If the response is JSON and contains a “counter” block (family trade + counter),
+      removes counter picks that duplicate players already GET in the trade.
+    - For all other requests/shapes, passes through unchanged.
+
+    NOTE: This is non-invasive. If the request/response shapes differ from the
+    expectations above, nothing is modified.
     """
 
     async def dispatch(self, request: Request, call_next):
-        # Only watch certain endpoints + POST
-        if request.method != "POST" or request.url.path not in _FILTER_PATHS:
-            return await call_next(request)
-
-        # Read request body once and re-attach it so downstream handlers still receive it
+        # 1) Peek at request body to collect trade GET players (best-effort)
         try:
-            body_bytes = await request.body()
+            raw = await request.body()
         except Exception:
-            body_bytes = b""
+            raw = b""
+
+        trade_get_players = _collect_trade_get_players(_safe_json_loads(raw))
+
+        # Rebuild the request stream for downstream (so FastAPI can read it again)
+        async def receive():
+            return {"type": "http.request", "body": raw, "more_body": False}
+
+        request._receive = receive  # type: ignore[attr-defined]
+
+        # 2) Call downstream
+        response: Response = await call_next(request)
+
+        # 3) Only attempt to filter JSON responses with a body
         try:
-            req_json = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+            # If not JSON, pass through
+            if "application/json" not in (response.headers.get("content-type") or ""):
+                return response
+
+            # Read the existing body
+            if isinstance(response, (JSONResponse,)):
+                body_obj = response.body
+            else:
+                body_bytes = b""
+                async for chunk in response.body_iterator:  # type: ignore[attr-defined]
+                    body_bytes += chunk
+                body_obj = body_bytes
+
+            body_json = _safe_json_loads(body_obj if isinstance(body_obj, (bytes, bytearray)) else bytes(body_obj))
+            if body_json is None:
+                # Not JSON decodable → pass through
+                return response
+
+            # 4) Filter counter picks if applicable
+            new_body = _filter_counter_picks(body_json, trade_get_players)
+            # 5) Return a fresh JSON response
+            return JSONResponse(new_body, status_code=getattr(response, "status_code", 200), headers=dict(response.headers))
+
         except Exception:
-            req_json = {}
-
-        # Re-supply the same body to the downstream app
-        async def _receive():
-            return {"type": "http.request", "body": body_bytes, "more_body": False}
-        request._receive = _receive  # type: ignore[attr-defined]
-
-        # Run the endpoint
-        response = await call_next(request)
-
-        # Filter only JSON responses
-        ctype = (response.headers.get("content-type") or "").lower()
-        if "application/json" not in ctype:
+            # Any failure → return the original response
             return response
-
-        # Only activate if the request asked for it and gave a baseline trade
-        if not (req_json.get("exclude_baseline_gets") and req_json.get("baseline_trade")):
-            return response
-
-        # Collect response body
-        resp_bytes = b""
-        async for chunk in response.body_iterator:
-            resp_bytes += chunk
-
-        try:
-            payload = json.loads(resp_bytes.decode("utf-8")) if resp_bytes else {}
-        except Exception:
-            # If the response isn't JSON parseable, pass through unchanged
-            return Response(content=resp_bytes, status_code=response.status_code, headers=dict(response.headers))
-
-        # Filter all known pick lists if present
-        for key in _ PICK_LIST_KEYS:
-            if isinstance(payload.get(key), list):
-                payload[key] = _filter_picks_excluding_baseline_gets(payload[key], req_json["baseline_trade"])
-
-        # Return the modified JSON
-        return JSONResponse(payload, status_code=response.status_code, headers=dict(response.headers))
