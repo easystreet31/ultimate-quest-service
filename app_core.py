@@ -1,12 +1,12 @@
 # app_core.py — Ultimate Quest Service (Small-Payload API)
-# Version: 4.1.0 (fragility: trade-created-only + notes; adds /leaderboard_delta convenience route)
+# Version: 4.1.0 (fix: case-insensitive delta math; fragility created-only + notes; adds /leaderboard_delta convenience route)
 #
 # Endpoints:
 #   • GET  /defaults
 #   • POST /family_evaluate_trade_by_urls
 #   • POST /family_trade_plus_counter_by_urls
 #   • POST /leaderboard_delta_by_urls
-#   • POST /leaderboard_delta        <-- NEW: accepts prefer_env_defaults (convenience)
+#   • POST /leaderboard_delta        <-- Convenience: accepts prefer_env_defaults
 #
 # Notes:
 #   • Accepts Google Sheets "edit/view" links; converts to export XLSX internally.
@@ -108,6 +108,7 @@ def _norm_player(p: Any) -> str:
 
 def _canon_user(u: Any) -> str:
     if pd.isna(u) or u is None: return ""
+    # Keep case here for general use; specific endpoints may add .lower() for matching
     return re.sub(r"\s+", "", str(u).strip())
 
 def _unique_preserve(seq: List[str]) -> List[str]:
@@ -127,6 +128,10 @@ def split_multi_subject_players(players_text: str) -> List[str]:
     return _unique_preserve(parts)
 
 def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Convert a leaderboard workbook into:
+      { "<player>": [ {"user": "<raw-or-canonical user>", "sp": N}, ... (sorted desc) ] }
+    """
     candidate = None
     for name, df in sheets.items():
         lower = [str(c).lower() for c in df.columns]
@@ -139,7 +144,7 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
     df.columns = [str(c).strip() for c in df.columns]
     player_col = next((c for c in df.columns if "player" in c.lower()), None)
     user_col   = next((c for c in df.columns if any(k in c.lower() for k in ["user","owner","name"])), None)
-    sp_col     = next((c for c in df.columns if any(k in c.lower() for k in ["sp","points","subject"])), None)
+    sp_col     = next((c for c in df.columns if any(k in c.lower() for k in ["sp","points"])), None)  # no 'subject' here
     out: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     if player_col and user_col and sp_col:
         for _, row in df.iterrows():
@@ -167,7 +172,7 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
                 sp = _as_int(row.get(sp_col2 or name_col, 0))
                 if user and sp >= 0:
                     out[p].append({"user": user, "sp": sp})
-    # Dedupe to best SP per user and sort
+    # Deduplicate to best SP per user and sort
     for p, lst in out.items():
         best: Dict[str, int] = {}
         for e in lst:
@@ -180,6 +185,9 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
     return out
 
 def parse_holdings(sheets: Dict[str, pd.DataFrame]) -> Dict[str, int]:
+    """
+    Return { player -> SP } for one account holdings workbook.
+    """
     df = None
     for name, d in sheets.items():
         if any("player" in c.lower() or "subject" in c.lower() for c in d.columns):
@@ -206,6 +214,9 @@ def parse_holdings(sheets: Dict[str, pd.DataFrame]) -> Dict[str, int]:
     return agg
 
 def parse_collection(sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Normalize collection workbook to columns: card, no, players, sp, qty
+    """
     df = list(sheets.values())[0].copy()
     df.columns = [str(c).strip() for c in df.columns]
     col_card = next((c for c in df.columns if any(k in c.lower() for k in ["card","title","item"])), df.columns[0])
@@ -236,6 +247,12 @@ def qp_for_rank(rank: int) -> int:
 def compute_family_qp(leader: Dict[str, List[Dict[str, Any]]],
                       accounts_sp: Dict[str, Dict[str, int]]
 ) -> Tuple[int, Dict[str, int], Dict[str, Dict[str, Any]]]:
+    """
+    Return:
+      family_qp_total,
+      per_account_qp: {acct -> QP},
+      per_account_details: {acct -> { player -> {sp, rank, gap_to_first, margin_if_first} } }
+    """
     per_account_qp: Dict[str, int] = {a: 0 for a in FAMILY_ACCOUNTS}
     per_account_details: Dict[str, Dict[str, Any]] = {a: {} for a in FAMILY_ACCOUNTS}
 
@@ -453,7 +470,6 @@ class LeaderboardDeltaReq(BaseModel):
     rivals: Optional[List[str]] = None
     min_sp_delta: int = 1
 
-# NEW: convenience request that allows prefer_env_defaults (and optional overrides)
 class LeaderboardDeltaEnvReq(BaseModel):
     prefer_env_defaults: bool = True
     leaderboard_today_url: Optional[str] = None
@@ -579,30 +595,39 @@ def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
 
 @app.post("/leaderboard_delta_by_urls")
 def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
+    # Load and normalize sheets
     today = normalize_leaderboard(fetch_xlsx(_sanitize_gsheet_url(req.leaderboard_today_url)))
     yday  = normalize_leaderboard(fetch_xlsx(_sanitize_gsheet_url(req.leaderboard_yesterday_url)))
-    rivals = [_canon_user(r) for r in (req.rivals or DEFAULT_RIVALS)]
-    rivals_set = set([r.lower() for r in rivals])
+
+    # Canonicalize usernames case-insensitively for matching across days
+    def canon_user(u: str) -> str:
+        return _canon_user(u).lower()
 
     changes = []
     players = sorted(set(list(today.keys()) + list(yday.keys())))
     for p in players:
         t = today.get(p, [])
         y = yday.get(p, [])
-        tm = {_canon_user(e["user"]): e["sp"] for e in t}
-        ym = {_canon_user(e["user"]): e["sp"] for e in y}
-        for user, sp in tm.items():
-            prev = ym.get(user, 0)
+        tm = {canon_user(e["user"]): _as_int(e["sp"]) for e in t}
+        ym = {canon_user(e["user"]): _as_int(e["sp"]) for e in y}
+
+        for user_key, sp in tm.items():
+            prev = ym.get(user_key, 0)
             d = sp - prev
             if abs(d) >= req.min_sp_delta:
-                changes.append({"player": p, "user": user, "delta_sp": int(d)})
-        t_top = set([_canon_user(e["user"]) for e in t[:3]])
-        y_top = set([_canon_user(e["user"]) for e in y[:3]])
+                changes.append({"player": p, "user": user_key, "delta_sp": int(d)})
+
+        # Track podium churn using the same case-insensitive keys
+        t_top = set([canon_user(e["user"]) for e in t[:3]])
+        y_top = set([canon_user(e["user"]) for e in y[:3]])
         joined = list(t_top - y_top)
         left   = list(y_top - t_top)
         if joined or left:
             changes.append({"player": p, "top3_joined": joined, "top3_left": left})
 
+    # Rival heatmap (case-insensitive)
+    rivals = [_canon_user(r) for r in (req.rivals or DEFAULT_RIVALS)]
+    rivals_set = set([r.lower() for r in rivals])
     heat = Counter()
     for c in changes:
         if "user" in c and c["user"].lower() in rivals_set and abs(c.get("delta_sp", 0)) >= req.min_sp_delta:
@@ -614,7 +639,7 @@ def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
     rival_heatmap = [{"user": u, "mentions": n} for u, n in heat.most_common(20)]
     return {"changes": changes[:1000], "rival_heatmap": rival_heatmap}
 
-# NEW: convenience route that accepts prefer_env_defaults and optional overrides
+# Convenience route: accepts prefer_env_defaults and optional overrides
 @app.post("/leaderboard_delta")
 def leaderboard_delta(req: LeaderboardDeltaEnvReq):
     today_url = _pick_url(req.leaderboard_today_url, "leaderboard", req.prefer_env_defaults)
