@@ -1,5 +1,5 @@
 # app_core.py — Ultimate Quest Service (Small-Payload API)
-# Version: 4.1.0 (fragility: trade-created-only)
+# Version: 4.1.0 (fragility: trade-created-only + notes)
 #
 # Endpoints (match Actions JSON v4.1.0):
 #   • GET  /defaults
@@ -9,9 +9,8 @@
 #
 # Notes:
 #   • Accepts Google Sheets "edit/view" links; converts to export XLSX internally.
-#   • Adds top‑level "fragility_alerts" for trade endpoints (per GPT instructions).
-#   • "trade_delta" now reports ONLY fragility CREATED by the trade, and ONLY for
-#     players referenced in the trade lines. Daily reports can show full fragility.
+#   • Fragility is TRADE-ONLY. We report ONLY fragility CREATED by the trade (crossing into fragile).
+#   • Adds top‑level "fragility_alerts" (array) PLUS "fragility_notes" (string).
 
 from __future__ import annotations
 
@@ -353,7 +352,7 @@ def _created_fragile_firsts(
     return sorted(alerts)
 
 def fragile_firsts(per_player_details: Dict[str, Any], buffer_val: int) -> List[str]:
-    # kept for completeness / future daily reporting
+    # reserved for daily reporting
     frag = []
     for player, d in per_player_details.items():
         if d.get("rank", 9999) == 1:
@@ -372,7 +371,7 @@ def apply_trade_lines_to_accounts(accounts_sp: Dict[str, Dict[str, int]],
     cur = clone_accounts_sp(accounts_sp)
     fam0, _, _ = compute_family_qp(leader, cur)
 
-    # Allocate GETs
+    # Allocate GETs greedily by family QP gain
     for line in [l for l in trade if l.side == "GET"]:
         players = split_multi_subject_players(line.players)
         if not players or line.sp <= 0:
@@ -395,7 +394,7 @@ def apply_trade_lines_to_accounts(accounts_sp: Dict[str, Dict[str, int]],
             alloc_plan.append({"type": "GET", "players": players, "sp": int(line.sp),
                                "to": best_acct, "family_qp_gain": int(best_gain)})
 
-    # Apply GIVEs to trade_account
+    # Apply GIVEs to the selected trade account
     for line in [l for l in trade if l.side == "GIVE"]:
         players = split_multi_subject_players(line.players)
         if not players or line.sp <= 0:
@@ -491,7 +490,7 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
     leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
     accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
 
-    # Baseline (before)
+    # Before
     fam0, per0, det0 = compute_family_qp(leader, accounts)
 
     # Apply trade
@@ -500,17 +499,23 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
     # After
     fam1, per1, det1 = compute_family_qp(leader, after_accounts)
 
-    # Build restrict set = players referenced by the trade (GET or GIVE)
+    # Players referenced by the trade (GET or GIVE)
     trade_players: Set[str] = set()
     for line in req.trade:
         for p in split_multi_subject_players(line.players):
             trade_players.add(p)
 
-    # Fragility: only created-by-trade (after fragile under buffer, was not fragile before) and only for trade players
+    # Fragility: only created-by-trade, only for trade players
     if req.fragility_mode == "trade_delta":
         frag_list = _created_fragile_firsts(det0, det1, req.defend_buffers, restrict_players=trade_players)
+        frag_note = (
+            "No new fragile firsts created by this trade."
+            if len(frag_list) == 0 else
+            f"{len(frag_list)} new fragile first(s) created by this trade."
+        )
     else:
         frag_list = []
+        frag_note = "Fragility check disabled for this request."
 
     verdict = "ACCEPT" if (fam1 - fam0) > 0 and len(frag_list) == 0 else \
               ("CAUTION" if (fam1 - fam0) >= 0 else "DECLINE")
@@ -523,12 +528,13 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
         },
         "family_qp": {"before": int(fam0), "after": int(fam1), "delta": int(fam1 - fam0)},
         "fragility_alerts": frag_list,
+        "fragility_notes": frag_note,
         "verdict": verdict
     }
 
 @app.post("/family_trade_plus_counter_by_urls")
 def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
-    # Reuse the evaluator so fragility is "created-only" and trade-restricted
+    # Reuse evaluator so fragility is created-only and includes notes
     evaluation = family_evaluate_trade_by_urls(FamilyEvaluateTradeReq(
         prefer_env_defaults=req.prefer_env_defaults,
         leaderboard_url=req.leaderboard_url,
