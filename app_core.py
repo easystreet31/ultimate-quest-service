@@ -1,21 +1,16 @@
 # app_core.py — Ultimate Quest Service (Small-Payload API)
-# Version: 4.1.0
+# Version: 4.1.0 (hotfix: compute_family_qp variable name)
 #
-# This module hosts the FastAPI app and the domain logic used by Quest Copilot.
-# It provides the exact endpoints referenced by the Quest GPT Actions JSON:
+# Endpoints (match Actions JSON v4.1.0):
 #   • GET  /defaults
 #   • POST /family_evaluate_trade_by_urls
 #   • POST /family_trade_plus_counter_by_urls
 #   • POST /leaderboard_delta_by_urls
 #
 # Notes:
-#   • Uses environment-provided default Google Sheets links if "prefer_env_defaults" is true
-#     or when a link is omitted.
-#   • Accepts Google Sheets "edit/view" links and transparently converts them to
-#     "export?format=xlsx" for robust downloading.
-#   • Top‑level "fragility_alerts" is included for trade endpoints, per GPT instructions.
-#
-#   Title matches the Actions spec: "Ultimate Quest Service (Small-Payload API)" v4.1.0.
+#   • Accepts Google Sheets "edit/view" links; converts to export XLSX internally.
+#   • Adds top‑level "fragility_alerts" for trade endpoints (per GPT instructions).
+#   • Uses env defaults when prefer_env_defaults=true or a URL is omitted.
 
 from __future__ import annotations
 
@@ -23,7 +18,6 @@ import io
 import os
 import re
 import math
-import json
 from typing import Dict, Any, Optional, List, Tuple, Literal
 from collections import defaultdict, Counter
 
@@ -59,30 +53,19 @@ app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 
 # ---------- Helpers ----------
 def _pick_url(explicit: Optional[str], key: str, prefer_env_defaults: bool) -> str:
-    """
-    If explicit is provided, use it. Otherwise, use the DEFAULT_LINKS[key].
-    prefer_env_defaults currently acts as a hint for the client; we still honor
-    any explicit overrides even when it's true.
-    """
     url = (explicit or "").strip()
     if not url:
         url = DEFAULT_LINKS[key]
     return _sanitize_gsheet_url(url)
 
 def _sanitize_gsheet_url(url: str) -> str:
-    """
-    Accept Google Sheets "edit/view" links and convert to export XLSX.
-    Otherwise return the URL unchanged.
-    """
     if not url:
         return url
     try:
         if "docs.google.com/spreadsheets/d/" in url:
-            # Extract doc id
             m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
             if m:
                 doc_id = m.group(1)
-                # Preserve ?gid=... when present by passing as query string
                 gid_match = re.search(r"[?&#]gid=(\d+)", url)
                 gid_part = f"&gid={gid_match.group(1)}" if gid_match else ""
                 return f"https://docs.google.com/spreadsheets/d/{doc_id}/export?format=xlsx{gid_part}"
@@ -147,7 +130,6 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
     Convert an arbitrary leaderboard workbook into:
       { "<player>": [ {"user": "...", "sp": N}, ... (sorted desc) ] }
     """
-    # Choose a sheet that likely has Player/User/SP
     candidate = None
     for name, df in sheets.items():
         lower = [str(c).lower() for c in df.columns]
@@ -158,8 +140,6 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
         candidate = list(sheets.values())[0]
     df = candidate.copy()
     df.columns = [str(c).strip() for c in df.columns]
-    lower = [c.lower() for c in df.columns]
-    # try to find columns
     player_col = next((c for c in df.columns if "player" in c.lower()), None)
     user_col   = next((c for c in df.columns if any(k in c.lower() for k in ["user","owner","name"])), None)
     sp_col     = next((c for c in df.columns if any(k in c.lower() for k in ["sp","points","subject"])), None)
@@ -172,7 +152,6 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
             if p and u:
                 out[p].append({"user": u, "sp": sp})
     else:
-        # Fallback: per-player columns for accounts (wide format)
         player_col = next((c for c in df.columns if "player" in c.lower()), df.columns[0])
         account_cols = []
         for c in df.columns:
@@ -186,9 +165,9 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
             p = _norm_player(row.get(player_col, ""))
             if not p:
                 continue
-            for name_col, sp_col in account_cols:
+            for name_col, sp_col2 in account_cols:
                 user = _canon_user(name_col)
-                sp = _as_int(row.get(sp_col or name_col, 0))
+                sp = _as_int(row.get(sp_col2 or name_col, 0))
                 if user and sp >= 0:
                     out[p].append({"user": user, "sp": sp})
     # Deduplicate to best SP per user and sort
@@ -207,7 +186,6 @@ def parse_holdings(sheets: Dict[str, pd.DataFrame]) -> Dict[str, int]:
     """
     Return { player -> SP } for one account holdings workbook.
     """
-    # Choose a sheet with player names
     df = None
     for name, d in sheets.items():
         if any("player" in c.lower() or "subject" in c.lower() for c in d.columns):
@@ -220,7 +198,6 @@ def parse_holdings(sheets: Dict[str, pd.DataFrame]) -> Dict[str, int]:
     player_col = next((c for c in df.columns if any(k in c.lower() for k in ["player","subject"])), df.columns[0])
     sp_col = next((c for c in df.columns if any(k in c.lower() for k in ["sp","points"])), None)
     if sp_col is None:
-        # sometimes last numeric-like column
         for c in reversed(df.columns):
             if df[c].dtype != object:
                 sp_col = c
@@ -275,32 +252,32 @@ def compute_family_qp(leader: Dict[str, List[Dict[str, Any]]],
       per_account_details: {acct -> { player -> {sp, rank, gap_to_first, margin_if_first} } }
     """
     per_account_qp: Dict[str, int] = {a: 0 for a in FAMILY_ACCOUNTS}
-    per_player_details: Dict[str, Dict[str, Dict[str, Any]]] = {a: {} for a in FAMILY_ACCOUNTS}
+    # FIX: Consistent variable name (this was the source of the 500)
+    per_account_details: Dict[str, Dict[str, Any]] = {a: {} for a in FAMILY_ACCOUNTS}
+
     all_players = set(leader.keys())
     for a in FAMILY_ACCOUNTS:
         all_players.update(accounts_sp.get(a, {}).keys())
+
     for player in all_players:
         lst = leader.get(player, [])
-        # top 3 users on leaderboard for this player
         top_users = [e["user"] for e in lst[:3]]
         top_sp    = [e["sp"]  for e in lst[:3]]
         first_sp = top_sp[0] if top_sp else 0
-        # family account SP for this player now
+
         fam_sp = {a: accounts_sp.get(a, {}).get(player, 0) for a in FAMILY_ACCOUNTS}
-        # rank of each family account for this player if inserted among top list
+
         merged = [{"user": a, "sp": fam_sp[a]} for a in FAMILY_ACCOUNTS if fam_sp[a] > 0]
         merged += [{"user": u, "sp": s} for u, s in zip(top_users, top_sp)]
-        # sort desc
         merged.sort(key=lambda x: (-x["sp"], str(x["user"]).lower()))
-        # dedupe to best per user
+
         best: Dict[str, int] = {}
         for e in merged:
             u = str(e["user"])
             if u not in best:
                 best[u] = e["sp"]
-        # ordered list for ranks
+
         ordered = sorted(best.items(), key=lambda x: (-x[1], x[0].lower()))
-        # rank index
         ranks_for_user: Dict[str, int] = {}
         last_sp = None
         current_rank = 0
@@ -311,10 +288,9 @@ def compute_family_qp(leader: Dict[str, List[Dict[str, Any]]],
                 current_rank = seen
             ranks_for_user[u] = current_rank
             last_sp = sp
-        # details per account
+
         for a in FAMILY_ACCOUNTS:
-            u = a
-            r = ranks_for_user.get(u, 9999)
+            r = ranks_for_user.get(a, 9999)
             sp = fam_sp[a]
             qp = qp_for_rank(r)
             per_account_qp[a] += qp
@@ -323,11 +299,11 @@ def compute_family_qp(leader: Dict[str, List[Dict[str, Any]]],
             per_account_details[a][player] = {
                 "sp": sp, "rank": r, "gap_to_first": gap_to_first, "margin_if_first": margin_if_first
             }
+
     family_qp_total = sum(per_account_qp.values())
     return family_qp_total, per_account_qp, per_account_details
 
 def apply_card_sp_to_account(acct_sp: Dict[str, int], players: List[str], sp: int, add: bool) -> None:
-    # rule "full_each_unique" — treat multi-subjects as full points to each unique player
     unique_players = []
     seen = set()
     for p in players:
@@ -342,7 +318,7 @@ def apply_card_sp_to_account(acct_sp: Dict[str, int], players: List[str], sp: in
 def clone_accounts_sp(accounts_sp: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, int]]:
     return {a: dict(v) for a, v in accounts_sp.items()}
 
-def fragile_firsts(per_player_details: Dict[str, Dict[str, Any]], buffer_val: int) -> List[str]:
+def fragile_firsts(per_player_details: Dict[str, Any], buffer_val: int) -> List[str]:
     frag = []
     for player, d in per_player_details.items():
         if d.get("rank", 9999) == 1:
@@ -357,12 +333,6 @@ def apply_trade_lines_to_accounts(accounts_sp: Dict[str, Dict[str, int]],
                                   trade_account: str,
                                   multi_subject_rule: str = "full_each_unique"
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, int]]]:
-    """
-    Apply trade lines to a copy of accounts_sp.
-    GET lines are greedily allocated to whichever account yields the largest *family QP* gain,
-    evaluated after each step (depends on prior choices).
-    GIVE lines are removed from the trade_account.
-    """
     alloc_plan: List[Dict[str, Any]] = []
     cur = clone_accounts_sp(accounts_sp)
     fam0, _, _ = compute_family_qp(leader, cur)
@@ -407,9 +377,9 @@ def holdings_from_urls(holdings_e31_url: Optional[str], holdings_dc_url: Optiona
     url_e31 = _pick_url(holdings_e31_url, "holdings_e31", prefer_env_defaults)
     url_dc  = _pick_url(holdings_dc_url,  "holdings_dc",  prefer_env_defaults)
     url_fe  = _pick_url(holdings_fe_url,  "holdings_fe",  prefer_env_defaults)
-    accounts["Easystreet31"]   = parse_holdings(fetch_xlsx(url_e31))
-    accounts["DusterCrusher"]  = parse_holdings(fetch_xlsx(url_dc))
-    accounts["FinkleIsEinhorn"]= parse_holdings(fetch_xlsx(url_fe))
+    accounts["Easystreet31"]    = parse_holdings(fetch_xlsx(url_e31))
+    accounts["DusterCrusher"]   = parse_holdings(fetch_xlsx(url_dc))
+    accounts["FinkleIsEinhorn"] = parse_holdings(fetch_xlsx(url_fe))
     return accounts
 
 # ---------- Pydantic models ----------
@@ -457,7 +427,6 @@ class FamilyTradePlusCounterReq(BaseModel):
     })
     exclude_trade_get_players: bool = True
 
-    # optional knobs (accepted, lightly used)
     thin: int = 15
     upgrade_gap: int = 12
     entry_gap: int = 8
@@ -484,24 +453,18 @@ def get_defaults():
 
 @app.post("/family_evaluate_trade_by_urls")
 def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
-    # Inputs
     leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
     accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
 
-    # Baseline
     fam0, per0, _ = compute_family_qp(leader, accounts)
-
-    # Apply allocation plan
     alloc, after_accounts = apply_trade_lines_to_accounts(accounts, req.trade, leader, req.trade_account, req.multi_subject_rule)
     fam1, per1, det1 = compute_family_qp(leader, after_accounts)
 
-    # Fragility
     frag_list: List[str] = []
     if req.fragility_mode == "trade_delta":
         for a in FAMILY_ACCOUNTS:
             frag_list.extend([f"{a}: {s}" for s in fragile_firsts(det1[a], req.defend_buffers.get(a, DEFAULT_DEFEND_BUFFER))])
 
-    # Verdict
     verdict = "ACCEPT" if (fam1 - fam0) > 0 and len(frag_list) == 0 else \
               ("CAUTION" if (fam1 - fam0) >= 0 else "DECLINE")
 
@@ -518,8 +481,7 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
 
 @app.post("/family_trade_plus_counter_by_urls")
 def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
-    # Evaluate the trade first
-    eval_payload = FamilyEvaluateTradeReq(
+    evaluation = family_evaluate_trade_by_urls(FamilyEvaluateTradeReq(
         prefer_env_defaults=req.prefer_env_defaults,
         leaderboard_url=req.leaderboard_url,
         holdings_e31_url=req.holdings_e31_url,
@@ -531,24 +493,20 @@ def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
         fragility_mode=req.fragility_mode,
         defend_buffers=req.defend_buffers,
         players_whitelist=None
-    )
-    evaluation = family_evaluate_trade_by_urls(eval_payload)
+    ))
 
-    # Build counter picks from pool collection
     accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
     leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
     fam0, _, _ = compute_family_qp(leader, accounts)
     pool_df = parse_collection(fetch_xlsx(_pick_url(req.collection_pool_url, "pool_collection", req.prefer_env_defaults)))
     subset = pool_df.head(req.scan_top_candidates) if req.scan_top_candidates > 0 else pool_df
 
-    # Set of GET players in trade
     trade_get_players: set[str] = set()
     for line in req.trade:
         if line.side == "GET":
             for p in split_multi_subject_players(line.players):
                 trade_get_players.add(p)
 
-    # Evaluate each pool row: choose the family account and quantity up to max_multiples_per_card
     picks: List[Dict[str, Any]] = []
     for _, row in subset.iterrows():
         players = split_multi_subject_players(row["players"])
@@ -566,18 +524,15 @@ def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
                 if gain > best_gain:
                     best_gain = int(gain); best_acct = acct; best_t = t
         if best_gain > 0 and best_acct:
-            pick = {
+            picks.append({
                 "card": row["card"], "no": row["no"], "players": players,
                 "assign_to": best_acct, "take_n": best_t, "sp": sp, "family_delta_qp": best_gain
-            }
-            picks.append(pick)
+            })
 
-    # Sort and cap
     picks.sort(key=lambda x: (-x["family_delta_qp"], str(x["card"])))
     if req.max_each > 0:
         picks = picks[:req.max_each]
 
-    # Optionally exclude any pick whose players are in trade GET lines
     omitted = 0
     if req.exclude_trade_get_players and trade_get_players:
         filtered = []
@@ -588,16 +543,13 @@ def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
             filtered.append(p)
         picks = filtered
 
-    return {
-        **evaluation,
-        "counter": {"picks": picks, "omitted": omitted}
-    }
+    return {**evaluation, "counter": {"picks": picks, "omitted": omitted}}
 
 @app.post("/leaderboard_delta_by_urls")
 def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
     today = normalize_leaderboard(fetch_xlsx(_sanitize_gsheet_url(req.leaderboard_today_url)))
     yday  = normalize_leaderboard(fetch_xlsx(_sanitize_gsheet_url(req.leaderboard_yesterday_url)))
-    rivals = [ _canon_user(r) for r in (req.rivals or DEFAULT_RIVALS) ]
+    rivals = [_canon_user(r) for r in (req.rivals or DEFAULT_RIVALS)]
     rivals_set = set([r.lower() for r in rivals])
 
     changes = []
@@ -607,13 +559,11 @@ def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
         y = yday.get(p, [])
         tm = {_canon_user(e["user"]): e["sp"] for e in t}
         ym = {_canon_user(e["user"]): e["sp"] for e in y}
-        # delta for any rival in top 3
         for user, sp in tm.items():
             prev = ym.get(user, 0)
             d = sp - prev
             if abs(d) >= req.min_sp_delta:
                 changes.append({"player": p, "user": user, "delta_sp": int(d)})
-        # New entries/removals in top 3
         t_top = set([_canon_user(e["user"]) for e in t[:3]])
         y_top = set([_canon_user(e["user"]) for e in y[:3]])
         joined = list(t_top - y_top)
@@ -621,7 +571,6 @@ def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
         if joined or left:
             changes.append({"player": p, "top3_joined": joined, "top3_left": left})
 
-    # Rival heatmap
     heat = Counter()
     for c in changes:
         if "user" in c and c["user"].lower() in rivals_set and abs(c.get("delta_sp", 0)) >= req.min_sp_delta:
@@ -631,5 +580,4 @@ def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
                 if u.lower() in rivals_set:
                     heat[u] += 1
     rival_heatmap = [{"user": u, "mentions": n} for u, n in heat.most_common(20)]
-
     return {"changes": changes[:1000], "rival_heatmap": rival_heatmap}
