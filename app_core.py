@@ -1,17 +1,18 @@
 # app_core.py — Ultimate Quest Service (Small-Payload API)
-# Version: 4.1.0 (fix: case-insensitive delta math; fragility created-only + notes; adds /leaderboard_delta convenience route)
+# Version: 4.3.0  (adds /family_internal_transfers_optimize_by_urls; keeps prior fixes)
 #
 # Endpoints:
 #   • GET  /defaults
 #   • POST /family_evaluate_trade_by_urls
 #   • POST /family_trade_plus_counter_by_urls
 #   • POST /leaderboard_delta_by_urls
-#   • POST /leaderboard_delta        <-- Convenience: accepts prefer_env_defaults
+#   • POST /leaderboard_delta                 (convenience; uses env defaults)
+#   • POST /family_internal_transfers_optimize_by_urls   <-- NEW (greedy optimizer for internal transfers)
 #
 # Notes:
 #   • Accepts Google Sheets "edit/view" links; converts to export XLSX internally.
-#   • Fragility is TRADE-ONLY; we report ONLY fragility CREATED by the trade (crossing buffer).
-#   • Adds "fragility_notes" so "no-change" is explicit in responses.
+#   • Trades: fragility is TRADE-ONLY; we report ONLY fragility CREATED by the trade (plus a friendly note).
+#   • Leaderboard delta: robust case-insensitive user matching with punctuation/parentheses stripped.
 
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-APP_VERSION = "4.1.0"
+APP_VERSION = "4.3.0"
 APP_TITLE = "Ultimate Quest Service (Small-Payload API)"
 
 FAMILY_ACCOUNTS = ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn"]
@@ -108,8 +109,16 @@ def _norm_player(p: Any) -> str:
 
 def _canon_user(u: Any) -> str:
     if pd.isna(u) or u is None: return ""
-    # Keep case here for general use; specific endpoints may add .lower() for matching
     return re.sub(r"\s+", "", str(u).strip())
+
+def _canon_user_strong(u: Any) -> str:
+    """ Strong canonicalization for cross-day matching and rival matching. """
+    if pd.isna(u) or u is None: return ""
+    s = str(u)
+    s = re.sub(r"\(.*?\)", "", s)         # remove parentheses
+    s = re.sub(r"\s+", "", s)             # remove whitespace
+    s = re.sub(r"[^A-Za-z0-9]+", "", s)   # keep alphanumerics only
+    return s.lower()
 
 def _unique_preserve(seq: List[str]) -> List[str]:
     seen = set()
@@ -130,7 +139,8 @@ def split_multi_subject_players(players_text: str) -> List[str]:
 def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dict[str, Any]]]:
     """
     Convert a leaderboard workbook into:
-      { "<player>": [ {"user": "<raw-or-canonical user>", "sp": N}, ... (sorted desc) ] }
+      { "<player>": [ {"user": "<user col or header>", "sp": N}, ... ] }
+    Accepts either long form (player/user/sp) or wide form (player + many user columns).
     """
     candidate = None
     for name, df in sheets.items():
@@ -142,43 +152,41 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
         candidate = list(sheets.values())[0]
     df = candidate.copy()
     df.columns = [str(c).strip() for c in df.columns]
+
     player_col = next((c for c in df.columns if "player" in c.lower()), None)
     user_col   = next((c for c in df.columns if any(k in c.lower() for k in ["user","owner","name"])), None)
-    sp_col     = next((c for c in df.columns if any(k in c.lower() for k in ["sp","points"])), None)  # no 'subject' here
+    sp_col     = next((c for c in df.columns if any(k in c.lower() for k in ["sp","points"])), None)
+
     out: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     if player_col and user_col and sp_col:
+        # Long form
         for _, row in df.iterrows():
             p = _norm_player(row.get(player_col, ""))
-            u = _canon_user(row.get(user_col, ""))
+            u = str(row.get(user_col, "")).strip()
             sp = _as_int(row.get(sp_col, 0))
-            if p and u:
+            if p and u != "":
                 out[p].append({"user": u, "sp": sp})
     else:
-        player_col = next((c for c in df.columns if "player" in c.lower()), df.columns[0])
-        account_cols = []
-        for c in df.columns:
-            cl = c.lower()
-            for acct in FAMILY_ACCOUNTS:
-                if _canon_user(acct).lower() in cl:
-                    account_cols.append((c, None))
-        if not account_cols:
-            account_cols = [(c, None) for c in df.columns if c != player_col]
+        # Wide form
+        if not player_col:
+            player_col = df.columns[0]
+        user_cols = [c for c in df.columns if c != player_col]
         for _, row in df.iterrows():
             p = _norm_player(row.get(player_col, ""))
             if not p:
                 continue
-            for name_col, sp_col2 in account_cols:
-                user = _canon_user(name_col)
-                sp = _as_int(row.get(sp_col2 or name_col, 0))
-                if user and sp >= 0:
-                    out[p].append({"user": user, "sp": sp})
+            for uc in user_cols:
+                u = uc
+                sp = _as_int(row.get(uc, 0))
+                out[p].append({"user": u, "sp": sp})
+
     # Deduplicate to best SP per user and sort
     for p, lst in out.items():
         best: Dict[str, int] = {}
         for e in lst:
-            u = e["user"]
+            u = str(e["user"])
             if u not in best or e["sp"] > best[u]:
-                best[u] = e["sp"]
+                best[u] = _as_int(e["sp"])
         merged = [{"user": u, "sp": best[u]} for u in best]
         merged.sort(key=lambda x: (-x["sp"], x["user"].lower()))
         out[p] = merged
@@ -276,7 +284,7 @@ def compute_family_qp(leader: Dict[str, List[Dict[str, Any]]],
         for e in merged:
             u = str(e["user"])
             if u not in best:
-                best[u] = e["sp"]
+                best[u] = _as_int(e["sp"])
 
         ordered = sorted(best.items(), key=lambda x: (-x[1], x[0].lower()))
         ranks_for_user: Dict[str, int] = {}
@@ -347,70 +355,6 @@ def _created_fragile_firsts(
                 alerts.append(f"{acct}: {player} (margin {int(a_margin)})")
     return sorted(alerts)
 
-def fragile_firsts(per_player_details: Dict[str, Any], buffer_val: int) -> List[str]:
-    frag = []
-    for player, d in per_player_details.items():
-        if d.get("rank", 9999) == 1:
-            margin = d.get("margin_if_first")
-            if margin is not None and margin < buffer_val:
-                frag.append(f"{player} (margin {int(margin)})")
-    return sorted(frag)
-
-def apply_trade_lines_to_accounts(accounts_sp: Dict[str, Dict[str, int]],
-                                  trade: List["TradeLine"],
-                                  leader: Dict[str, List[Dict[str, Any]]],
-                                  trade_account: str,
-                                  multi_subject_rule: str = "full_each_unique"
-) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, int]]]:
-    alloc_plan: List[Dict[str, Any]] = []
-    cur = clone_accounts_sp(accounts_sp)
-    fam0, _, _ = compute_family_qp(leader, cur)
-
-    # Allocate GETs greedily by family QP gain
-    for line in [l for l in trade if l.side == "GET"]:
-        players = split_multi_subject_players(line.players)
-        if not players or line.sp <= 0:
-            continue
-        best_acct = None
-        best_gain = -10**9
-        best_snapshot = None
-        for acct in FAMILY_ACCOUNTS:
-            sim = clone_accounts_sp(cur)
-            apply_card_sp_to_account(sim[acct], players, line.sp, add=True)
-            fam, _, _ = compute_family_qp(leader, sim)
-            gain = fam - fam0
-            if gain > best_gain:
-                best_gain = gain
-                best_acct = acct
-                best_snapshot = sim
-        if best_snapshot is not None:
-            cur = best_snapshot
-            fam0, _, _ = compute_family_qp(leader, cur)
-            alloc_plan.append({"type": "GET", "players": players, "sp": int(line.sp),
-                               "to": best_acct, "family_qp_gain": int(best_gain)})
-
-    # Apply GIVEs to the selected trade account
-    for line in [l for l in trade if l.side == "GIVE"]:
-        players = split_multi_subject_players(line.players)
-        if not players or line.sp <= 0:
-            continue
-        apply_card_sp_to_account(cur[trade_account], players, line.sp, add=False)
-        alloc_plan.append({"type": "GIVE", "players": players, "sp": int(line.sp),
-                           "from_acct": trade_account})
-
-    return alloc_plan, cur
-
-def holdings_from_urls(holdings_e31_url: Optional[str], holdings_dc_url: Optional[str],
-                       holdings_fe_url: Optional[str], prefer_env_defaults: bool) -> Dict[str, Dict[str, int]]:
-    accounts = {a: {} for a in FAMILY_ACCOUNTS}
-    url_e31 = _pick_url(holdings_e31_url, "holdings_e31", prefer_env_defaults)
-    url_dc  = _pick_url(holdings_dc_url,  "holdings_dc",  prefer_env_defaults)
-    url_fe  = _pick_url(holdings_fe_url,  "holdings_fe",  prefer_env_defaults)
-    accounts["Easystreet31"]    = parse_holdings(fetch_xlsx(url_e31))
-    accounts["DusterCrusher"]   = parse_holdings(fetch_xlsx(url_dc))
-    accounts["FinkleIsEinhorn"] = parse_holdings(fetch_xlsx(url_fe))
-    return accounts
-
 # ---------- Pydantic models ----------
 class TradeLine(BaseModel):
     side: Literal["GET","GIVE"]
@@ -476,6 +420,29 @@ class LeaderboardDeltaEnvReq(BaseModel):
     leaderboard_yesterday_url: Optional[str] = None
     rivals: Optional[List[str]] = None
     min_sp_delta: int = 1
+
+# NEW: internal transfers optimizer
+class FamilyTransfersOptimizeReq(BaseModel):
+    prefer_env_defaults: bool = True
+    leaderboard_url: Optional[str] = None
+    holdings_e31_url: Optional[str] = None
+    holdings_dc_url: Optional[str] = None
+    holdings_fe_url: Optional[str] = None
+    collection_e31_url: Optional[str] = None
+    collection_dc_url: Optional[str] = None
+    collection_fe_url: Optional[str] = None
+
+    defend_buffers: Dict[str, int] = Field(default_factory=lambda: {
+        "Easystreet31": DEFAULT_DEFEND_BUFFER,
+        "DusterCrusher": DEFAULT_DEFEND_BUFFER,
+        "FinkleIsEinhorn": DEFAULT_DEFEND_BUFFER
+    })
+    max_multiples_per_card: int = 3
+    scan_top_candidates: int = 60
+    limit_moves: int = 100
+    players_whitelist: Optional[List[str]] = None
+    players_blacklist: Optional[List[str]] = None
+    algorithm: Literal["greedy"] = "greedy"  # future: "cp_sat"
 
 # ---------- Routes ----------
 @app.get("/defaults")
@@ -593,53 +560,63 @@ def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
 
     return {**evaluation, "counter": {"picks": picks, "omitted": omitted}}
 
+# ---------- Leaderboard Delta ----------
 @app.post("/leaderboard_delta_by_urls")
 def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
     # Load and normalize sheets
     today = normalize_leaderboard(fetch_xlsx(_sanitize_gsheet_url(req.leaderboard_today_url)))
     yday  = normalize_leaderboard(fetch_xlsx(_sanitize_gsheet_url(req.leaderboard_yesterday_url)))
 
-    # Canonicalize usernames case-insensitively for matching across days
-    def canon_user(u: str) -> str:
-        return _canon_user(u).lower()
+    # Build strong-key maps (case-insensitive, punctuation/parentheses stripped)
+    def to_maps(lst: List[Dict[str, Any]]) -> Tuple[Dict[str, int], Dict[str, str]]:
+        key_to_sp: Dict[str, int] = {}
+        key_to_label: Dict[str, str] = {}
+        for e in lst:
+            raw_user = str(e["user"])
+            key = _canon_user_strong(raw_user)
+            sp  = _as_int(e["sp"])
+            if key not in key_to_sp or sp > key_to_sp[key]:
+                key_to_sp[key] = sp
+                key_to_label.setdefault(key, raw_user)
+        return key_to_sp, key_to_label
 
     changes = []
     players = sorted(set(list(today.keys()) + list(yday.keys())))
     for p in players:
         t = today.get(p, [])
         y = yday.get(p, [])
-        tm = {canon_user(e["user"]): _as_int(e["sp"]) for e in t}
-        ym = {canon_user(e["user"]): _as_int(e["sp"]) for e in y}
+        tm, tlabels = to_maps(t)
+        ym, ylabels = to_maps(y)
 
-        for user_key, sp in tm.items():
-            prev = ym.get(user_key, 0)
-            d = sp - prev
+        for key, sp_now in tm.items():
+            sp_prev = ym.get(key, 0)
+            d = sp_now - sp_prev
             if abs(d) >= req.min_sp_delta:
-                changes.append({"player": p, "user": user_key, "delta_sp": int(d)})
+                label = tlabels.get(key) or ylabels.get(key) or key
+                changes.append({"player": p, "user": label, "delta_sp": int(d)})
 
-        # Track podium churn using the same case-insensitive keys
-        t_top = set([canon_user(e["user"]) for e in t[:3]])
-        y_top = set([canon_user(e["user"]) for e in y[:3]])
-        joined = list(t_top - y_top)
-        left   = list(y_top - t_top)
+        t_top = set(_canon_user_strong(e["user"]) for e in t[:3])
+        y_top = set(_canon_user_strong(e["user"]) for e in y[:3])
+        joined = [tlabels.get(k, k) for k in (t_top - y_top)]
+        left   = [ylabels.get(k, k) for k in (y_top - t_top)]
         if joined or left:
             changes.append({"player": p, "top3_joined": joined, "top3_left": left})
 
-    # Rival heatmap (case-insensitive)
-    rivals = [_canon_user(r) for r in (req.rivals or DEFAULT_RIVALS)]
-    rivals_set = set([r.lower() for r in rivals])
+    # Rival heatmap
+    def to_key(u: str) -> str: return _canon_user_strong(u)
+    rivals = [r for r in (req.rivals or DEFAULT_RIVALS)]
+    rivals_set = set(to_key(r) for r in rivals)
     heat = Counter()
     for c in changes:
-        if "user" in c and c["user"].lower() in rivals_set and abs(c.get("delta_sp", 0)) >= req.min_sp_delta:
+        if "user" in c and to_key(c["user"]) in rivals_set and abs(c.get("delta_sp", 0)) >= req.min_sp_delta:
             heat[c["user"]] += 1
         if "top3_joined" in c:
             for u in c["top3_joined"]:
-                if u.lower() in rivals_set:
+                if to_key(u) in rivals_set:
                     heat[u] += 1
     rival_heatmap = [{"user": u, "mentions": n} for u, n in heat.most_common(20)]
     return {"changes": changes[:1000], "rival_heatmap": rival_heatmap}
 
-# Convenience route: accepts prefer_env_defaults and optional overrides
 @app.post("/leaderboard_delta")
 def leaderboard_delta(req: LeaderboardDeltaEnvReq):
     today_url = _pick_url(req.leaderboard_today_url, "leaderboard", req.prefer_env_defaults)
@@ -650,3 +627,172 @@ def leaderboard_delta(req: LeaderboardDeltaEnvReq):
         rivals=req.rivals,
         min_sp_delta=req.min_sp_delta
     ))
+
+# ---------- NEW: Family Internal Transfers Optimizer (greedy) ----------
+def holdings_from_urls(holdings_e31_url: Optional[str], holdings_dc_url: Optional[str],
+                       holdings_fe_url: Optional[str], prefer_env_defaults: bool) -> Dict[str, Dict[str, int]]:
+    accounts = {a: {} for a in FAMILY_ACCOUNTS}
+    url_e31 = _pick_url(holdings_e31_url, "holdings_e31", prefer_env_defaults)
+    url_dc  = _pick_url(holdings_dc_url,  "holdings_dc",  prefer_env_defaults)
+    url_fe  = _pick_url(holdings_fe_url,  "holdings_fe",  prefer_env_defaults)
+    accounts["Easystreet31"]    = parse_holdings(fetch_xlsx(url_e31))
+    accounts["DusterCrusher"]   = parse_holdings(fetch_xlsx(url_dc))
+    accounts["FinkleIsEinhorn"] = parse_holdings(fetch_xlsx(url_fe))
+    return accounts
+
+def collections_from_urls(collection_e31_url: Optional[str], collection_dc_url: Optional[str],
+                          collection_fe_url: Optional[str], prefer_env_defaults: bool
+) -> Dict[str, pd.DataFrame]:
+    out: Dict[str, pd.DataFrame] = {}
+    url_e31 = _pick_url(collection_e31_url, "collection_e31", prefer_env_defaults)
+    url_dc  = _pick_url(collection_dc_url,  "collection_dc",  prefer_env_defaults)
+    url_fe  = _pick_url(collection_fe_url,  "collection_fe",  prefer_env_defaults)
+    out["Easystreet31"]    = parse_collection(fetch_xlsx(url_e31))
+    out["DusterCrusher"]   = parse_collection(fetch_xlsx(url_dc))
+    out["FinkleIsEinhorn"] = parse_collection(fetch_xlsx(url_fe))
+    return out
+
+def _family_had_first_before(player: str, det_before: Dict[str, Dict[str, Any]]) -> bool:
+    for a in FAMILY_ACCOUNTS:
+        d = det_before.get(a, {}).get(player, {})
+        if d.get("rank", 9999) == 1 and (d.get("margin_if_first") is not None):
+            return True
+    return False
+
+def _family_first_ok_after(player: str,
+                           det_after: Dict[str, Dict[str, Any]],
+                           buffers: Dict[str, int]) -> bool:
+    # After the move, some family account must hold 1st with margin >= its buffer
+    holder = None; margin = None
+    for a in FAMILY_ACCOUNTS:
+        d = det_after.get(a, {}).get(player, {})
+        if d.get("rank", 9999) == 1:
+            holder = a
+            margin = d.get("margin_if_first")
+            break
+    if holder is None:  # family lost 1st
+        return False
+    buf = buffers.get(holder, DEFAULT_DEFEND_BUFFER)
+    return (margin is not None) and (margin >= buf)
+
+@app.post("/family_internal_transfers_optimize_by_urls")
+def family_internal_transfers_optimize_by_urls(req: FamilyTransfersOptimizeReq):
+    # Load sources
+    leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
+    accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
+    colls = collections_from_urls(req.collection_e31_url, req.collection_dc_url, req.collection_fe_url, req.prefer_env_defaults)
+
+    # Optional scan throttling
+    for acct in FAMILY_ACCOUNTS:
+        df = colls.get(acct, pd.DataFrame())
+        if req.scan_top_candidates > 0 and len(df) > req.scan_top_candidates:
+            colls[acct] = df.head(req.scan_top_candidates).copy()
+
+    # Optional whitelist/blacklist filters
+    wl = set([p.lower() for p in (req.players_whitelist or [])])
+    bl = set([p.lower() for p in (req.players_blacklist or [])])
+    def row_ok(players_text: str) -> bool:
+        players = [p.lower() for p in split_multi_subject_players(players_text)]
+        if wl and not any(p in wl for p in players):
+            return False
+        if bl and any(p in bl for p in players):
+            return False
+        return True
+    for acct in FAMILY_ACCOUNTS:
+        df = colls[acct]
+        colls[acct] = df[df["players"].map(row_ok)].reset_index(drop=True)
+
+    # Working state
+    fam_now, per_now, det_now = compute_family_qp(leader, accounts)
+    plan: List[Dict[str, Any]] = []
+    moved_by_row: Dict[Tuple[str, int], int] = defaultdict(int)  # (donor, rowidx) -> moved copies
+
+    # Greedy loop
+    while len(plan) < req.limit_moves:
+        best_gain = 0
+        best_move = None  # (donor, rowidx, receiver, players, sp, card, no)
+        for donor in FAMILY_ACCOUNTS:
+            df = colls.get(donor, pd.DataFrame())
+            for rowidx, row in df.iterrows():
+                qty = int(row.get("qty", 0))
+                already = moved_by_row[(donor, rowidx)]
+                if qty <= already:
+                    continue
+                if already >= req.max_multiples_per_card:
+                    continue
+                players = split_multi_subject_players(row.get("players", ""))
+                sp = int(row.get("sp", 0))
+                if not players or sp <= 0:
+                    continue
+                for recv in FAMILY_ACCOUNTS:
+                    if recv == donor:
+                        continue
+                    sim_accounts = clone_accounts_sp(accounts)
+                    # move ONE copy
+                    apply_card_sp_to_account(sim_accounts[donor], players, sp, add=False)
+                    apply_card_sp_to_account(sim_accounts[recv],  players, sp, add=True)
+                    fam2, per2, det2 = compute_family_qp(leader, sim_accounts)
+
+                    # safety: if family had a 1st on any involved player before, keep 1st with margin >= buffer after
+                    safe = True
+                    for pl in players:
+                        if _family_had_first_before(pl, det_now):
+                            if not _family_first_ok_after(pl, det2, req.defend_buffers):
+                                safe = False
+                                break
+                    if not safe:
+                        continue
+
+                    gain = fam2 - fam_now
+                    if gain > best_gain:
+                        best_gain = int(gain)
+                        best_move = (donor, rowidx, recv, players, sp, str(row.get("card","")), str(row.get("no","")))
+        if not best_move or best_gain <= 0:
+            break
+
+        # Apply the best move
+        donor, rowidx, recv, players, sp, card_title, card_no = best_move
+        apply_card_sp_to_account(accounts[donor], players, sp, add=False)
+        apply_card_sp_to_account(accounts[recv],  players, sp, add=True)
+        fam_now, per_now, det_now = compute_family_qp(leader, accounts)
+        moved_by_row[(donor, rowidx)] += 1
+
+        plan.append({
+            "from": donor, "to": recv, "card": card_title, "no": card_no,
+            "players": players, "sp_per_copy": sp, "copies": 1, "family_delta_qp": best_gain
+        })
+
+    # Consolidate consecutive moves of the same card/from/to
+    consolidated: List[Dict[str, Any]] = []
+    for step in plan:
+        if consolidated and all(step[k]==consolidated[-1][k] for k in ["from","to","card","no","sp_per_copy","players"]):
+            consolidated[-1]["copies"] += 1
+            consolidated[-1]["family_delta_qp"] += step["family_delta_qp"]
+        else:
+            consolidated.append(step)
+
+    # Prepare response
+    fam0, per0, _ = compute_family_qp(leader, collections_to_zero())  # not meaningful; keep per-account deltas vs start
+    # We really want deltas vs pre-optimizer state:
+    eval_before, per_before, _ = compute_family_qp(leader, holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults))
+
+    result = {
+        "transfer_plan": consolidated,
+        "per_account": {
+            a: {"qp_before": int(per_before[a]), "qp_after": int(per_now[a]), "delta_qp": int(per_now[a]-per_before[a])}
+            for a in FAMILY_ACCOUNTS
+        },
+        "family_qp": {"before": int(eval_before), "after": int(fam_now), "delta": int(fam_now - eval_before)},
+        "constraints": {
+            "defend_buffers": req.defend_buffers,
+            "max_multiples_per_card": req.max_multiples_per_card,
+            "limit_moves": req.limit_moves,
+            "scan_top_candidates": req.scan_top_candidates
+        },
+        "notes": "Greedy optimizer: applies the best +ΔQP move per step, enforcing family-first buffer safety."
+    }
+    return result
+
+def collections_to_zero() -> Dict[str, Dict[str, int]]:
+    # helper used only if needed elsewhere; returns empty holdings
+    return {a: {} for a in FAMILY_ACCOUNTS}
