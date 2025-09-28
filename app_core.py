@@ -1,16 +1,17 @@
 # app_core.py — Ultimate Quest Service (Small-Payload API)
-# Version: 4.1.0 (fragility: trade-created-only + notes)
+# Version: 4.1.0 (fragility: trade-created-only + notes; adds /leaderboard_delta convenience route)
 #
-# Endpoints (match Actions JSON v4.1.0):
+# Endpoints:
 #   • GET  /defaults
 #   • POST /family_evaluate_trade_by_urls
 #   • POST /family_trade_plus_counter_by_urls
 #   • POST /leaderboard_delta_by_urls
+#   • POST /leaderboard_delta        <-- NEW: accepts prefer_env_defaults (convenience)
 #
 # Notes:
 #   • Accepts Google Sheets "edit/view" links; converts to export XLSX internally.
-#   • Fragility is TRADE-ONLY. We report ONLY fragility CREATED by the trade (crossing into fragile).
-#   • Adds top‑level "fragility_alerts" (array) PLUS "fragility_notes" (string).
+#   • Fragility is TRADE-ONLY; we report ONLY fragility CREATED by the trade (crossing buffer).
+#   • Adds "fragility_notes" so "no-change" is explicit in responses.
 
 from __future__ import annotations
 
@@ -126,10 +127,6 @@ def split_multi_subject_players(players_text: str) -> List[str]:
     return _unique_preserve(parts)
 
 def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Convert an arbitrary leaderboard workbook into:
-      { "<player>": [ {"user": "...", "sp": N}, ... (sorted desc) ] }
-    """
     candidate = None
     for name, df in sheets.items():
         lower = [str(c).lower() for c in df.columns]
@@ -170,7 +167,7 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
                 sp = _as_int(row.get(sp_col2 or name_col, 0))
                 if user and sp >= 0:
                     out[p].append({"user": user, "sp": sp})
-    # Deduplicate to best SP per user and sort
+    # Dedupe to best SP per user and sort
     for p, lst in out.items():
         best: Dict[str, int] = {}
         for e in lst:
@@ -183,9 +180,6 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
     return out
 
 def parse_holdings(sheets: Dict[str, pd.DataFrame]) -> Dict[str, int]:
-    """
-    Return { player -> SP } for one account holdings workbook.
-    """
     df = None
     for name, d in sheets.items():
         if any("player" in c.lower() or "subject" in c.lower() for c in d.columns):
@@ -212,9 +206,6 @@ def parse_holdings(sheets: Dict[str, pd.DataFrame]) -> Dict[str, int]:
     return agg
 
 def parse_collection(sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """
-    Normalize collection workbook to columns: card, no, players, sp, qty
-    """
     df = list(sheets.values())[0].copy()
     df.columns = [str(c).strip() for c in df.columns]
     col_card = next((c for c in df.columns if any(k in c.lower() for k in ["card","title","item"])), df.columns[0])
@@ -245,12 +236,6 @@ def qp_for_rank(rank: int) -> int:
 def compute_family_qp(leader: Dict[str, List[Dict[str, Any]]],
                       accounts_sp: Dict[str, Dict[str, int]]
 ) -> Tuple[int, Dict[str, int], Dict[str, Dict[str, Any]]]:
-    """
-    Return:
-      family_qp_total,
-      per_account_qp: {acct -> QP},
-      per_account_details: {acct -> { player -> {sp, rank, gap_to_first, margin_if_first} } }
-    """
     per_account_qp: Dict[str, int] = {a: 0 for a in FAMILY_ACCOUNTS}
     per_account_details: Dict[str, Dict[str, Any]] = {a: {} for a in FAMILY_ACCOUNTS}
 
@@ -317,19 +302,13 @@ def apply_card_sp_to_account(acct_sp: Dict[str, int], players: List[str], sp: in
 def clone_accounts_sp(accounts_sp: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, int]]:
     return {a: dict(v) for a, v in accounts_sp.items()}
 
-# --- Fragility helpers ---
+# --- Fragility helpers (trade-only) ---
 def _created_fragile_firsts(
     det_before: Dict[str, Dict[str, Any]],
     det_after: Dict[str, Dict[str, Any]],
     buffers: Dict[str, int],
     restrict_players: Optional[Set[str]] = None
 ) -> List[str]:
-    """
-    Return only NEW fragility created by the trade:
-      - rank == 1 after AND margin_if_first < buffer
-      - was NOT fragile before
-      - restricted to players referenced in the trade (if restrict_players is provided)
-    """
     alerts: List[str] = []
     for acct in FAMILY_ACCOUNTS:
         buf = buffers.get(acct, DEFAULT_DEFEND_BUFFER)
@@ -352,7 +331,6 @@ def _created_fragile_firsts(
     return sorted(alerts)
 
 def fragile_firsts(per_player_details: Dict[str, Any], buffer_val: int) -> List[str]:
-    # reserved for daily reporting
     frag = []
     for player, d in per_player_details.items():
         if d.get("rank", 9999) == 1:
@@ -475,6 +453,14 @@ class LeaderboardDeltaReq(BaseModel):
     rivals: Optional[List[str]] = None
     min_sp_delta: int = 1
 
+# NEW: convenience request that allows prefer_env_defaults (and optional overrides)
+class LeaderboardDeltaEnvReq(BaseModel):
+    prefer_env_defaults: bool = True
+    leaderboard_today_url: Optional[str] = None
+    leaderboard_yesterday_url: Optional[str] = None
+    rivals: Optional[List[str]] = None
+    min_sp_delta: int = 1
+
 # ---------- Routes ----------
 @app.get("/defaults")
 def get_defaults():
@@ -490,22 +476,15 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
     leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
     accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
 
-    # Before
     fam0, per0, det0 = compute_family_qp(leader, accounts)
-
-    # Apply trade
     alloc, after_accounts = apply_trade_lines_to_accounts(accounts, req.trade, leader, req.trade_account, req.multi_subject_rule)
-
-    # After
     fam1, per1, det1 = compute_family_qp(leader, after_accounts)
 
-    # Players referenced by the trade (GET or GIVE)
     trade_players: Set[str] = set()
     for line in req.trade:
         for p in split_multi_subject_players(line.players):
             trade_players.add(p)
 
-    # Fragility: only created-by-trade, only for trade players
     if req.fragility_mode == "trade_delta":
         frag_list = _created_fragile_firsts(det0, det1, req.defend_buffers, restrict_players=trade_players)
         frag_note = (
@@ -534,7 +513,6 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
 
 @app.post("/family_trade_plus_counter_by_urls")
 def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
-    # Reuse evaluator so fragility is created-only and includes notes
     evaluation = family_evaluate_trade_by_urls(FamilyEvaluateTradeReq(
         prefer_env_defaults=req.prefer_env_defaults,
         leaderboard_url=req.leaderboard_url,
@@ -549,7 +527,6 @@ def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
         players_whitelist=None
     ))
 
-    # Counter picks from pool
     accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
     leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
     fam0, _, _ = compute_family_qp(leader, accounts)
@@ -636,3 +613,15 @@ def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
                     heat[u] += 1
     rival_heatmap = [{"user": u, "mentions": n} for u, n in heat.most_common(20)]
     return {"changes": changes[:1000], "rival_heatmap": rival_heatmap}
+
+# NEW: convenience route that accepts prefer_env_defaults and optional overrides
+@app.post("/leaderboard_delta")
+def leaderboard_delta(req: LeaderboardDeltaEnvReq):
+    today_url = _pick_url(req.leaderboard_today_url, "leaderboard", req.prefer_env_defaults)
+    yday_url  = _pick_url(req.leaderboard_yesterday_url, "leaderboard_yday", req.prefer_env_defaults)
+    return leaderboard_delta_by_urls(LeaderboardDeltaReq(
+        leaderboard_today_url=today_url,
+        leaderboard_yesterday_url=yday_url,
+        rivals=req.rivals,
+        min_sp_delta=req.min_sp_delta
+    ))
