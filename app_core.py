@@ -1,5 +1,5 @@
 # app_core.py — Ultimate Quest Service (Small-Payload API)
-# Version: 4.1.0 (hotfix: compute_family_qp variable name)
+# Version: 4.1.0 (fragility: trade-created-only)
 #
 # Endpoints (match Actions JSON v4.1.0):
 #   • GET  /defaults
@@ -10,7 +10,8 @@
 # Notes:
 #   • Accepts Google Sheets "edit/view" links; converts to export XLSX internally.
 #   • Adds top‑level "fragility_alerts" for trade endpoints (per GPT instructions).
-#   • Uses env defaults when prefer_env_defaults=true or a URL is omitted.
+#   • "trade_delta" now reports ONLY fragility CREATED by the trade, and ONLY for
+#     players referenced in the trade lines. Daily reports can show full fragility.
 
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ import io
 import os
 import re
 import math
-from typing import Dict, Any, Optional, List, Tuple, Literal
+from typing import Dict, Any, Optional, List, Tuple, Literal, Set
 from collections import defaultdict, Counter
 
 import requests
@@ -252,7 +253,6 @@ def compute_family_qp(leader: Dict[str, List[Dict[str, Any]]],
       per_account_details: {acct -> { player -> {sp, rank, gap_to_first, margin_if_first} } }
     """
     per_account_qp: Dict[str, int] = {a: 0 for a in FAMILY_ACCOUNTS}
-    # FIX: Consistent variable name (this was the source of the 500)
     per_account_details: Dict[str, Dict[str, Any]] = {a: {} for a in FAMILY_ACCOUNTS}
 
     all_players = set(leader.keys())
@@ -318,7 +318,42 @@ def apply_card_sp_to_account(acct_sp: Dict[str, int], players: List[str], sp: in
 def clone_accounts_sp(accounts_sp: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, int]]:
     return {a: dict(v) for a, v in accounts_sp.items()}
 
+# --- Fragility helpers ---
+def _created_fragile_firsts(
+    det_before: Dict[str, Dict[str, Any]],
+    det_after: Dict[str, Dict[str, Any]],
+    buffers: Dict[str, int],
+    restrict_players: Optional[Set[str]] = None
+) -> List[str]:
+    """
+    Return only NEW fragility created by the trade:
+      - rank == 1 after AND margin_if_first < buffer
+      - was NOT fragile before
+      - restricted to players referenced in the trade (if restrict_players is provided)
+    """
+    alerts: List[str] = []
+    for acct in FAMILY_ACCOUNTS:
+        buf = buffers.get(acct, DEFAULT_DEFEND_BUFFER)
+        after_map = det_after.get(acct, {}) or {}
+        before_map = det_before.get(acct, {}) or {}
+        for player, ainfo in after_map.items():
+            if restrict_players and player not in restrict_players:
+                continue
+            a_rank = ainfo.get("rank", 9999)
+            a_margin = ainfo.get("margin_if_first")
+            frag_after = (a_rank == 1 and a_margin is not None and a_margin < buf)
+            if not frag_after:
+                continue
+            binfo = before_map.get(player, {})
+            b_rank = binfo.get("rank", 9999)
+            b_margin = binfo.get("margin_if_first")
+            frag_before = (b_rank == 1 and b_margin is not None and b_margin < buf)
+            if frag_after and not frag_before:
+                alerts.append(f"{acct}: {player} (margin {int(a_margin)})")
+    return sorted(alerts)
+
 def fragile_firsts(per_player_details: Dict[str, Any], buffer_val: int) -> List[str]:
+    # kept for completeness / future daily reporting
     frag = []
     for player, d in per_player_details.items():
         if d.get("rank", 9999) == 1:
@@ -456,14 +491,26 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
     leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
     accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
 
-    fam0, per0, _ = compute_family_qp(leader, accounts)
+    # Baseline (before)
+    fam0, per0, det0 = compute_family_qp(leader, accounts)
+
+    # Apply trade
     alloc, after_accounts = apply_trade_lines_to_accounts(accounts, req.trade, leader, req.trade_account, req.multi_subject_rule)
+
+    # After
     fam1, per1, det1 = compute_family_qp(leader, after_accounts)
 
-    frag_list: List[str] = []
+    # Build restrict set = players referenced by the trade (GET or GIVE)
+    trade_players: Set[str] = set()
+    for line in req.trade:
+        for p in split_multi_subject_players(line.players):
+            trade_players.add(p)
+
+    # Fragility: only created-by-trade (after fragile under buffer, was not fragile before) and only for trade players
     if req.fragility_mode == "trade_delta":
-        for a in FAMILY_ACCOUNTS:
-            frag_list.extend([f"{a}: {s}" for s in fragile_firsts(det1[a], req.defend_buffers.get(a, DEFAULT_DEFEND_BUFFER))])
+        frag_list = _created_fragile_firsts(det0, det1, req.defend_buffers, restrict_players=trade_players)
+    else:
+        frag_list = []
 
     verdict = "ACCEPT" if (fam1 - fam0) > 0 and len(frag_list) == 0 else \
               ("CAUTION" if (fam1 - fam0) >= 0 else "DECLINE")
@@ -481,6 +528,7 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
 
 @app.post("/family_trade_plus_counter_by_urls")
 def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
+    # Reuse the evaluator so fragility is "created-only" and trade-restricted
     evaluation = family_evaluate_trade_by_urls(FamilyEvaluateTradeReq(
         prefer_env_defaults=req.prefer_env_defaults,
         leaderboard_url=req.leaderboard_url,
@@ -495,6 +543,7 @@ def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
         players_whitelist=None
     ))
 
+    # Counter picks from pool
     accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
     leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
     fam0, _, _ = compute_family_qp(leader, accounts)
