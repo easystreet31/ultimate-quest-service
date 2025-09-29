@@ -1,17 +1,18 @@
 # app_core.py — Ultimate Quest Service (Small-Payload API)
-# Version: 4.5.0
+# Version: 4.5.1
 #
-# Change in 4.5.0:
-# - Default to scanning ALL rows of the seller/pool sheet (scan_top_candidates=0) and
-#   then returning only the best N picks via "max_each". You can still cap the scan
-#   by setting scan_top_candidates>0 for speed on very large sheets.
+# 4.5.1 (stability):
+# - Hardened parse_collection() so every column is a same-length Series (no scalar defaults),
+#   preventing constructor shape errors when seller sheets have missing/odd columns.
+# - Planner guards against edge values; returns clean empty results instead of 500s.
+# - Added /healthz.
 #
-# New in 4.4.x (kept):
-# - POST /family_collection_review_by_urls — standalone, qty-aware buyer (QP-first, then buffer shoring).
-# - /family_trade_plus_counter_by_urls uses the same buyer AFTER simulating the trade.
+# 4.5.0 behavior (kept):
+# - Collection Review + Trade+Counter default to scanning ALL rows (scan_top_candidates=0),
+#   then return only the best N via max_each.
 #
-# Math fixes from 4.3.x (kept):
-# - Strong-key matching for users; per-player QP/buffer reconcile with family totals.
+# 4.3.x fixes (kept):
+# - Strong-key user matching; per-player QP math reconciles with family totals.
 #
 # Stack: FastAPI + pandas + openpyxl + requests on Python 3.11.9.
 
@@ -27,7 +28,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-APP_VERSION = "4.5.0"
+APP_VERSION = "4.5.1"
 APP_TITLE = "Ultimate Quest Service (Small-Payload API)"
 
 FAMILY_ACCOUNTS = ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn"]
@@ -194,27 +195,48 @@ def parse_holdings(sheets: Dict[str, pd.DataFrame]) -> Dict[str, int]:
             agg[p] = agg.get(p, 0) + sp
     return agg
 
+def _series_or_default(df: pd.DataFrame, col: Optional[str], default_value: Any, length: Optional[int] = None) -> pd.Series:
+    """
+    Return a Series for df[col] if present; otherwise a same-length Series filled with default_value.
+    """
+    if col is not None and col in df.columns:
+        s = df[col]
+        return s
+    # fallback to same-length series
+    n = len(df) if length is None else length
+    return pd.Series([default_value] * n, index=df.index if length is None else None)
+
 def parse_collection(sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    df = list(sheets.values())[0].copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    col_card = next((c for c in df.columns if any(k in c.lower() for k in ["card","title","item"])), df.columns[0])
-    col_no   = next((c for c in df.columns if c.lower() in ("no","#","num","id","index")), None)
-    col_pl   = next((c for c in df.columns if any(k in c.lower() for k in ["players","player","subject"])), None)
-    col_sp   = next((c for c in df.columns if any(k in c.lower() for k in ["sp","points"])), None)
-    col_qty  = next((c for c in df.columns if any(k in c.lower() for k in ["qty","quantity","count"])), None)
+    # Use the first sheet
+    df_raw = list(sheets.values())[0].copy()
+    df_raw.columns = [str(c).strip() for c in df_raw.columns]
+
+    # Identify columns (tolerant)
+    col_card = next((c for c in df_raw.columns if any(k in c.lower() for k in ["card","title","item"])), None)
+    col_no   = next((c for c in df_raw.columns if c.lower() in ("no","#","num","id","index")), None)
+    col_pl   = next((c for c in df_raw.columns if any(k in c.lower() for k in ["players","player","subject"])), None)
+    col_sp   = next((c for c in df_raw.columns if any(k in c.lower() for k in ["sp","points","score"])), None)
+    col_qty  = next((c for c in df_raw.columns if any(k in c.lower() for k in ["qty","quantity","count","copies"])), None)
+
+    # Build columns as Series (never scalars)
+    players_s = _series_or_default(df_raw, col_pl, "")
+    card_s    = _series_or_default(df_raw, col_card or (df_raw.columns[0] if len(df_raw.columns) else None), "")
+    no_s      = _series_or_default(df_raw, col_no, "")
+    sp_s      = _series_or_default(df_raw, col_sp, 0).map(_as_int)
+    qty_s     = _series_or_default(df_raw, col_qty, 1).map(_as_int)
+
     out = pd.DataFrame({
-        "card": df.get(col_card, ""),
-        "no": df.get(col_no, ""),
-        "players": df.get(col_pl, ""),
-        "sp": df.get(col_sp, 0).map(_as_int),
-        "qty": df.get(col_qty, 1).map(_as_int),
+        "card": card_s.astype(str).fillna(""),
+        "no": no_s.astype(str).fillna(""),
+        "players": players_s.astype(str).fillna(""),
+        "sp": sp_s.fillna(0).astype(int),
+        "qty": qty_s.fillna(1).astype(int),
     })
-    out["players"] = out["players"].fillna("").astype(str)
-    out["card"]    = out["card"].fillna("").astype(str)
-    out["no"]      = out["no"].fillna("").astype(str)
-    out["sp"]      = out["sp"].fillna(0).astype(int)
-    out["qty"]     = out["qty"].fillna(1).astype(int)
-    out = out[out["card"].str.strip() != ""].copy()
+
+    # Clean & filter
+    out["card"] = out["card"].str.strip()
+    out["players"] = out["players"].str.strip()
+    out = out[out["card"] != ""].copy()
     out.reset_index(drop=True, inplace=True)
     return out
 
@@ -370,7 +392,7 @@ class FamilyTradePlusCounterReq(BaseModel):
 
     players_whitelist: Optional[List[str]] = None
 
-    # NEW DEFAULTS: scan all rows, return top N via max_each
+    # Default: scan all rows; return best N via max_each
     scan_top_candidates: int = 0
     max_each: int = 60
     max_multiples_per_card: int = 3
@@ -390,7 +412,7 @@ class FamilyCollectionReviewReq(BaseModel):
     players_whitelist: Optional[List[str]] = None
     players_blacklist: Optional[List[str]] = None
 
-    # NEW DEFAULTS: scan all rows, return top N via max_each
+    # Default: scan all rows; return best N via max_each
     scan_top_candidates: int = 0
     max_each: int = 60
     max_multiples_per_card: int = 3
@@ -435,7 +457,8 @@ def _simulate_family_trade_allocation(leader, accounts_in: Dict[str, Dict[str, i
 
 # ---------- Buyer planner (standalone + counter) ----------
 def _row_ok(players_text: str, wl: Set[str], bl: Set[str]) -> bool:
-    players = [p.lower() for p in split_multi_subject_players(players_text)]
+    s = "" if players_text is None else str(players_text)
+    players = [p.lower() for p in split_multi_subject_players(s)]
     if wl and not any(p in wl for p in players): return False
     if bl and any(p in bl for p in players): return False
     return True
@@ -454,7 +477,7 @@ def _plan_collection_buys_greedy(
     Greedy planner:
       - Considers ALL rows by default (scan_top_candidates=0).
       - If scan_top_candidates>0, considers only the first N rows for speed.
-      - Returns up to max_each picks picked by (QP gains first) then (buffer shoring with smallest resulting buffer).
+      - Returns up to max_each picks (QP gains first, then buffer-shoring).
     """
     ignore_players = set([p.lower() for p in (ignore_players or set())])
     wl = set([p.lower() for p in (players_whitelist or [])])
@@ -469,19 +492,30 @@ def _plan_collection_buys_greedy(
     accounts_now = {a: dict(v) for a, v in accounts_start.items()}
     fam_now = fam0
 
-    used: Dict[int, int] = defaultdict(int)  # rowidx -> copies taken
+    used: Dict[int, int] = defaultdict(int)
     plan: List[Dict[str, Any]] = []
 
+    # Nothing to do
+    if max_each <= 0 or len(df) == 0:
+        fam_after, _, _ = compute_family_qp(leader, accounts_now)
+        return {
+            "picks": [],
+            "summary": {
+                "family_qp": {"before": int(fam0), "after": int(fam_after), "delta": int(fam_after - fam0)},
+                "counts": {"considered_rows": int(len(df)), "selected": 0}
+            }
+        }
+
     while len(plan) < max_each:
-        best = None  # (score tuple, candidate dict)
+        best = None  # (score tuple, candidate dict, sim_after, fam2)
         for idx, row in df.iterrows():
-            qty = int(row.get("qty", 0))
-            sp  = int(row.get("sp", 0))
+            qty = int(_as_int(row.get("qty", 0)))
+            sp  = int(_as_int(row.get("sp", 0)))
             players = split_multi_subject_players(row.get("players", ""))
             if not players or sp <= 0: continue
             if any(p.lower() in ignore_players for p in players): continue
 
-            avail = min(qty - used[idx], max_multiples_per_card)
+            avail = min(max(qty - used[idx], 0), max_multiples_per_card)
             if avail <= 0: continue
 
             for acct in FAMILY_ACCOUNTS:
@@ -529,9 +563,9 @@ def _plan_collection_buys_greedy(
                     if primary is None:
                         continue
 
-                    # Score: QP gains first, else buffer shoring
+                    # Scoring: QP gains first, else buffer shoring
                     if gain > 0:
-                        score = (1, int(gain), -int(primary.get("buffer_after") or 10**6))
+                        score = (1, int(gain), -int(primary.get("buffer_after") if primary.get("buffer_after") is not None else 10**6))
                         category = "QP_GAIN"
                     else:
                         rank_after = primary["rank_after"] or 9999
@@ -542,7 +576,8 @@ def _plan_collection_buys_greedy(
                         improved = (buffer_after or 0) > (buffer_before or 0)
                         under_target = (buffer_after or 0) < buf_target
                         if rank_after in (1, 2) and (improved or under_target):
-                            score = (0, 0, -int(buffer_after or -10**6))
+                            # Lower buffer AFTER = more critical
+                            score = (0, 0, -int(buffer_after if buffer_after is not None else -10**6))
                             category = "BUFFER_SHORE"
                         else:
                             continue
@@ -569,7 +604,7 @@ def _plan_collection_buys_greedy(
                         best = (score, cand, sim, fam2)
 
         if not best:
-            break  # nothing more to add
+            break  # no more useful picks
 
         _, cand, sim_after, fam2 = best
         # Commit choice
@@ -617,6 +652,10 @@ def _plan_collection_buys_greedy(
     }
 
 # ---------- Routes ----------
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "version": APP_VERSION}
+
 @app.get("/defaults")
 def get_defaults():
     return {
