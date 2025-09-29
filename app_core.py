@@ -1,17 +1,18 @@
 # app_core.py — Ultimate Quest Service (Small-Payload API)
-# Version: 4.6.0
+# Version: 4.7.0
 #
-# 4.6.0 (performance & resilience):
-# - SMART MULTIPLES: evaluate only the meaningful copy-counts per row/account:
-#   {1, t_to_top3, t_to_2nd, t_to_1st, t_to_buffer_target} ∩ [1..avail], de-duped.
-#   This slashes simulations vs naive t=1..avail loops for big sheets and high multiples.
-# - TIME BUDGET: planner stops gracefully if a soft budget (default ~23s) is exceeded,
-#   returning partial picks with summary.partial=true instead of timing out.
-# - Keeps: full-scan default (scan_top_candidates=0) and all 4.5.1 math/behavior.
+# 4.7.0 (new):
+# - New route: /family_fragile_whitelist_by_urls
+#   Returns a deduped player whitelist and detailed lists of fragile 1sts and 2nds
+#   based on per-account buffer vs defend buffer targets.
 #
-# 4.5.1 (stability, kept):
-# - Hardened parse_collection() to always emit same-length Series (no scalar defaults).
-# - /healthz added.
+# 4.6.1 (coverage, kept):
+# - Fallback: infer player names from Card Title when Players column is empty.
+# - Summary includes with_players count.
+#
+# 4.6.0 (performance & resilience, kept):
+# - SMART MULTIPLES (evaluate only meaningful copy-counts).
+# - TIME BUDGET (soft, partial results instead of timeouts).
 #
 # Stack: FastAPI + pandas + openpyxl + requests on Python 3.11.9.
 
@@ -27,12 +28,12 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-APP_VERSION = "4.6.0"
+APP_VERSION = "4.7.0"
 APP_TITLE = "Ultimate Quest Service (Small-Payload API)"
 
 FAMILY_ACCOUNTS = ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn"]
 
-# Soft compute budget for collection planning (ms). If exceeded, we return partial results.
+# Soft compute budget (ms). If exceeded, return partial results.
 EVAL_TIME_BUDGET_MS = int(os.getenv("EVAL_TIME_BUDGET_MS", "23000"))
 
 # ---------- Defaults (ENV) ----------
@@ -162,7 +163,7 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
             for uc in user_cols:
                 out[p].append({"user": uc, "sp": _as_int(row.get(uc, 0))})
 
-    # Dedup to best SP per label & sort
+    # Dedup per label & sort
     for p, lst in out.items():
         best: Dict[str, int] = {}
         for e in lst:
@@ -203,19 +204,38 @@ def _series_or_default(df: pd.DataFrame, col: Optional[str], default_value: Any,
     n = len(df) if length is None else length
     return pd.Series([default_value] * n, index=df.index if length is None else None)
 
+# Fallback: infer players from Card Title when Players is empty.
+_TITLE_SPLIT_RE = re.compile(r"\s+(?:—|–|-)\s+")
+def _players_from_title(card: str) -> str:
+    if not card:
+        return ""
+    s = str(card).strip()
+    parts = _TITLE_SPLIT_RE.split(s)
+    if len(parts) == 0:
+        return ""
+    tail = parts[-1].strip()
+    if "/" in tail:
+        return tail
+    if re.search(r"[A-Za-z]\s+[A-Za-z]", tail):
+        return tail
+    return ""
+
 def parse_collection(sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     df_raw = list(sheets.values())[0].copy()
     df_raw.columns = [str(c).strip() for c in df_raw.columns]
+
     col_card = next((c for c in df_raw.columns if any(k in c.lower() for k in ["card","title","item"])), None)
     col_no   = next((c for c in df_raw.columns if c.lower() in ("no","#","num","id","index")), None)
     col_pl   = next((c for c in df_raw.columns if any(k in c.lower() for k in ["players","player","subject"])), None)
     col_sp   = next((c for c in df_raw.columns if any(k in c.lower() for k in ["sp","points","score"])), None)
     col_qty  = next((c for c in df_raw.columns if any(k in c.lower() for k in ["qty","quantity","count","copies"])), None)
+
     players_s = _series_or_default(df_raw, col_pl, "")
     card_s    = _series_or_default(df_raw, col_card or (df_raw.columns[0] if len(df_raw.columns) else None), "")
     no_s      = _series_or_default(df_raw, col_no, "")
     sp_s      = _series_or_default(df_raw, col_sp, 0).map(_as_int)
     qty_s     = _series_or_default(df_raw, col_qty, 1).map(_as_int)
+
     out = pd.DataFrame({
         "card": card_s.astype(str).fillna(""),
         "no": no_s.astype(str).fillna(""),
@@ -223,10 +243,14 @@ def parse_collection(sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         "sp": sp_s.fillna(0).astype(int),
         "qty": qty_s.fillna(1).astype(int),
     })
+
+    mask_empty = (out["players"].str.strip() == "")
+    if mask_empty.any():
+        out.loc[mask_empty, "players"] = out.loc[mask_empty, "card"].map(_players_from_title).fillna("")
     out["card"] = out["card"].str.strip()
     out["players"] = out["players"].str.strip()
-    out = out[out["card"] != ""].copy()
-    out.reset_index(drop=True, inplace=True)
+    out = out[(out["card"] != "") & (out["players"] != "")]
+    out = out.copy().reset_index(drop=True)
     return out
 
 # ---------- Ranking (small set, strong keys) ----------
@@ -373,7 +397,6 @@ class FamilyTradePlusCounterReq(BaseModel):
     })
     exclude_trade_get_players: bool = True
     players_whitelist: Optional[List[str]] = None
-    # Default: scan ALL rows; return best N via max_each
     scan_top_candidates: int = 0
     max_each: int = 60
     max_multiples_per_card: int = 3
@@ -392,7 +415,6 @@ class FamilyCollectionReviewReq(BaseModel):
     })
     players_whitelist: Optional[List[str]] = None
     players_blacklist: Optional[List[str]] = None
-    # Default: scan ALL rows; return best N via max_each
     scan_top_candidates: int = 0
     max_each: int = 60
     max_multiples_per_card: int = 3
@@ -409,6 +431,21 @@ class LeaderboardDeltaEnvReq(BaseModel):
     leaderboard_yesterday_url: Optional[str] = None
     rivals: Optional[List[str]] = None
     min_sp_delta: int = 1
+
+class FamilyFragileWhitelistReq(BaseModel):
+    prefer_env_defaults: bool = True
+    leaderboard_url: Optional[str] = None
+    holdings_e31_url: Optional[str] = None
+    holdings_dc_url: Optional[str] = None
+    holdings_fe_url: Optional[str] = None
+    defend_buffers: Dict[str, int] = Field(default_factory=lambda: {
+        "Easystreet31": DEFAULT_DEFEND_BUFFER,
+        "DusterCrusher": DEFAULT_DEFEND_BUFFER,
+        "FinkleIsEinhorn": DEFAULT_DEFEND_BUFFER
+    })
+    include_firsts: bool = True
+    include_seconds: bool = True
+    limit: int = 120  # cap players in 'whitelist'
 
 # ---------- Trade simulation ----------
 def _simulate_family_trade_allocation(leader, accounts_in: Dict[str, Dict[str, int]],
@@ -448,35 +485,26 @@ def _apply_card(accounts: Dict[str, Dict[str, int]], acct: str, players: List[st
         accounts[acct][p] = accounts[acct].get(p, 0) + sp * t
 
 def _competitor_levels_for(acct: str, player: str, leader, accounts_now):
-    """Get competitor SP levels (top1/top2/top3) excluding the target acct's current entry."""
     rows = _smallset_entries_for_player(player, leader, accounts_now)
     if not rows: return (0, 0, 0)
     ordered, _ = _dedup_and_rank(rows)
-    # Remove the target acct row if present (we're planning increases on this acct)
     key_acct = _canon_user_strong(acct)
     filtered = [(k, sp) for (k, _, sp) in ordered if k != key_acct]
-    # Pad with zeros
     vals = [sp for _, sp in filtered] + [0, 0, 0]
     top1, top2, top3 = vals[0], vals[1], vals[2]
     return (top1, top2, top3)
 
 def _candidate_t_values(acct: str, players: List[str], sp_per_copy: int, avail: int,
                         leader, accounts_now, defend_buffers: Dict[str,int]) -> List[int]:
-    """Return the small set of meaningful t values to evaluate."""
     if avail <= 0 or sp_per_copy <= 0:
         return []
     tset: Set[int] = set([1])  # always try 1 copy
     for pl in players:
-        # Current SP for this acct on this player
         s0 = int(accounts_now.get(acct, {}).get(pl, 0))
-        t1, t2, t3 = _competitor_levels_for(acct, pl, leader, accounts_now)  # top1/top2/top3 excluding acct
-        # To enter top-3 (rank<=3): reach >= third place + 1
+        t1, t2, t3 = _competitor_levels_for(acct, pl, leader, accounts_now)
         need_top3 = max((t3 + 1) - s0, 0)
-        # To reach 2nd: >= second + 1
         need_2nd  = max((t2 + 1) - s0, 0)
-        # To reach 1st: >= first + 1
         need_1st  = max((t1 + 1) - s0, 0)
-        # Buffer target if 1st: >= second + buffer_target
         buf_target = int(defend_buffers.get(acct, DEFAULT_DEFEND_BUFFER))
         need_buf   = max((t2 + buf_target) - s0, 0)
         for need in (need_top3, need_2nd, need_1st, need_buf):
@@ -484,12 +512,9 @@ def _candidate_t_values(acct: str, players: List[str], sp_per_copy: int, avail: 
                 t = (need + sp_per_copy - 1) // sp_per_copy
                 if 1 <= t <= avail:
                     tset.add(t)
-    # Also consider all-in on this row (avail)
     tset.add(avail)
-    # Return sorted, but cap to a handful to contain search
     candidates = sorted(tset)
     if len(candidates) > 6:
-        # Keep the smallest few plus 'avail'
         candidates = sorted(set(candidates[:5] + [avail]))
     return candidates
 
@@ -499,13 +524,6 @@ def _plan_collection_buys_greedy(
     players_whitelist: Optional[List[str]] = None, players_blacklist: Optional[List[str]] = None,
     ignore_players: Optional[Set[str]] = None
 ):
-    """
-    Greedy planner (fast path):
-      - Considers ALL rows by default (scan_top_candidates=0).
-      - SMART MULTIPLES: try only meaningful t values {1, t_to_top3, t_to_2nd, t_to_1st, t_to_buffer_target, avail}.
-      - If time budget is exceeded, return partial results with summary.partial=true.
-      - Priorities: QP gains first; then buffer shoring (critical buffers first).
-    """
     start = time.monotonic()
     def over_budget() -> bool:
         return (time.monotonic() - start) * 1000.0 > EVAL_TIME_BUDGET_MS
@@ -533,18 +551,16 @@ def _plan_collection_buys_greedy(
             "picks": [],
             "summary": {
                 "family_qp": {"before": int(fam0), "after": int(fam_after), "delta": int(fam_after - fam0)},
-                "counts": {"considered_rows": int(len(df)), "selected": 0, "simulations": sims},
+                "counts": {"considered_rows": int(len(df)), "with_players": int(len(df)), "selected": 0, "simulations": sims},
                 "partial": False
             }
         }
 
     while len(plan) < max_each:
-        if over_budget():
-            break
-        best = None  # (score tuple, candidate dict, sim_after, fam2)
+        if over_budget(): break
+        best = None
         for idx, row in df.iterrows():
-            if over_budget():
-                break
+            if over_budget(): break
             qty = int(_as_int(row.get("qty", 0)))
             sp  = int(_as_int(row.get("sp", 0)))
             players = split_multi_subject_players(row.get("players", ""))
@@ -555,7 +571,6 @@ def _plan_collection_buys_greedy(
             if avail <= 0: continue
 
             for acct in FAMILY_ACCOUNTS:
-                # SMART MULTIPLES: evaluate only meaningful t values for this row/account
                 t_candidates = _candidate_t_values(acct, players, sp, avail, leader, accounts_now, defend_buffers)
                 for t in t_candidates:
                     if over_budget(): break
@@ -565,11 +580,9 @@ def _plan_collection_buys_greedy(
                     gain = fam2 - fam_now
                     sims += 1
 
-                    # Choose a primary player for messaging/rule checks
-                    primary: Optional[Dict[str, Any]] = None
+                    primary = None
                     best_rank_jump = -999
                     worst_buffer_after = None
-
                     for pl in players:
                         ctx_b = _rank_context_smallset(pl, leader, accounts_now)
                         ctx_a = _rank_context_smallset(pl, leader, sim)
@@ -577,7 +590,6 @@ def _plan_collection_buys_greedy(
                         r_a = ctx_a["best_rank"] or 9999
                         buf_b = ctx_b["buffer_down"]
                         buf_a = ctx_a["buffer_down"]
-
                         rank_jump = (0 if r_b == 9999 else -r_b) - (0 if r_a == 9999 else -r_a)
                         if rank_jump > best_rank_jump:
                             best_rank_jump = rank_jump
@@ -599,11 +611,9 @@ def _plan_collection_buys_greedy(
                                     "buffer_before": None if buf_b is None else int(buf_b),
                                     "buffer_after":  None if buf_a is None else int(buf_a)
                                 }
-
                     if primary is None:
                         continue
 
-                    # Scoring: QP gains first, else buffer shoring
                     if gain > 0:
                         score = (1, int(gain), -int(primary.get("buffer_after") if primary.get("buffer_after") is not None else 10**6))
                         category = "QP_GAIN"
@@ -638,19 +648,16 @@ def _plan_collection_buys_greedy(
                         "buffer_before": primary["buffer_before"],
                         "buffer_after": primary["buffer_after"],
                     }
-
                     if (best is None) or (score > best[0]):
                         best = (score, cand, sim, fam2)
 
         if not best:
-            break  # nothing more to add or time budget used
-
+            break
         _, cand, sim_after, fam2 = best
         used[cand["row_idx"]] += cand["take_n"]
         accounts_now = sim_after
         fam_now = fam2
 
-        # Threshold note
         holder_after = _rank_context_smallset(cand["primary_player"], leader, accounts_now)["best_acct"]
         buf_target = defend_buffers.get(holder_after or cand["assign_to"], DEFAULT_DEFEND_BUFFER)
         if cand["rank_after"] in (1, 2) and cand["buffer_after"] is not None:
@@ -662,7 +669,6 @@ def _plan_collection_buys_greedy(
         cand["buffer_target"] = int(buf_target) if cand["rank_after"] in (1,2) else None
         cand["copies_needed_for_threshold"] = int(copies_more) if copies_more is not None else None
 
-        # Friendly label
         rb, ra = cand["rank_before"], cand["rank_after"]
         if cand["category"] == "QP_GAIN":
             if (rb or 9999) > 3 and (ra or 9999) <= 3: note = "enter top‑3"
@@ -681,12 +687,13 @@ def _plan_collection_buys_greedy(
 
     fam_before, _, _ = compute_family_qp(leader, accounts_start)
     fam_after, _, _ = compute_family_qp(leader, accounts_now)
+    with_players = int(len(df))
     return {
         "picks": plan,
         "summary": {
             "family_qp": {"before": int(fam_before), "after": int(fam_after), "delta": int(fam_after - fam_before)},
-            "counts": {"considered_rows": int(len(df)), "selected": int(len(plan)), "simulations": sims},
-            "partial": (len(plan) < max_each and over_budget())
+            "counts": {"considered_rows": int(len(df)), "with_players": with_players, "selected": int(len(plan)), "simulations": sims},
+            "partial": (len(plan) < max_each and ((time.monotonic() - start) * 1000.0 > EVAL_TIME_BUDGET_MS))
         }
     }
 
@@ -721,7 +728,6 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
 
     fam1, per1, det1 = compute_family_qp(leader, cur)
 
-    # Touched players’ report
     touched = set()
     for tl in req.trade:
         for pl in split_multi_subject_players(tl.players):
@@ -756,7 +762,6 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
               "delta_buffer": int(tot_buf),
               "delta_qp": int(fam1 - fam0)}
 
-    # Fragility created by this trade only
     def _created_fragile_firsts(det_before, det_after, buffers, restrict_players: Optional[Set[str]]):
         alerts: List[str] = []
         for acct in FAMILY_ACCOUNTS:
@@ -903,3 +908,87 @@ def leaderboard_delta(req: LeaderboardDeltaEnvReq):
         rivals=req.rivals,
         min_sp_delta=req.min_sp_delta
     ))
+
+# ---- NEW: Fragile whitelist (1sts & 2nds) ----
+@app.post("/family_fragile_whitelist_by_urls")
+def family_fragile_whitelist_by_urls(req: FamilyFragileWhitelistReq):
+    leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
+    accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
+
+    fragile_firsts: List[Dict[str, Any]] = []
+    fragile_seconds: List[Dict[str, Any]] = []
+
+    all_players = set(leader.keys())
+    for a in FAMILY_ACCOUNTS:
+        all_players.update(accounts.get(a, {}).keys())
+
+    for player in sorted(all_players):
+        # Build ranked view including family + top competitors
+        rows = _smallset_entries_for_player(player, leader, accounts)
+        if not rows:  # nobody has it anywhere
+            continue
+        ordered, rank_by_key = _dedup_and_rank(rows)
+        for acct in FAMILY_ACCOUNTS:
+            key = _canon_user_strong(acct)
+            rank, sp = rank_by_key.get(key, (9999, 0))
+            if rank not in (1, 2):
+                continue
+            target = int(req.defend_buffers.get(acct, DEFAULT_DEFEND_BUFFER))
+            if rank == 1 and req.include_firsts:
+                second_sp = ordered[1][2] if len(ordered) > 1 else 0
+                cushion = int(sp - second_sp)
+                need = max(target - cushion, 0)
+                if cushion < target:
+                    nearest_threat = ordered[1][1] if len(ordered) > 1 else None
+                    fragile_firsts.append({
+                        "player": player, "account": acct,
+                        "cushion": cushion, "target": target, "need_sp_for_target": need,
+                        "current_sp": int(sp), "second_sp": int(second_sp),
+                        "nearest_threat": nearest_threat
+                    })
+            if rank == 2 and req.include_seconds:
+                third_sp = ordered[2][2] if len(ordered) > 2 else 0
+                cushion = int(sp - third_sp)
+                need = max(target - cushion, 0)
+                if cushion < target:
+                    nearest_threat = ordered[2][1] if len(ordered) > 2 else None
+                    gap_to_first = int(max(ordered[0][2] - sp, 0))
+                    fragile_seconds.append({
+                        "player": player, "account": acct,
+                        "cushion": cushion, "target": target, "need_sp_for_target": need,
+                        "current_sp": int(sp), "third_sp": int(third_sp),
+                        "gap_to_first": gap_to_first, "nearest_threat": nearest_threat
+                    })
+
+    # Sort by lowest cushion first (most critical), then by highest need
+    fragile_firsts.sort(key=lambda r: (r["cushion"], -r["need_sp_for_target"], r["player"].lower()))
+    fragile_seconds.sort(key=lambda r: (r["cushion"], -r["need_sp_for_target"], r["player"].lower()))
+
+    # Build a deduped whitelist of names, capped
+    names = []
+    seen = set()
+    for src in (fragile_firsts, fragile_seconds):
+        for r in src:
+            p = r["player"]
+            if p.lower() not in seen:
+                seen.add(p.lower())
+                names.append(p)
+            if len(names) >= max(0, int(req.limit)):
+                break
+        if len(names) >= max(0, int(req.limit)):
+            break
+
+    return {
+        "whitelist": names,
+        "fragile_firsts": fragile_firsts,
+        "fragile_seconds": fragile_seconds,
+        "summary": {
+            "counts": {
+                "fragile_firsts": len(fragile_firsts),
+                "fragile_seconds": len(fragile_seconds),
+                "unique_players": len(names)
+            },
+            "limit": int(req.limit),
+            "defend_buffers": req.defend_buffers
+        }
+    }
