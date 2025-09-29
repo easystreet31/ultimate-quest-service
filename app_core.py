@@ -202,23 +202,19 @@ def _series_or_default(df: pd.DataFrame, col: Optional[str], default_value: Any,
     if col is not None and col in df.columns:
         s = df[col]
         return s
-    # fallback to same-length series
     n = len(df) if length is None else length
     return pd.Series([default_value] * n, index=df.index if length is None else None)
 
 def parse_collection(sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    # Use the first sheet
     df_raw = list(sheets.values())[0].copy()
     df_raw.columns = [str(c).strip() for c in df_raw.columns]
 
-    # Identify columns (tolerant)
     col_card = next((c for c in df_raw.columns if any(k in c.lower() for k in ["card","title","item"])), None)
     col_no   = next((c for c in df_raw.columns if c.lower() in ("no","#","num","id","index")), None)
     col_pl   = next((c for c in df_raw.columns if any(k in c.lower() for k in ["players","player","subject"])), None)
     col_sp   = next((c for c in df_raw.columns if any(k in c.lower() for k in ["sp","points","score"])), None)
     col_qty  = next((c for c in df_raw.columns if any(k in c.lower() for k in ["qty","quantity","count","copies"])), None)
 
-    # Build columns as Series (never scalars)
     players_s = _series_or_default(df_raw, col_pl, "")
     card_s    = _series_or_default(df_raw, col_card or (df_raw.columns[0] if len(df_raw.columns) else None), "")
     no_s      = _series_or_default(df_raw, col_no, "")
@@ -233,7 +229,6 @@ def parse_collection(sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         "qty": qty_s.fillna(1).astype(int),
     })
 
-    # Clean & filter
     out["card"] = out["card"].str.strip()
     out["players"] = out["players"].str.strip()
     out = out[out["card"] != ""].copy()
@@ -495,7 +490,6 @@ def _plan_collection_buys_greedy(
     used: Dict[int, int] = defaultdict(int)
     plan: List[Dict[str, Any]] = []
 
-    # Nothing to do
     if max_each <= 0 or len(df) == 0:
         fam_after, _, _ = compute_family_qp(leader, accounts_now)
         return {
@@ -525,7 +519,6 @@ def _plan_collection_buys_greedy(
                     fam2, _, _ = compute_family_qp(leader, sim)
                     gain = fam2 - fam_now
 
-                    # Choose a primary player for messaging/rule checks
                     primary: Optional[Dict[str, Any]] = None
                     best_rank_jump = -999
                     worst_buffer_after = None
@@ -563,7 +556,6 @@ def _plan_collection_buys_greedy(
                     if primary is None:
                         continue
 
-                    # Scoring: QP gains first, else buffer shoring
                     if gain > 0:
                         score = (1, int(gain), -int(primary.get("buffer_after") if primary.get("buffer_after") is not None else 10**6))
                         category = "QP_GAIN"
@@ -576,7 +568,6 @@ def _plan_collection_buys_greedy(
                         improved = (buffer_after or 0) > (buffer_before or 0)
                         under_target = (buffer_after or 0) < buf_target
                         if rank_after in (1, 2) and (improved or under_target):
-                            # Lower buffer AFTER = more critical
                             score = (0, 0, -int(buffer_after if buffer_after is not None else -10**6))
                             category = "BUFFER_SHORE"
                         else:
@@ -604,15 +595,13 @@ def _plan_collection_buys_greedy(
                         best = (score, cand, sim, fam2)
 
         if not best:
-            break  # no more useful picks
+            break
 
         _, cand, sim_after, fam2 = best
-        # Commit choice
         used[cand["row_idx"]] += cand["take_n"]
         accounts_now = sim_after
         fam_now = fam2
 
-        # Threshold note
         holder_after = _rank_context_smallset(cand["primary_player"], leader, accounts_now)["best_acct"]
         buf_target = defend_buffers.get(holder_after or cand["assign_to"], DEFAULT_DEFEND_BUFFER)
         if cand["rank_after"] in (1, 2) and cand["buffer_after"] is not None:
@@ -624,7 +613,6 @@ def _plan_collection_buys_greedy(
         cand["buffer_target"] = int(buf_target) if cand["rank_after"] in (1,2) else None
         cand["copies_needed_for_threshold"] = int(copies_more) if copies_more is not None else None
 
-        # Friendly label
         rb, ra = cand["rank_before"], cand["rank_after"]
         if cand["category"] == "QP_GAIN":
             if (rb or 9999) > 3 and (ra or 9999) <= 3: note = "enter top‑3"
@@ -682,7 +670,6 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
 
     fam1, per1, det1 = compute_family_qp(leader, cur)
 
-    # Touched players’ report
     touched = set()
     for tl in req.trade:
         for pl in split_multi_subject_players(tl.players):
@@ -715,7 +702,6 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
     rows.sort(key=lambda r: (-r["delta_qp"], -r["delta_sp"], r["player"].lower()))
     totals = {"delta_sp": int(tot_sp), "delta_buffer": int(tot_buf), "delta_qp": int(fam1 - fam0)}
 
-    # Fragility created by this trade only
     def _created_fragile_firsts(det_before, det_after, buffers, restrict_players: Optional[Set[str]]):
         alerts: List[str] = []
         for acct in FAMILY_ACCOUNTS:
@@ -752,7 +738,6 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
 
 @app.post("/family_trade_plus_counter_by_urls")
 def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
-    # Evaluate trade first
     evaluation = family_evaluate_trade_by_urls(FamilyEvaluateTradeReq(
         prefer_env_defaults=req.prefer_env_defaults,
         leaderboard_url=req.leaderboard_url,
@@ -767,10 +752,9 @@ def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
         players_whitelist=None
     ))
 
-    # Then counter using the same planner from the post-trade state
     leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
     accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
-    # Simulate trade to get current holdings
+
     cur, _ = _simulate_family_trade_allocation(leader, accounts, req.trade)
     for line in [l for l in req.trade if l.side == "GIVE"]:
         players = split_multi_subject_players(line.players)
