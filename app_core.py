@@ -1,17 +1,19 @@
 # app_core.py — Ultimate Quest Service (Small-Payload API)
-# Version: 4.4.0
+# Version: 4.5.0
 #
-# New:
-#   • POST /family_collection_review_by_urls  — Standalone buyer (qty-aware), QP-first then buffer-shoring.
-# Updated:
-#   • POST /family_trade_plus_counter_by_urls — Uses the same buyer after simulating the trade.
+# Change in 4.5.0:
+# - Default to scanning ALL rows of the seller/pool sheet (scan_top_candidates=0) and
+#   then returning only the best N picks via "max_each". You can still cap the scan
+#   by setting scan_top_candidates>0 for speed on very large sheets.
 #
-# Kept:
-#   • /family_evaluate_trade_by_urls (trade-only; per-player impact + totals)
-#   • /leaderboard_delta_by_urls and /leaderboard_delta
-#   • /defaults
+# New in 4.4.x (kept):
+# - POST /family_collection_review_by_urls — standalone, qty-aware buyer (QP-first, then buffer shoring).
+# - /family_trade_plus_counter_by_urls uses the same buyer AFTER simulating the trade.
 #
-# Stack: FastAPI + pandas + openpyxl + requests; Python 3.11.9 (Render config unchanged).
+# Math fixes from 4.3.x (kept):
+# - Strong-key matching for users; per-player QP/buffer reconcile with family totals.
+#
+# Stack: FastAPI + pandas + openpyxl + requests on Python 3.11.9.
 
 from __future__ import annotations
 
@@ -25,7 +27,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-APP_VERSION = "4.4.0"
+APP_VERSION = "4.5.0"
 APP_TITLE = "Ultimate Quest Service (Small-Payload API)"
 
 FAMILY_ACCOUNTS = ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn"]
@@ -354,6 +356,7 @@ class FamilyTradePlusCounterReq(BaseModel):
     holdings_dc_url: Optional[str] = None
     holdings_fe_url: Optional[str] = None
     collection_pool_url: Optional[str] = None
+
     trade_account: Literal["Easystreet31","DusterCrusher","FinkleIsEinhorn"]
     trade: List[TradeLine]
     multi_subject_rule: Literal["full_each_unique"] = "full_each_unique"
@@ -364,8 +367,11 @@ class FamilyTradePlusCounterReq(BaseModel):
         "FinkleIsEinhorn": DEFAULT_DEFEND_BUFFER
     })
     exclude_trade_get_players: bool = True
-    players_whitelist: Optional[List[str]] = None  # NEW (handy for counter focus)
-    scan_top_candidates: int = 60
+
+    players_whitelist: Optional[List[str]] = None
+
+    # NEW DEFAULTS: scan all rows, return top N via max_each
+    scan_top_candidates: int = 0
     max_each: int = 60
     max_multiples_per_card: int = 3
 
@@ -383,7 +389,9 @@ class FamilyCollectionReviewReq(BaseModel):
     })
     players_whitelist: Optional[List[str]] = None
     players_blacklist: Optional[List[str]] = None
-    scan_top_candidates: int = 60
+
+    # NEW DEFAULTS: scan all rows, return top N via max_each
+    scan_top_candidates: int = 0
     max_each: int = 60
     max_multiples_per_card: int = 3
 
@@ -400,14 +408,12 @@ class LeaderboardDeltaEnvReq(BaseModel):
     rivals: Optional[List[str]] = None
     min_sp_delta: int = 1
 
-# ---------- Trade simulation (for evaluator and counter) ----------
+# ---------- Trade simulation ----------
 def _simulate_family_trade_allocation(leader, accounts_in: Dict[str, Dict[str, int]],
                                       trade: List[TradeLine]) -> Tuple[Dict[str, Dict[str, int]], List[Dict[str, Any]]]:
     cur = {a: dict(v) for a, v in accounts_in.items()}
     fam_base, _, _ = compute_family_qp(leader, cur)
     alloc_plan: List[Dict[str, Any]] = []
-
-    # Greedy assign GETs
     for line in [l for l in trade if l.side == "GET"]:
         players = split_multi_subject_players(line.players)
         if not players or line.sp <= 0: continue
@@ -425,8 +431,6 @@ def _simulate_family_trade_allocation(leader, accounts_in: Dict[str, Dict[str, i
             fam_base, _, _ = compute_family_qp(leader, cur)
             alloc_plan.append({"type": "GET", "players": players, "sp": int(line.sp),
                                "to": best_acct, "family_qp_gain": int(best_gain)})
-
-    # Apply GIVEs to trade_account (handled by caller; we don’t have it here)
     return cur, alloc_plan
 
 # ---------- Buyer planner (standalone + counter) ----------
@@ -446,6 +450,12 @@ def _plan_collection_buys_greedy(
     players_whitelist: Optional[List[str]] = None, players_blacklist: Optional[List[str]] = None,
     ignore_players: Optional[Set[str]] = None
 ):
+    """
+    Greedy planner:
+      - Considers ALL rows by default (scan_top_candidates=0).
+      - If scan_top_candidates>0, considers only the first N rows for speed.
+      - Returns up to max_each picks picked by (QP gains first) then (buffer shoring with smallest resulting buffer).
+    """
     ignore_players = set([p.lower() for p in (ignore_players or set())])
     wl = set([p.lower() for p in (players_whitelist or [])])
     bl = set([p.lower() for p in (players_blacklist or [])])
@@ -464,7 +474,6 @@ def _plan_collection_buys_greedy(
 
     while len(plan) < max_each:
         best = None  # (score tuple, candidate dict)
-        # scan candidates
         for idx, row in df.iterrows():
             qty = int(row.get("qty", 0))
             sp  = int(row.get("sp", 0))
@@ -482,7 +491,7 @@ def _plan_collection_buys_greedy(
                     fam2, _, _ = compute_family_qp(leader, sim)
                     gain = fam2 - fam_now
 
-                    # choose primary player: prefer one with rank improvement; otherwise top-2 buffer most critical after
+                    # Choose a primary player for messaging/rule checks
                     primary: Optional[Dict[str, Any]] = None
                     best_rank_jump = -999
                     worst_buffer_after = None
@@ -495,8 +504,7 @@ def _plan_collection_buys_greedy(
                         buf_b = ctx_b["buffer_down"]
                         buf_a = ctx_a["buffer_down"]
 
-                        rank_jump = (0 if r_b == 9999 else -r_b) - (0 if r_a == 9999 else -r_a)  # positive if rank improves
-                        # Track by (rank improvement first)
+                        rank_jump = (0 if r_b == 9999 else -r_b) - (0 if r_a == 9999 else -r_a)
                         if rank_jump > best_rank_jump:
                             best_rank_jump = rank_jump
                             primary = {
@@ -508,7 +516,6 @@ def _plan_collection_buys_greedy(
                             }
                             worst_buffer_after = buf_a
                         elif rank_jump == best_rank_jump:
-                            # tie-breaker: more critical buffer AFTER (smaller)
                             if (buf_a or 10**9) < (worst_buffer_after or 10**9):
                                 worst_buffer_after = buf_a
                                 primary = {
@@ -522,13 +529,11 @@ def _plan_collection_buys_greedy(
                     if primary is None:
                         continue
 
-                    # Category & scores
+                    # Score: QP gains first, else buffer shoring
                     if gain > 0:
-                        # QP gain first
                         score = (1, int(gain), -int(primary.get("buffer_after") or 10**6))
                         category = "QP_GAIN"
                     else:
-                        # Buffer-shoring if we are in 1st/2nd after and buffer improved or still under target
                         rank_after = primary["rank_after"] or 9999
                         buffer_after = primary["buffer_after"]
                         buffer_before = primary["buffer_before"]
@@ -537,11 +542,10 @@ def _plan_collection_buys_greedy(
                         improved = (buffer_after or 0) > (buffer_before or 0)
                         under_target = (buffer_after or 0) < buf_target
                         if rank_after in (1, 2) and (improved or under_target):
-                            # Critical = lowest buffer AFTER
                             score = (0, 0, -int(buffer_after or -10**6))
                             category = "BUFFER_SHORE"
                         else:
-                            continue  # neither QP nor useful buffer change
+                            continue
 
                     cand = {
                         "row_idx": int(idx),
@@ -565,15 +569,15 @@ def _plan_collection_buys_greedy(
                         best = (score, cand, sim, fam2)
 
         if not best:
-            break  # no candidate
+            break  # nothing more to add
 
-        score, cand, sim_after, fam2 = best
-        # commit best
+        _, cand, sim_after, fam2 = best
+        # Commit choice
         used[cand["row_idx"]] += cand["take_n"]
         accounts_now = sim_after
         fam_now = fam2
 
-        # annotate threshold need (if 1st/2nd)
+        # Threshold note
         holder_after = _rank_context_smallset(cand["primary_player"], leader, accounts_now)["best_acct"]
         buf_target = defend_buffers.get(holder_after or cand["assign_to"], DEFAULT_DEFEND_BUFFER)
         if cand["rank_after"] in (1, 2) and cand["buffer_after"] is not None:
@@ -585,8 +589,7 @@ def _plan_collection_buys_greedy(
         cand["buffer_target"] = int(buf_target) if cand["rank_after"] in (1,2) else None
         cand["copies_needed_for_threshold"] = int(copies_more) if copies_more is not None else None
 
-        # friendly note
-        note = None
+        # Friendly label
         rb, ra = cand["rank_before"], cand["rank_after"]
         if cand["category"] == "QP_GAIN":
             if (rb or 9999) > 3 and (ra or 9999) <= 3: note = "enter top‑3"
@@ -604,7 +607,7 @@ def _plan_collection_buys_greedy(
         plan.append(cand)
 
     fam_before, _, _ = compute_family_qp(leader, accounts_start)
-    fam_after, per_after, _ = compute_family_qp(leader, accounts_now)
+    fam_after, _, _ = compute_family_qp(leader, accounts_now)
     return {
         "picks": plan,
         "summary": {
@@ -623,14 +626,12 @@ def get_defaults():
         "defend_buffer_all": DEFAULT_DEFEND_BUFFER
     }
 
-# ---- Trade evaluator (unchanged behavior) ----
 @app.post("/family_evaluate_trade_by_urls")
 def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
     leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
     accounts_before = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
     fam0, per0, det0 = compute_family_qp(leader, accounts_before)
 
-    # Greedy apply GETs; then GIVEs on req.trade_account
     cur, alloc_plan = _simulate_family_trade_allocation(leader, accounts_before, req.trade)
     for line in [l for l in req.trade if l.side == "GIVE"]:
         players = split_multi_subject_players(line.players)
@@ -642,40 +643,40 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
 
     fam1, per1, det1 = compute_family_qp(leader, cur)
 
-    # Per-player impact (touched players only)
-    def _players_touched(trade): 
-        s=set(); [s.update(split_multi_subject_players(l.players)) for l in trade]; return s
-    touched = _players_touched(req.trade)
+    # Touched players’ report
+    touched = set()
+    for tl in req.trade:
+        for pl in split_multi_subject_players(tl.players):
+            touched.add(pl)
 
-    def player_changes(players: Set[str]):
-        rows=[]; tot_sp=0; tot_buf=0; tot_qp=0
-        for pl in sorted(players):
-            sp_b = max(accounts_before.get(a, {}).get(pl, 0) for a in FAMILY_ACCOUNTS)
-            sp_a = max(cur.get(a, {}).get(pl, 0) for a in FAMILY_ACCOUNTS)
-            d_sp = sp_a - sp_b
-            ctx_b = _rank_context_smallset(pl, leader, accounts_before)
-            ctx_a = _rank_context_smallset(pl, leader, cur)
-            r_b, r_a = ctx_b["best_rank"], ctx_a["best_rank"]
-            buf_b, buf_a = ctx_b["buffer_down"], ctx_a["buffer_down"]
-            d_buf = (buf_a or 0) - (buf_b or 0) if (buf_b is not None or buf_a is not None) else None
-            qp_b, qp_a = ctx_b["family_qp_player"], ctx_a["family_qp_player"]
-            d_qp = qp_a - qp_b
-            rows.append({
-                "player": pl,
-                "sp_before": int(sp_b), "sp_after": int(sp_a), "delta_sp": int(d_sp),
-                "best_rank_before": r_b, "best_rank_after": r_a,
-                "buffer_before": None if buf_b is None else int(buf_b),
-                "buffer_after":  None if buf_a is None else int(buf_a),
-                "delta_buffer":   None if d_buf is None else int(d_buf),
-                "qp_before": int(qp_b), "qp_after": int(qp_a), "delta_qp": int(d_qp)
-            })
-            tot_sp += d_sp; tot_qp += d_qp
-            if d_buf is not None: tot_buf += d_buf
-        rows.sort(key=lambda r: (-r["delta_qp"], -r["delta_sp"], r["player"].lower()))
-        return rows, {"delta_sp": int(tot_sp), "delta_buffer": int(tot_buf), "delta_qp": int(fam1 - fam0)}
-    player_rows, totals = player_changes(touched)
+    rows=[]; tot_sp=0; tot_buf=0; tot_qp=0
+    for pl in sorted(touched):
+        sp_b = max(accounts_before.get(a, {}).get(pl, 0) for a in FAMILY_ACCOUNTS)
+        sp_a = max(cur.get(a, {}).get(pl, 0) for a in FAMILY_ACCOUNTS)
+        d_sp = sp_a - sp_b
+        ctx_b = _rank_context_smallset(pl, leader, accounts_before)
+        ctx_a = _rank_context_smallset(pl, leader, cur)
+        r_b, r_a = ctx_b["best_rank"], ctx_a["best_rank"]
+        buf_b, buf_a = ctx_b["buffer_down"], ctx_a["buffer_down"]
+        d_buf = (buf_a or 0) - (buf_b or 0) if (buf_b is not None or buf_a is not None) else None
+        qp_b, qp_a = ctx_b["family_qp_player"], ctx_a["family_qp_player"]
+        d_qp = qp_a - qp_b
+        rows.append({
+            "player": pl,
+            "sp_before": int(sp_b), "sp_after": int(sp_a), "delta_sp": int(d_sp),
+            "best_rank_before": r_b, "best_rank_after": r_a,
+            "buffer_before": None if buf_b is None else int(buf_b),
+            "buffer_after":  None if buf_a is None else int(buf_a),
+            "delta_buffer":   None if d_buf is None else int(d_buf),
+            "qp_before": int(qp_b), "qp_after": int(qp_a), "delta_qp": int(d_qp)
+        })
+        tot_sp += d_sp; tot_qp += d_qp
+        if d_buf is not None: tot_buf += d_buf
 
-    # Trade-only fragility
+    rows.sort(key=lambda r: (-r["delta_qp"], -r["delta_sp"], r["player"].lower()))
+    totals = {"delta_sp": int(tot_sp), "delta_buffer": int(tot_buf), "delta_qp": int(fam1 - fam0)}
+
+    # Fragility created by this trade only
     def _created_fragile_firsts(det_before, det_after, buffers, restrict_players: Optional[Set[str]]):
         alerts: List[str] = []
         for acct in FAMILY_ACCOUNTS:
@@ -693,6 +694,7 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
                 if frag_after and not frag_before:
                     alerts.append(f"{acct}: {player} (margin {int(a_margin)})")
         return sorted(alerts)
+
     frag_list = _created_fragile_firsts(det0, det1, req.defend_buffers, restrict_players=touched) if req.fragility_mode=="trade_delta" else []
     frag_note = ("No new fragile firsts created by this trade." if not frag_list else f"{len(frag_list)} new fragile first(s) created by this trade.") if req.fragility_mode=="trade_delta" else "Fragility check disabled for this request."
 
@@ -702,31 +704,17 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
         "allocation_plan": alloc_plan,
         "per_account": {a: {"qp_before": int(per0[a]), "qp_after": int(per1[a]), "delta_qp": int(per1[a]-per0[a])} for a in FAMILY_ACCOUNTS},
         "family_qp": {"before": int(fam0), "after": int(fam1), "delta": int(fam1 - fam0)},
-        "player_changes": player_rows,
+        "player_changes": rows,
         "total_changes": totals,
         "fragility_alerts": frag_list,
         "fragility_notes": frag_note,
         "verdict": verdict
     }
 
-# ---- Trade + Counter (uses unified buyer) ----
 @app.post("/family_trade_plus_counter_by_urls")
 def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
-    # 1) Evaluate trade & get accounts AFTER
-    leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
-    accounts_before = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
-
-    # Simulate allocation
-    cur, alloc_plan = _simulate_family_trade_allocation(leader, accounts_before, req.trade)
-    for line in [l for l in req.trade if l.side == "GIVE"]:
-        players = split_multi_subject_players(line.players)
-        if not players or line.sp <= 0: continue
-        for p in _unique_preserve(players):
-            cur[req.trade_account][p] = cur[req.trade_account].get(p, 0) - line.sp
-            if cur[req.trade_account][p] <= 0:
-                cur[req.trade_account].pop(p, None)
-
-    fam_eval = family_evaluate_trade_by_urls(FamilyEvaluateTradeReq(
+    # Evaluate trade first
+    evaluation = family_evaluate_trade_by_urls(FamilyEvaluateTradeReq(
         prefer_env_defaults=req.prefer_env_defaults,
         leaderboard_url=req.leaderboard_url,
         holdings_e31_url=req.holdings_e31_url,
@@ -740,7 +728,19 @@ def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
         players_whitelist=None
     ))
 
-    # 2) Unified buyer from the pool, starting from accounts AFTER the trade
+    # Then counter using the same planner from the post-trade state
+    leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
+    accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
+    # Simulate trade to get current holdings
+    cur, _ = _simulate_family_trade_allocation(leader, accounts, req.trade)
+    for line in [l for l in req.trade if l.side == "GIVE"]:
+        players = split_multi_subject_players(line.players)
+        if not players or line.sp <= 0: continue
+        for p in _unique_preserve(players):
+            cur[req.trade_account][p] = cur[req.trade_account].get(p, 0) - line.sp
+            if cur[req.trade_account][p] <= 0:
+                cur[req.trade_account].pop(p, None)
+
     pool_df = parse_collection_pool(req.prefer_env_defaults, req.collection_pool_url)
 
     trade_get_players: set[str] = set()
@@ -756,9 +756,8 @@ def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
         players_whitelist=req.players_whitelist, players_blacklist=None, ignore_players=ignore
     )
 
-    return {**fam_eval, "counter": review}
+    return {**evaluation, "counter": review}
 
-# ---- Standalone Family Collection Review ----
 @app.post("/family_collection_review_by_urls")
 def family_collection_review_by_urls(req: FamilyCollectionReviewReq):
     leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
