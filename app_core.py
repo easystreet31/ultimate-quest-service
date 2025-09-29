@@ -1,20 +1,22 @@
 # app_core.py — Ultimate Quest Service (Small-Payload API)
-# Version: 4.7.0
+# Version: 4.7.1
+#
+# 4.7.1 (bugfix):
+# - BUFFER_SHORE candidates must (a) assign to the actual post-buy holder (holder_after == acct)
+#   and (b) strictly improve cushion (buffer_after > buffer_before). This prevents misallocations
+#   to non-holders and discards "no-change" buffer picks.
 #
 # 4.7.0 (new):
-# - New route: /family_fragile_whitelist_by_urls
-#   Returns a deduped player whitelist and detailed lists of fragile 1sts and 2nds
-#   based on per-account buffer vs defend buffer targets.
+# - /family_fragile_whitelist_by_urls: returns fragile 1sts & 2nds + whitelist.
 #
 # 4.6.1 (coverage, kept):
-# - Fallback: infer player names from Card Title when Players column is empty.
+# - Fallback: infer player names from Card Title when Players is empty.
 # - Summary includes with_players count.
 #
 # 4.6.0 (performance & resilience, kept):
-# - SMART MULTIPLES (evaluate only meaningful copy-counts).
-# - TIME BUDGET (soft, partial results instead of timeouts).
+# - SMART MULTIPLES; TIME BUDGET (soft).
 #
-# Stack: FastAPI + pandas + openpyxl + requests on Python 3.11.9.
+# Stack: FastAPI + pandas + openpyxl + requests (Python 3.11.9).
 
 from __future__ import annotations
 
@@ -28,7 +30,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-APP_VERSION = "4.7.0"
+APP_VERSION = "4.7.1"
 APP_TITLE = "Ultimate Quest Service (Small-Payload API)"
 
 FAMILY_ACCOUNTS = ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn"]
@@ -618,14 +620,14 @@ def _plan_collection_buys_greedy(
                         score = (1, int(gain), -int(primary.get("buffer_after") if primary.get("buffer_after") is not None else 10**6))
                         category = "QP_GAIN"
                     else:
+                        # --- BUFFER_SHORE (bugfix in 4.7.1) ---
                         rank_after = primary["rank_after"] or 9999
                         buffer_after = primary["buffer_after"]
                         buffer_before = primary["buffer_before"]
                         holder_after = _rank_context_smallset(primary["player"], leader, sim)["best_acct"]
-                        buf_target = defend_buffers.get(holder_after or acct, DEFAULT_DEFEND_BUFFER)
-                        improved = (buffer_after or 0) > (buffer_before or 0)
-                        under_target = (buffer_after or 0) < buf_target
-                        if rank_after in (1, 2) and (improved or under_target):
+                        # Require: (1) we shore the actual holder, and (2) cushion strictly improves.
+                        if rank_after in (1, 2) and holder_after == acct and (buffer_after or 0) > (buffer_before or 0):
+                            buf_target = defend_buffers.get(holder_after, DEFAULT_DEFEND_BUFFER)
                             score = (0, 0, -int(buffer_after if buffer_after is not None else -10**6))
                             category = "BUFFER_SHORE"
                         else:
@@ -647,6 +649,7 @@ def _plan_collection_buys_greedy(
                         "rank_after": primary["rank_after"],
                         "buffer_before": primary["buffer_before"],
                         "buffer_after": primary["buffer_after"],
+                        "holder_after": holder_after  # transparency
                     }
                     if (best is None) or (score > best[0]):
                         best = (score, cand, sim, fam2)
@@ -658,7 +661,7 @@ def _plan_collection_buys_greedy(
         accounts_now = sim_after
         fam_now = fam2
 
-        holder_after = _rank_context_smallset(cand["primary_player"], leader, accounts_now)["best_acct"]
+        holder_after = cand["holder_after"]
         buf_target = defend_buffers.get(holder_after or cand["assign_to"], DEFAULT_DEFEND_BUFFER)
         if cand["rank_after"] in (1, 2) and cand["buffer_after"] is not None:
             left = max(buf_target - cand["buffer_after"], 0)
@@ -923,9 +926,8 @@ def family_fragile_whitelist_by_urls(req: FamilyFragileWhitelistReq):
         all_players.update(accounts.get(a, {}).keys())
 
     for player in sorted(all_players):
-        # Build ranked view including family + top competitors
         rows = _smallset_entries_for_player(player, leader, accounts)
-        if not rows:  # nobody has it anywhere
+        if not rows:
             continue
         ordered, rank_by_key = _dedup_and_rank(rows)
         for acct in FAMILY_ACCOUNTS:
@@ -960,11 +962,9 @@ def family_fragile_whitelist_by_urls(req: FamilyFragileWhitelistReq):
                         "gap_to_first": gap_to_first, "nearest_threat": nearest_threat
                     })
 
-    # Sort by lowest cushion first (most critical), then by highest need
     fragile_firsts.sort(key=lambda r: (r["cushion"], -r["need_sp_for_target"], r["player"].lower()))
     fragile_seconds.sort(key=lambda r: (r["cushion"], -r["need_sp_for_target"], r["player"].lower()))
 
-    # Build a deduped whitelist of names, capped
     names = []
     seen = set()
     for src in (fragile_firsts, fragile_seconds):
