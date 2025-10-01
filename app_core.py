@@ -1,20 +1,20 @@
 # app_core.py — Ultimate Quest Service (Small-Payload API)
-# Version: 4.7.1
+# Version: 4.8.0
 #
-# 4.7.1 (bugfix):
-# - BUFFER_SHORE candidates must (a) assign to the actual post-buy holder (holder_after == acct)
-#   and (b) strictly improve cushion (buffer_after > buffer_before). This prevents misallocations
-#   to non-holders and discards "no-change" buffer picks.
+# 4.8.0 (new):
+# - SP-Budget Counter for /family_trade_plus_counter_by_urls:
+#   counter_sp_target (int), counter_sp_mode ("closest"|"at_least"|"at_most"), counter_sp_tolerance (int).
+#   The counter planner now stops when the SP budget rule is satisfied, while preserving QP-first, then buffer-shore logic.
 #
-# 4.7.0 (new):
-# - /family_fragile_whitelist_by_urls: returns fragile 1sts & 2nds + whitelist.
+# 4.7.1 (bugfix, kept):
+# - BUFFER_SHORE must (a) assign to the post-buy holder (holder_after == acct) and (b) strictly improve cushion (buffer_after > buffer_before).
 #
-# 4.6.1 (coverage, kept):
-# - Fallback: infer player names from Card Title when Players is empty.
-# - Summary includes with_players count.
+# 4.7.0 (new, kept):
+# - /family_fragile_whitelist_by_urls: fragile 1sts & 2nds + whitelist (deduped, capped).
 #
-# 4.6.0 (performance & resilience, kept):
-# - SMART MULTIPLES; TIME BUDGET (soft).
+# 4.6.x (kept):
+# - Full-scan collection review (scan_top_candidates: 0) with SMART MULTIPLES and a soft TIME BUDGET.
+# - Player-from-title fallback in collection parsing; with_players count in summaries.
 #
 # Stack: FastAPI + pandas + openpyxl + requests (Python 3.11.9).
 
@@ -30,7 +30,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-APP_VERSION = "4.7.1"
+APP_VERSION = "4.8.0"
 APP_TITLE = "Ultimate Quest Service (Small-Payload API)"
 
 FAMILY_ACCOUNTS = ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn"]
@@ -388,6 +388,7 @@ class FamilyTradePlusCounterReq(BaseModel):
     holdings_dc_url: Optional[str] = None
     holdings_fe_url: Optional[str] = None
     collection_pool_url: Optional[str] = None
+
     trade_account: Literal["Easystreet31","DusterCrusher","FinkleIsEinhorn"]
     trade: List[TradeLine]
     multi_subject_rule: Literal["full_each_unique"] = "full_each_unique"
@@ -398,10 +399,16 @@ class FamilyTradePlusCounterReq(BaseModel):
         "FinkleIsEinhorn": DEFAULT_DEFEND_BUFFER
     })
     exclude_trade_get_players: bool = True
+
     players_whitelist: Optional[List[str]] = None
     scan_top_candidates: int = 0
     max_each: int = 60
     max_multiples_per_card: int = 3
+
+    # --- NEW: SP-Budget knobs for counter ---
+    counter_sp_target: Optional[int] = None
+    counter_sp_mode: Literal["closest","at_least","at_most"] = "closest"
+    counter_sp_tolerance: int = 0
 
 class FamilyCollectionReviewReq(BaseModel):
     prefer_env_defaults: bool = True
@@ -520,14 +527,27 @@ def _candidate_t_values(acct: str, players: List[str], sp_per_copy: int, avail: 
         candidates = sorted(set(candidates[:5] + [avail]))
     return candidates
 
+def _budget_satisfied(total_sp: int, tgt: Optional[int], mode: str, tol: int) -> bool:
+    if tgt is None:
+        return False
+    mode = (mode or "closest").lower()
+    tol = max(0, int(tol or 0))
+    if mode == "at_most":
+        # Stop when we are <= target and within tolerance below it.
+        return (total_sp <= tgt) and ((tgt - total_sp) <= tol)
+    # For "closest" (greedy) we behave like "at_least" with tolerance.
+    return (total_sp >= tgt) and ((total_sp - tgt) <= tol)
+
 def _plan_collection_buys_greedy(
     leader, accounts_start: Dict[str, Dict[str, int]], pool_df: pd.DataFrame,
     defend_buffers: Dict[str, int], scan_top_candidates: int, max_each: int, max_multiples_per_card: int,
     players_whitelist: Optional[List[str]] = None, players_blacklist: Optional[List[str]] = None,
-    ignore_players: Optional[Set[str]] = None
+    ignore_players: Optional[Set[str]] = None,
+    # --- NEW: SP budget controls (optional) ---
+    budget_target: Optional[int] = None, budget_mode: str = "closest", budget_tolerance: int = 0
 ):
     start = time.monotonic()
-    def over_budget() -> bool:
+    def over_budget_time() -> bool:
         return (time.monotonic() - start) * 1000.0 > EVAL_TIME_BUDGET_MS
 
     ignore_players = set([p.lower() for p in (ignore_players or set())])
@@ -546,6 +566,7 @@ def _plan_collection_buys_greedy(
     used: Dict[int, int] = defaultdict(int)
     plan: List[Dict[str, Any]] = []
     sims = 0
+    total_sp_purchased = 0  # sum of (sp * take_n), independent of multi-subject player count
 
     if max_each <= 0 or len(df) == 0:
         fam_after, _, _ = compute_family_qp(leader, accounts_now)
@@ -554,15 +575,16 @@ def _plan_collection_buys_greedy(
             "summary": {
                 "family_qp": {"before": int(fam0), "after": int(fam_after), "delta": int(fam_after - fam0)},
                 "counts": {"considered_rows": int(len(df)), "with_players": int(len(df)), "selected": 0, "simulations": sims},
+                "sp_budget": {"target": budget_target, "mode": budget_mode, "tolerance": int(budget_tolerance), "purchased_sp": int(total_sp_purchased), "satisfied": False},
                 "partial": False
             }
         }
 
     while len(plan) < max_each:
-        if over_budget(): break
+        if over_budget_time(): break
         best = None
         for idx, row in df.iterrows():
-            if over_budget(): break
+            if over_budget_time(): break
             qty = int(_as_int(row.get("qty", 0)))
             sp  = int(_as_int(row.get("sp", 0)))
             players = split_multi_subject_players(row.get("players", ""))
@@ -575,7 +597,7 @@ def _plan_collection_buys_greedy(
             for acct in FAMILY_ACCOUNTS:
                 t_candidates = _candidate_t_values(acct, players, sp, avail, leader, accounts_now, defend_buffers)
                 for t in t_candidates:
-                    if over_budget(): break
+                    if over_budget_time(): break
                     sim = {a: dict(v) for a, v in accounts_now.items()}
                     _apply_card(sim, acct, players, sp, t)
                     fam2, _, _ = compute_family_qp(leader, sim)
@@ -620,14 +642,12 @@ def _plan_collection_buys_greedy(
                         score = (1, int(gain), -int(primary.get("buffer_after") if primary.get("buffer_after") is not None else 10**6))
                         category = "QP_GAIN"
                     else:
-                        # --- BUFFER_SHORE (bugfix in 4.7.1) ---
+                        # BUFFER_SHORE (holder-only + strict improvement)
                         rank_after = primary["rank_after"] or 9999
                         buffer_after = primary["buffer_after"]
                         buffer_before = primary["buffer_before"]
                         holder_after = _rank_context_smallset(primary["player"], leader, sim)["best_acct"]
-                        # Require: (1) we shore the actual holder, and (2) cushion strictly improves.
                         if rank_after in (1, 2) and holder_after == acct and (buffer_after or 0) > (buffer_before or 0):
-                            buf_target = defend_buffers.get(holder_after, DEFAULT_DEFEND_BUFFER)
                             score = (0, 0, -int(buffer_after if buffer_after is not None else -10**6))
                             category = "BUFFER_SHORE"
                         else:
@@ -649,18 +669,22 @@ def _plan_collection_buys_greedy(
                         "rank_after": primary["rank_after"],
                         "buffer_before": primary["buffer_before"],
                         "buffer_after": primary["buffer_after"],
-                        "holder_after": holder_after  # transparency
+                        "holder_after": _rank_context_smallset(primary["player"], leader, sim)["best_acct"]
                     }
                     if (best is None) or (score > best[0]):
                         best = (score, cand, sim, fam2)
 
         if not best:
             break
+
+        # Commit the best candidate
         _, cand, sim_after, fam2 = best
         used[cand["row_idx"]] += cand["take_n"]
         accounts_now = sim_after
         fam_now = fam2
+        total_sp_purchased += int(cand["sp"]) * int(cand["take_n"])
 
+        # Post-commit buffer target guidance
         holder_after = cand["holder_after"]
         buf_target = defend_buffers.get(holder_after or cand["assign_to"], DEFAULT_DEFEND_BUFFER)
         if cand["rank_after"] in (1, 2) and cand["buffer_after"] is not None:
@@ -672,6 +696,7 @@ def _plan_collection_buys_greedy(
         cand["buffer_target"] = int(buf_target) if cand["rank_after"] in (1,2) else None
         cand["copies_needed_for_threshold"] = int(copies_more) if copies_more is not None else None
 
+        # Human-readable note
         rb, ra = cand["rank_before"], cand["rank_after"]
         if cand["category"] == "QP_GAIN":
             if (rb or 9999) > 3 and (ra or 9999) <= 3: note = "enter top‑3"
@@ -688,6 +713,10 @@ def _plan_collection_buys_greedy(
 
         plan.append(cand)
 
+        # --- NEW: SP budget stop ---
+        if _budget_satisfied(total_sp_purchased, budget_target, budget_mode, budget_tolerance):
+            break
+
     fam_before, _, _ = compute_family_qp(leader, accounts_start)
     fam_after, _, _ = compute_family_qp(leader, accounts_now)
     with_players = int(len(df))
@@ -696,6 +725,13 @@ def _plan_collection_buys_greedy(
         "summary": {
             "family_qp": {"before": int(fam_before), "after": int(fam_after), "delta": int(fam_after - fam_before)},
             "counts": {"considered_rows": int(len(df)), "with_players": with_players, "selected": int(len(plan)), "simulations": sims},
+            "sp_budget": {
+                "target": budget_target,
+                "mode": budget_mode,
+                "tolerance": int(budget_tolerance),
+                "purchased_sp": int(total_sp_purchased),
+                "satisfied": _budget_satisfied(total_sp_purchased, budget_target, budget_mode, budget_tolerance) if budget_target is not None else False
+            },
             "partial": (len(plan) < max_each and ((time.monotonic() - start) * 1000.0 > EVAL_TIME_BUDGET_MS))
         }
     }
@@ -818,6 +854,7 @@ def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
     leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
     accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
 
+    # Apply trade for counter baseline
     cur, _ = _simulate_family_trade_allocation(leader, accounts, req.trade)
     for line in [l for l in req.trade if l.side == "GIVE"]:
         players = split_multi_subject_players(line.players)
@@ -839,7 +876,8 @@ def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
 
     review = _plan_collection_buys_greedy(
         leader, cur, pool_df, req.defend_buffers, req.scan_top_candidates, req.max_each, req.max_multiples_per_card,
-        players_whitelist=req.players_whitelist, players_blacklist=None, ignore_players=ignore
+        players_whitelist=req.players_whitelist, players_blacklist=None, ignore_players=ignore,
+        budget_target=req.counter_sp_target, budget_mode=req.counter_sp_mode, budget_tolerance=req.counter_sp_tolerance
     )
 
     return {**evaluation, "counter": review}
@@ -856,7 +894,7 @@ def family_collection_review_by_urls(req: FamilyCollectionReviewReq):
     )
     return review
 
-# ---- Leaderboard delta (unchanged) ----
+# ---- Leaderboard delta ----
 @app.post("/leaderboard_delta_by_urls")
 def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
     def _to_maps(lst: List[Dict[str, Any]]):
@@ -912,7 +950,7 @@ def leaderboard_delta(req: LeaderboardDeltaEnvReq):
         min_sp_delta=req.min_sp_delta
     ))
 
-# ---- NEW: Fragile whitelist (1sts & 2nds) ----
+# ---- Fragile whitelist (1sts & 2nds) ----
 @app.post("/family_fragile_whitelist_by_urls")
 def family_fragile_whitelist_by_urls(req: FamilyFragileWhitelistReq):
     leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
