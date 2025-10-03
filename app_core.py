@@ -1,20 +1,20 @@
 # app_core.py — Ultimate Quest Service (Small-Payload API)
-# Version: 4.8.0
+# Version: 4.9.0
 #
-# 4.8.0 (new):
-# - SP-Budget Counter for /family_trade_plus_counter_by_urls:
-#   counter_sp_target (int), counter_sp_mode ("closest"|"at_least"|"at_most"), counter_sp_tolerance (int).
-#   The counter planner now stops when the SP budget rule is satisfied, while preserving QP-first, then buffer-shore logic.
+# 4.9.0 (new):
+# - players_blacklist supported on /family_trade_plus_counter_by_urls (like collection review).
+# - NEW endpoint /family_safe_sell_report_by_urls:
+#   Lists players each family account can safely sell (no QP risk), with per-account SP owned
+#   and distance to Rank 3; supports a min_distance_to_rank3 filter & (optional) whitelist/blacklist.
 #
-# 4.7.1 (bugfix, kept):
-# - BUFFER_SHORE must (a) assign to the post-buy holder (holder_after == acct) and (b) strictly improve cushion (buffer_after > buffer_before).
+# 4.8.0 (kept):
+# - SP-Budget Counter knobs for trade+counter (target/mode/tolerance) with a greedy budget stop.
 #
-# 4.7.0 (new, kept):
-# - /family_fragile_whitelist_by_urls: fragile 1sts & 2nds + whitelist (deduped, capped).
+# 4.7.1 (kept):
+# - BUFFER_SHORE assigns only to post-buy holder and requires cushion improvement.
 #
 # 4.6.x (kept):
-# - Full-scan collection review (scan_top_candidates: 0) with SMART MULTIPLES and a soft TIME BUDGET.
-# - Player-from-title fallback in collection parsing; with_players count in summaries.
+# - Full-scan collection review; time budget (soft); player-from-title fallback.
 #
 # Stack: FastAPI + pandas + openpyxl + requests (Python 3.11.9).
 
@@ -30,7 +30,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-APP_VERSION = "4.8.0"
+APP_VERSION = "4.9.0"
 APP_TITLE = "Ultimate Quest Service (Small-Payload API)"
 
 FAMILY_ACCOUNTS = ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn"]
@@ -255,7 +255,7 @@ def parse_collection(sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     out = out.copy().reset_index(drop=True)
     return out
 
-# ---------- Ranking (small set, strong keys) ----------
+# ---------- Ranking (small set) ----------
 def qp_for_rank(rank: int) -> int:
     return 5 if rank == 1 else 3 if rank == 2 else 1 if rank == 3 else 0
 
@@ -306,10 +306,9 @@ def compute_family_qp(leader: Dict[str, List[Dict[str, Any]]],
             key_a = _canon_user_strong(acct)
             r, sp = rank_by_key.get(key_a, (9999, 0))
             per_account_qp[acct] += qp_for_rank(r)
-            gap_to_first = max(first_sp - sp, 0) if first_sp else 0
             margin_if_first = (sp - second_sp) if r == 1 else None
             per_account_details[acct][player] = {
-                "sp": sp, "rank": r, "gap_to_first": gap_to_first, "margin_if_first": margin_if_first
+                "sp": sp, "rank": r, "gap_to_first": max(first_sp - sp, 0), "margin_if_first": margin_if_first
             }
     family_qp_total = sum(per_account_qp.values())
     return family_qp_total, per_account_qp, per_account_details
@@ -401,11 +400,12 @@ class FamilyTradePlusCounterReq(BaseModel):
     exclude_trade_get_players: bool = True
 
     players_whitelist: Optional[List[str]] = None
+    players_blacklist: Optional[List[str]] = None  # NEW
     scan_top_candidates: int = 0
     max_each: int = 60
     max_multiples_per_card: int = 3
 
-    # --- NEW: SP-Budget knobs for counter ---
+    # SP-Budget knobs
     counter_sp_target: Optional[int] = None
     counter_sp_mode: Literal["closest","at_least","at_most"] = "closest"
     counter_sp_tolerance: int = 0
@@ -427,6 +427,18 @@ class FamilyCollectionReviewReq(BaseModel):
     scan_top_candidates: int = 0
     max_each: int = 60
     max_multiples_per_card: int = 3
+
+class FamilySafeSellReq(BaseModel):
+    prefer_env_defaults: bool = True
+    leaderboard_url: Optional[str] = None
+    holdings_e31_url: Optional[str] = None
+    holdings_dc_url: Optional[str] = None
+    holdings_fe_url: Optional[str] = None
+    players_whitelist: Optional[List[str]] = None
+    players_blacklist: Optional[List[str]] = None
+    include_top3: bool = False  # by default we only list players outside Top-3 (to avoid any QP loss)
+    min_distance_to_rank3: int = 6  # hide players that are within this many SP of entering Top-3
+    exclude_accounts: Optional[List[Literal["Easystreet31","DusterCrusher","FinkleIsEinhorn"]]] = None
 
 class LeaderboardDeltaReq(BaseModel):
     leaderboard_today_url: str
@@ -454,7 +466,7 @@ class FamilyFragileWhitelistReq(BaseModel):
     })
     include_firsts: bool = True
     include_seconds: bool = True
-    limit: int = 120  # cap players in 'whitelist'
+    limit: int = 120
 
 # ---------- Trade simulation ----------
 def _simulate_family_trade_allocation(leader, accounts_in: Dict[str, Dict[str, int]],
@@ -533,9 +545,8 @@ def _budget_satisfied(total_sp: int, tgt: Optional[int], mode: str, tol: int) ->
     mode = (mode or "closest").lower()
     tol = max(0, int(tol or 0))
     if mode == "at_most":
-        # Stop when we are <= target and within tolerance below it.
         return (total_sp <= tgt) and ((tgt - total_sp) <= tol)
-    # For "closest" (greedy) we behave like "at_least" with tolerance.
+    # "closest" behaves like "at_least" with tolerance
     return (total_sp >= tgt) and ((total_sp - tgt) <= tol)
 
 def _plan_collection_buys_greedy(
@@ -543,7 +554,6 @@ def _plan_collection_buys_greedy(
     defend_buffers: Dict[str, int], scan_top_candidates: int, max_each: int, max_multiples_per_card: int,
     players_whitelist: Optional[List[str]] = None, players_blacklist: Optional[List[str]] = None,
     ignore_players: Optional[Set[str]] = None,
-    # --- NEW: SP budget controls (optional) ---
     budget_target: Optional[int] = None, budget_mode: str = "closest", budget_tolerance: int = 0
 ):
     start = time.monotonic()
@@ -566,7 +576,7 @@ def _plan_collection_buys_greedy(
     used: Dict[int, int] = defaultdict(int)
     plan: List[Dict[str, Any]] = []
     sims = 0
-    total_sp_purchased = 0  # sum of (sp * take_n), independent of multi-subject player count
+    total_sp_purchased = 0
 
     if max_each <= 0 or len(df) == 0:
         fam_after, _, _ = compute_family_qp(leader, accounts_now)
@@ -642,7 +652,7 @@ def _plan_collection_buys_greedy(
                         score = (1, int(gain), -int(primary.get("buffer_after") if primary.get("buffer_after") is not None else 10**6))
                         category = "QP_GAIN"
                     else:
-                        # BUFFER_SHORE (holder-only + strict improvement)
+                        # BUFFER_SHORE (holder-only + improvement)
                         rank_after = primary["rank_after"] or 9999
                         buffer_after = primary["buffer_after"]
                         buffer_before = primary["buffer_before"]
@@ -677,14 +687,14 @@ def _plan_collection_buys_greedy(
         if not best:
             break
 
-        # Commit the best candidate
+        # Commit best
         _, cand, sim_after, fam2 = best
         used[cand["row_idx"]] += cand["take_n"]
         accounts_now = sim_after
         fam_now = fam2
         total_sp_purchased += int(cand["sp"]) * int(cand["take_n"])
 
-        # Post-commit buffer target guidance
+        # Buffer target guidance
         holder_after = cand["holder_after"]
         buf_target = defend_buffers.get(holder_after or cand["assign_to"], DEFAULT_DEFEND_BUFFER)
         if cand["rank_after"] in (1, 2) and cand["buffer_after"] is not None:
@@ -696,7 +706,7 @@ def _plan_collection_buys_greedy(
         cand["buffer_target"] = int(buf_target) if cand["rank_after"] in (1,2) else None
         cand["copies_needed_for_threshold"] = int(copies_more) if copies_more is not None else None
 
-        # Human-readable note
+        # Note
         rb, ra = cand["rank_before"], cand["rank_after"]
         if cand["category"] == "QP_GAIN":
             if (rb or 9999) > 3 and (ra or 9999) <= 3: note = "enter top‑3"
@@ -713,7 +723,7 @@ def _plan_collection_buys_greedy(
 
         plan.append(cand)
 
-        # --- NEW: SP budget stop ---
+        # Budget stop
         if _budget_satisfied(total_sp_purchased, budget_target, budget_mode, budget_tolerance):
             break
 
@@ -735,6 +745,20 @@ def _plan_collection_buys_greedy(
             "partial": (len(plan) < max_each and ((time.monotonic() - start) * 1000.0 > EVAL_TIME_BUDGET_MS))
         }
     }
+
+# ---------- Safe-Sell analyzer ----------
+def _third_sp_for_player(leader, accounts, player: str) -> int:
+    rows = _smallset_entries_for_player(player, leader, accounts)
+    if not rows:
+        return 0
+    ordered, _ = _dedup_and_rank(rows)
+    return ordered[2][2] if len(ordered) > 2 else (ordered[1][2] if len(ordered) > 1 else 0)
+
+def _passes_lists(player: str, wl: Set[str], bl: Set[str]) -> bool:
+    p = (player or "").lower()
+    if wl and p not in wl: return False
+    if bl and p in bl: return False
+    return True
 
 # ---------- Routes ----------
 @app.get("/healthz")
@@ -876,7 +900,7 @@ def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
 
     review = _plan_collection_buys_greedy(
         leader, cur, pool_df, req.defend_buffers, req.scan_top_candidates, req.max_each, req.max_multiples_per_card,
-        players_whitelist=req.players_whitelist, players_blacklist=None, ignore_players=ignore,
+        players_whitelist=req.players_whitelist, players_blacklist=req.players_blacklist, ignore_players=ignore,
         budget_target=req.counter_sp_target, budget_mode=req.counter_sp_mode, budget_tolerance=req.counter_sp_tolerance
     )
 
@@ -893,6 +917,74 @@ def family_collection_review_by_urls(req: FamilyCollectionReviewReq):
         players_whitelist=req.players_whitelist, players_blacklist=req.players_blacklist, ignore_players=None
     )
     return review
+
+# ---- Safe-Sell: who can we sell without risking QP? ----
+@app.post("/family_safe_sell_report_by_urls")
+def family_safe_sell_report_by_urls(req: FamilySafeSellReq):
+    leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
+    accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
+
+    wl = set([(p or "").lower() for p in (req.players_whitelist or [])])
+    bl = set([(p or "").lower() for p in (req.players_blacklist or [])])
+    ex = set(req.exclude_accounts or [])
+
+    items: List[Dict[str, Any]] = []
+    for acct in FAMILY_ACCOUNTS:
+        if acct in ex: continue
+        for player, sp_owned in sorted(accounts.get(acct, {}).items()):
+            if sp_owned <= 0: continue
+            if not _passes_lists(player, wl, bl): continue
+
+            rows = _smallset_entries_for_player(player, leader, accounts)
+            if not rows:  # extremely rare
+                continue
+            ordered, rank_by_key = _dedup_and_rank(rows)
+            r, s = rank_by_key.get(_canon_user_strong(acct), (9999, 0))
+            # Skip Top-3 unless include_top3 is true (selling from Top-3 can cost QP)
+            if not req.include_top3 and r <= 3:
+                continue
+
+            third_sp = ordered[2][2] if len(ordered) > 2 else (ordered[1][2] if len(ordered) > 1 else 0)
+            distance_to_rank3 = max((third_sp + 1) - s, 0)
+
+            # Hide players too close to a QP entry (within slider X)
+            if distance_to_rank3 < int(req.min_distance_to_rank3):
+                continue
+
+            items.append({
+                "account": acct,
+                "player": player,
+                "sp_owned": int(s),
+                "rank": int(r),
+                "third_sp": int(third_sp),
+                "distance_to_rank3": int(distance_to_rank3)
+            })
+
+    # Sort by "safest" (furthest from Top-3), then by SP held, then name
+    items.sort(key=lambda d: (-d["distance_to_rank3"], -d["sp_owned"], d["player"].lower()))
+
+    # Group by account for readability
+    per_acct: Dict[str, List[Dict[str, Any]]] = {a: [] for a in FAMILY_ACCOUNTS}
+    for it in items:
+        per_acct[it["account"]].append(it)
+
+    return {
+        "per_account": per_acct,
+        "flat": items,
+        "summary": {
+            "filters": {
+                "include_top3": bool(req.include_top3),
+                "min_distance_to_rank3": int(req.min_distance_to_rank3),
+                "whitelist_count": len(wl) if wl else 0,
+                "blacklist_count": len(bl) if bl else 0,
+                "excluded_accounts": list(ex) if ex else []
+            },
+            "counts": {
+                "returned": len(items),
+                "accounts_with_items": sum(1 for a in FAMILY_ACCOUNTS if per_acct[a])
+            }
+        }
+    }
 
 # ---- Leaderboard delta ----
 @app.post("/leaderboard_delta_by_urls")
