@@ -1,19 +1,18 @@
 # app_core.py — Ultimate Quest Service (Small-Payload API)
-# Version: 4.9.2
+# Version: 4.9.3
 #
-# 4.9.2 (display/data additions):
-# - PLAYER IMPACT rows now include:
-#     • rank_before, rank_after + human labels (e.g., "1st","2nd","3rd","4th", "—")
-#     • per_account_sp_before/after/delta for E31/DC/FE (debug visibility)
-#   (We continue to report SP_before/after as the FAMILY TOTAL sum across E31/DC/FE.)
-# - ownership_warnings: if GIVE lines request more SP than the trade account owns pre-trade,
-#   we list those players with attempted vs owned, so "no SP drop" is explained.
+# 4.9.3 (player-impact correctness):
+# - Player line Buffer/Rank/SP now computed against an "effective" family SP:
+#   effective_before = max(leaderboard_family_SP, holdings_before_SP)
+#   effective_after  = effective_before + (holdings_after_SP - holdings_before_SP)
+#   → fixes cases where leaderboard shows your base SP (e.g., 85) but holdings sheet
+#     doesn't, so a +4 GET now correctly yields 89 and buffer delta +4 (1→5).
 #
-# 4.9.1 (fix):
-# - PLAYER IMPACT SP displayed as FAMILY TOTAL (sum), not family max.
+# 4.9.2:
+# - PLAYER IMPACT rows include rank labels and per-account deltas; ownership warnings for GIVE>owned.
 #
-# 4.9.0 (prev):
-# - players_blacklist for trade+counter; Safe‑Sell endpoint added; full-scan review.
+# 4.9.1:
+# - PLAYER IMPACT SP displayed as FAMILY TOTAL (sum).
 #
 # Stack: FastAPI + pandas + openpyxl + requests (Python 3.11.9).
 
@@ -29,7 +28,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-APP_VERSION = "4.9.2"
+APP_VERSION = "4.9.3"
 APP_TITLE = "Ultimate Quest Service (Small-Payload API)"
 
 FAMILY_ACCOUNTS = ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn"]
@@ -171,7 +170,7 @@ def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dic
             for uc in user_cols:
                 out[p].append({"user": uc, "sp": _as_int(row.get(uc, 0))})
 
-    # Dedup per label & sort
+    # Dedup/keep max per label
     for p, lst in out.items():
         best: Dict[str, int] = {}
         for e in lst:
@@ -219,9 +218,7 @@ def _players_from_title(card: str) -> str:
         return ""
     s = str(card).strip()
     parts = _TITLE_SPLIT_RE.split(s)
-    if len(parts) == 0:
-        return ""
-    tail = parts[-1].strip()
+    tail = parts[-1].strip() if parts else ""
     if "/" in tail:
         return tail
     if re.search(r"[A-Za-z]\s+[A-Za-z]", tail):
@@ -752,6 +749,14 @@ def _plan_collection_buys_greedy(
         }
     }
 
+# ---- Helpers for effective SP on touched players ----
+def _lb_family_sp_for(leader: Dict[str, List[Dict[str, Any]]], player: str, acct: str) -> int:
+    key = _canon_user_strong(acct)
+    for e in leader.get(player, []):
+        if _canon_user_strong(e["user"]) == key:
+            return _as_int(e["sp"])
+    return 0
+
 # ---- Safe-Sell helpers ----
 def _third_sp_for_player(leader, accounts, player: str) -> int:
     rows = _smallset_entries_for_player(player, leader, accounts)
@@ -824,18 +829,32 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
                 "note": "GIVE exceeds owned SP; family total may not drop as expected."
             })
 
-    # Build player changes
+    # Build player changes — use EFFECTIVE family SP for buffer/rank/SP lines
     rows=[]; tot_buf=0
     for pl in sorted(touched):
-        sp_b_by_acct = {a: int(accounts_before.get(a, {}).get(pl, 0)) for a in FAMILY_ACCOUNTS}
-        sp_a_by_acct = {a: int(cur.get(a, {}).get(pl, 0)) for a in FAMILY_ACCOUNTS}
-        sp_b = sum(sp_b_by_acct.values())
-        sp_a = sum(sp_a_by_acct.values())
-        d_sp = sp_a - sp_b
-        d_by_acct = {a: sp_a_by_acct[a] - sp_b_by_acct[a] for a in FAMILY_ACCOUNTS}
+        # Per-account deltas from holdings (what the trade actually changed)
+        d_by_acct = {a: int(cur.get(a, {}).get(pl, 0) - accounts_before.get(a, {}).get(pl, 0)) for a in FAMILY_ACCOUNTS}
 
-        ctx_b = _rank_context_smallset(pl, leader, accounts_before)
-        ctx_a = _rank_context_smallset(pl, leader, cur)
+        # Leaderboard family baseline for each account
+        lb_base = {a: _lb_family_sp_for(leader, pl, a) for a in FAMILY_ACCOUNTS}
+        # Holdings baseline (if present)
+        hold_b = {a: int(accounts_before.get(a, {}).get(pl, 0)) for a in FAMILY_ACCOUNTS}
+        # Effective before: take the better of leaderboard vs holdings
+        eff_b = {a: max(lb_base[a], hold_b[a]) for a in FAMILY_ACCOUNTS}
+        # Effective after: add the trade delta on top of effective before
+        eff_a = {a: eff_b[a] + d_by_acct[a] for a in FAMILY_ACCOUNTS}
+
+        # Totals (family sum)
+        sp_b = sum(eff_b.values())
+        sp_a = sum(eff_a.values())
+        d_sp = sp_a - sp_b
+
+        # Rank/buffer contexts computed against *effective* SP maps
+        eff_before_map = {a: {pl: eff_b[a]} for a in FAMILY_ACCOUNTS}
+        eff_after_map  = {a: {pl: eff_a[a]} for a in FAMILY_ACCOUNTS}
+        ctx_b = _rank_context_smallset(pl, leader, eff_before_map)
+        ctx_a = _rank_context_smallset(pl, leader, eff_after_map)
+
         r_b, r_a = ctx_b["best_rank"], ctx_a["best_rank"]
         buf_b, buf_a = ctx_b["buffer_down"], ctx_a["buffer_down"]
         d_buf = (buf_a or 0) - (buf_b or 0) if (buf_b is not None or buf_a is not None) else None
@@ -846,8 +865,8 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
         rows.append({
             "player": pl,
             "sp_before": int(sp_b), "sp_after": int(sp_a), "delta_sp": int(d_sp),
-            "per_account_sp_before": sp_b_by_acct,
-            "per_account_sp_after": sp_a_by_acct,
+            "per_account_sp_before": eff_b,
+            "per_account_sp_after": eff_a,
             "per_account_sp_delta": d_by_acct,
             "best_rank_before": r_b, "best_rank_after": r_a,
             "best_rank_before_label": _rank_label(r_b),
