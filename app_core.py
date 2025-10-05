@@ -1,18 +1,17 @@
 # app_core.py — Ultimate Quest Service (Small-Payload API)
-# Version: 4.9.3
+# Version: 4.9.4
 #
-# 4.9.3 (player-impact correctness):
-# - Player line Buffer/Rank/SP now computed against an "effective" family SP:
-#   effective_before = max(leaderboard_family_SP, holdings_before_SP)
-#   effective_after  = effective_before + (holdings_after_SP - holdings_before_SP)
-#   → fixes cases where leaderboard shows your base SP (e.g., 85) but holdings sheet
-#     doesn't, so a +4 GET now correctly yields 89 and buffer delta +4 (1→5).
+# 4.9.4 (player-impact buffer/rank correctness):
+# - Player line Buffer Δ and Rank now computed using an "effective" family SP
+#   (leaderboard baseline + trade deltas) against the FULL leaderboard
+#   competitor set for that player (not just top‑3). This fixes cases like
+#   Fagemo 85→89 where the buffer should show +4 (1 → 5 total).
+#
+# 4.9.3:
+# - Effective family SP introduced for player lines; ownership warnings for GIVE>owned.
 #
 # 4.9.2:
-# - PLAYER IMPACT rows include rank labels and per-account deltas; ownership warnings for GIVE>owned.
-#
-# 4.9.1:
-# - PLAYER IMPACT SP displayed as FAMILY TOTAL (sum).
+# - Player lines include per-account deltas and rank labels; SP uses FAMILY TOTAL.
 #
 # Stack: FastAPI + pandas + openpyxl + requests (Python 3.11.9).
 
@@ -28,7 +27,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-APP_VERSION = "4.9.3"
+APP_VERSION = "4.9.4"
 APP_TITLE = "Ultimate Quest Service (Small-Payload API)"
 
 FAMILY_ACCOUNTS = ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn"]
@@ -258,17 +257,20 @@ def parse_collection(sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     out = out.copy().reset_index(drop=True)
     return out
 
-# ---------- Ranking (small set) ----------
+# ---------- Ranking (core) ----------
 def qp_for_rank(rank: int) -> int:
     return 5 if rank == 1 else 3 if rank == 2 else 1 if rank == 3 else 0
 
 def _smallset_entries_for_player(player: str,
                                  leader: Dict[str, List[Dict[str, Any]]],
                                  accounts_sp: Dict[str, Dict[str, int]]) -> List[Tuple[str, str, int]]:
+    """Used for family QP computations and general context. Includes family accounts and
+    the top few leaderboard rows (kept small for performance across many players)."""
     rows: List[Tuple[str, str, int]] = []
     for acct in FAMILY_ACCOUNTS:
         sp = _as_int(accounts_sp.get(acct, {}).get(player, 0))
         if sp > 0: rows.append((_canon_user_strong(acct), acct, sp))
+    # Keep this small (top 3) for global scans
     for e in leader.get(player, [])[:3]:
         label = str(e["user"])
         rows.append((_canon_user_strong(label), label, _as_int(e["sp"])))
@@ -343,6 +345,55 @@ def _rank_context_smallset(player: str,
     return {"best_acct": best_acct, "best_rank": (best_rank if best_rank != 9999 else None),
             "best_sp": best_sp, "buffer_down": buffer_down,
             "family_qp_player": family_qp_player, "fam_ranks": fam_ranks}
+
+# ----- NEW: full-leader buffer/rank for a single player (accurate cushion) -----
+def _rank_and_buffer_full_leader(player: str,
+                                 leader: Dict[str, List[Dict[str, Any]]],
+                                 fam_sp_map: Dict[str, int]) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Build a full competitive table for `player` by combining:
+      • ALL leaderboard entries for that player, and
+      • the provided family SP overrides (fam_sp_map),
+    then compute:
+      • best family rank overall, and
+      • cushion (if rank is 1 or 2): vs 2nd (if 1st) or vs 3rd (if 2nd).
+    """
+    # Start from leaderboard
+    best_by_key: Dict[str, Tuple[str, int]] = {}
+    for e in leader.get(player, []):
+        label = str(e["user"]); key = _canon_user_strong(label); sp = _as_int(e["sp"])
+        if key not in best_by_key or sp > best_by_key[key][1]:
+            best_by_key[key] = (label, sp)
+    # Overlay family effective SP
+    for acct, sp in fam_sp_map.items():
+        if _as_int(sp) <= 0: continue
+        key = _canon_user_strong(acct)
+        if key not in best_by_key or _as_int(sp) > best_by_key[key][1]:
+            best_by_key[key] = (acct, _as_int(sp))
+
+    if not best_by_key:
+        return (None, None)
+
+    ordered = sorted(((k, v[0], v[1]) for k, v in best_by_key.items()),
+                     key=lambda t: (-t[2], t[1].lower()))
+    # best family rank
+    best_rank = 9999; best_sp = 0
+    for idx, (k, label, sp) in enumerate(ordered, start=1):
+        if label in FAMILY_ACCOUNTS:
+            if idx < best_rank or (idx == best_rank and sp > best_sp):
+                best_rank = idx; best_sp = sp
+    if best_rank >= 9999:
+        return (None, None)
+
+    # cushion
+    cushion = None
+    if best_rank == 1:
+        second_sp = ordered[1][2] if len(ordered) > 1 else 0
+        cushion = best_sp - second_sp
+    elif best_rank == 2:
+        third_sp = ordered[2][2] if len(ordered) > 2 else 0
+        cushion = best_sp - third_sp
+    return (best_rank, cushion)
 
 # ---------- Family holdings ----------
 def holdings_from_urls(holdings_e31_url: Optional[str], holdings_dc_url: Optional[str],
@@ -829,37 +880,44 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
                 "note": "GIVE exceeds owned SP; family total may not drop as expected."
             })
 
-    # Build player changes — use EFFECTIVE family SP for buffer/rank/SP lines
+    # Build player changes — EFFECTIVE family SP and FULL-leader buffer/rank
     rows=[]; tot_buf=0
     for pl in sorted(touched):
-        # Per-account deltas from holdings (what the trade actually changed)
+        # Per-account holdings deltas from the simulated trade
         d_by_acct = {a: int(cur.get(a, {}).get(pl, 0) - accounts_before.get(a, {}).get(pl, 0)) for a in FAMILY_ACCOUNTS}
 
-        # Leaderboard family baseline for each account
+        # Leaderboard family baseline per account
         lb_base = {a: _lb_family_sp_for(leader, pl, a) for a in FAMILY_ACCOUNTS}
         # Holdings baseline (if present)
         hold_b = {a: int(accounts_before.get(a, {}).get(pl, 0)) for a in FAMILY_ACCOUNTS}
-        # Effective before: take the better of leaderboard vs holdings
+        # Effective before: take max(leaderboard, holdings)
         eff_b = {a: max(lb_base[a], hold_b[a]) for a in FAMILY_ACCOUNTS}
-        # Effective after: add the trade delta on top of effective before
+        # Effective after: add the trade delta
         eff_a = {a: eff_b[a] + d_by_acct[a] for a in FAMILY_ACCOUNTS}
 
-        # Totals (family sum)
+        # Family TOTAL SPs
         sp_b = sum(eff_b.values())
         sp_a = sum(eff_a.values())
         d_sp = sp_a - sp_b
 
-        # Rank/buffer contexts computed against *effective* SP maps
+        # QP context (kept via smallset for performance)
         eff_before_map = {a: {pl: eff_b[a]} for a in FAMILY_ACCOUNTS}
         eff_after_map  = {a: {pl: eff_a[a]} for a in FAMILY_ACCOUNTS}
         ctx_b = _rank_context_smallset(pl, leader, eff_before_map)
         ctx_a = _rank_context_smallset(pl, leader, eff_after_map)
-
-        r_b, r_a = ctx_b["best_rank"], ctx_a["best_rank"]
-        buf_b, buf_a = ctx_b["buffer_down"], ctx_a["buffer_down"]
-        d_buf = (buf_a or 0) - (buf_b or 0) if (buf_b is not None or buf_a is not None) else None
         qp_b, qp_a = ctx_b["family_qp_player"], ctx_a["family_qp_player"]
         d_qp = qp_a - qp_b
+
+        # Accurate buffer/rank using FULL leaderboard set
+        r_b_full, buf_b_full = _rank_and_buffer_full_leader(pl, leader, {a: eff_b[a] for a in FAMILY_ACCOUNTS})
+        r_a_full, buf_a_full = _rank_and_buffer_full_leader(pl, leader, {a: eff_a[a] for a in FAMILY_ACCOUNTS})
+        if r_b_full is None: r_b_full = None
+        if r_a_full is None: r_a_full = None
+        if buf_b_full is None and buf_a_full is None:
+            d_buf = None
+        else:
+            d_buf = (buf_a_full or 0) - (buf_b_full or 0)
+
         if d_buf is not None: tot_buf += d_buf
 
         rows.append({
@@ -868,11 +926,11 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
             "per_account_sp_before": eff_b,
             "per_account_sp_after": eff_a,
             "per_account_sp_delta": d_by_acct,
-            "best_rank_before": r_b, "best_rank_after": r_a,
-            "best_rank_before_label": _rank_label(r_b),
-            "best_rank_after_label": _rank_label(r_a),
-            "buffer_before": None if buf_b is None else int(buf_b),
-            "buffer_after":  None if buf_a is None else int(buf_a),
+            "best_rank_before": r_b_full, "best_rank_after": r_a_full,
+            "best_rank_before_label": _rank_label(r_b_full),
+            "best_rank_after_label": _rank_label(r_a_full),
+            "buffer_before": None if buf_b_full is None else int(buf_b_full),
+            "buffer_after":  None if buf_a_full is None else int(buf_a_full),
             "delta_buffer":   None if d_buf is None else int(d_buf),
             "qp_before": int(qp_b), "qp_after": int(qp_a), "delta_qp": int(d_qp)
         })
@@ -884,7 +942,7 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
         "delta_qp": int(fam1 - fam0)
     }
 
-    # Trade-created fragile firsts
+    # Trade-created fragile firsts (unchanged)
     def _created_fragile_firsts(det_before, det_after, buffers, restrict_players: Optional[Set[str]]):
         alerts: List[str] = []
         for acct in FAMILY_ACCOUNTS:
