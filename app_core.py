@@ -1,22 +1,19 @@
 # app_core.py — Ultimate Quest Service (Small-Payload API)
-# Version: 4.9.1
+# Version: 4.9.2
+#
+# 4.9.2 (display/data additions):
+# - PLAYER IMPACT rows now include:
+#     • rank_before, rank_after + human labels (e.g., "1st","2nd","3rd","4th", "—")
+#     • per_account_sp_before/after/delta for E31/DC/FE (debug visibility)
+#   (We continue to report SP_before/after as the FAMILY TOTAL sum across E31/DC/FE.)
+# - ownership_warnings: if GIVE lines request more SP than the trade account owns pre-trade,
+#   we list those players with attempted vs owned, so "no SP drop" is explained.
 #
 # 4.9.1 (fix):
-# - PLAYER IMPACT now reports SP as FAMILY TOTAL (sum across E31/DC/FE) for each touched player,
-#   not family max. This makes GET/GIVE effects visible even when they don't alter the best-holder.
-#   Buffer/QP logic unchanged; buffer shown is TOTAL cushion for the best family holder when rank is 1/2.
+# - PLAYER IMPACT SP displayed as FAMILY TOTAL (sum), not family max.
 #
 # 4.9.0 (prev):
-# - players_blacklist supported on trade+counter; Safe‑Sell endpoint added.
-#
-# 4.8.0 (prev):
-# - SP-Budget Counter knobs (target/mode/tolerance) with greedy budget stop.
-#
-# 4.7.1 (prev):
-# - BUFFER_SHORE assigns only to post-buy holder and requires cushion improvement.
-#
-# 4.6.x (prev):
-# - Full-scan collection review; soft time budget; player-from-title fallback.
+# - players_blacklist for trade+counter; Safe‑Sell endpoint added; full-scan review.
 #
 # Stack: FastAPI + pandas + openpyxl + requests (Python 3.11.9).
 
@@ -32,7 +29,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-APP_VERSION = "4.9.1"
+APP_VERSION = "4.9.2"
 APP_TITLE = "Ultimate Quest Service (Small-Payload API)"
 
 FAMILY_ACCOUNTS = ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn"]
@@ -133,6 +130,13 @@ def split_multi_subject_players(players_text: str) -> List[str]:
     parts = re.split(r"\s*(?:/|&|\+|,| and |\||—|–)\s*", str(players_text))
     parts = [_norm_player(p) for p in parts if _norm_player(p)]
     return _unique_preserve(parts)
+
+def _rank_label(r: Optional[int]) -> str:
+    if r is None or r >= 9999: return "—"
+    if r == 1: return "1st"
+    if r == 2: return "2nd"
+    if r == 3: return "3rd"
+    return f"{int(r)}th"
 
 # ---------- Parse helpers ----------
 def normalize_leaderboard(sheets: Dict[str, pd.DataFrame]) -> Dict[str, List[Dict[str, Any]]]:
@@ -748,7 +752,7 @@ def _plan_collection_buys_greedy(
         }
     }
 
-# ---------- Safe-Sell analyzer ----------
+# ---- Safe-Sell helpers ----
 def _third_sp_for_player(leader, accounts, player: str) -> int:
     rows = _smallset_entries_for_player(player, leader, accounts)
     if not rows:
@@ -782,7 +786,15 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
     accounts_before = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
     fam0, per0, det0 = compute_family_qp(leader, accounts_before)
 
+    # Ownership warning prep: sum GIVE requests per player
+    give_requested: Dict[str, int] = defaultdict(int)
+    for line in [l for l in req.trade if l.side == "GIVE"]:
+        for p in split_multi_subject_players(line.players):
+            give_requested[p] += int(line.sp)
+
     cur, alloc_plan = _simulate_family_trade_allocation(leader, accounts_before, req.trade)
+
+    # Apply GIVEs (only to the trade account)
     for line in [l for l in req.trade if l.side == "GIVE"]:
         players = split_multi_subject_players(line.players)
         if not players or line.sp <= 0: continue
@@ -793,17 +805,34 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
 
     fam1, per1, det1 = compute_family_qp(leader, cur)
 
+    # Build touched set
     touched = set()
     for tl in req.trade:
         for pl in split_multi_subject_players(tl.players):
             touched.add(pl)
 
-    rows=[]; tot_sp=0; tot_buf=0
+    # Ownership warnings (compare to pre-trade holdings)
+    ownership_warnings = []
+    for p, want in sorted(give_requested.items(), key=lambda kv: kv[0].lower()):
+        have = int(accounts_before.get(req.trade_account, {}).get(p, 0))
+        if want > have:
+            ownership_warnings.append({
+                "account": req.trade_account,
+                "player": p,
+                "attempted_give_sp": int(want),
+                "owned_sp_before": int(have),
+                "note": "GIVE exceeds owned SP; family total may not drop as expected."
+            })
+
+    # Build player changes
+    rows=[]; tot_buf=0
     for pl in sorted(touched):
-        # --- FIX: family TOTAL SP (sum across family), not max ---
-        sp_b = sum(accounts_before.get(a, {}).get(pl, 0) for a in FAMILY_ACCOUNTS)
-        sp_a = sum(cur.get(a, {}).get(pl, 0) for a in FAMILY_ACCOUNTS)
+        sp_b_by_acct = {a: int(accounts_before.get(a, {}).get(pl, 0)) for a in FAMILY_ACCOUNTS}
+        sp_a_by_acct = {a: int(cur.get(a, {}).get(pl, 0)) for a in FAMILY_ACCOUNTS}
+        sp_b = sum(sp_b_by_acct.values())
+        sp_a = sum(sp_a_by_acct.values())
         d_sp = sp_a - sp_b
+        d_by_acct = {a: sp_a_by_acct[a] - sp_b_by_acct[a] for a in FAMILY_ACCOUNTS}
 
         ctx_b = _rank_context_smallset(pl, leader, accounts_before)
         ctx_a = _rank_context_smallset(pl, leader, cur)
@@ -812,24 +841,31 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
         d_buf = (buf_a or 0) - (buf_b or 0) if (buf_b is not None or buf_a is not None) else None
         qp_b, qp_a = ctx_b["family_qp_player"], ctx_a["family_qp_player"]
         d_qp = qp_a - qp_b
+        if d_buf is not None: tot_buf += d_buf
 
         rows.append({
             "player": pl,
             "sp_before": int(sp_b), "sp_after": int(sp_a), "delta_sp": int(d_sp),
+            "per_account_sp_before": sp_b_by_acct,
+            "per_account_sp_after": sp_a_by_acct,
+            "per_account_sp_delta": d_by_acct,
             "best_rank_before": r_b, "best_rank_after": r_a,
+            "best_rank_before_label": _rank_label(r_b),
+            "best_rank_after_label": _rank_label(r_a),
             "buffer_before": None if buf_b is None else int(buf_b),
             "buffer_after":  None if buf_a is None else int(buf_a),
             "delta_buffer":   None if d_buf is None else int(d_buf),
             "qp_before": int(qp_b), "qp_after": int(qp_a), "delta_qp": int(d_qp)
         })
-        tot_sp += d_sp
-        if d_buf is not None: tot_buf += d_buf
 
     rows.sort(key=lambda r: (-r["delta_qp"], -r["delta_sp"], r["player"].lower()))
-    totals = {"delta_sp": int(sum(r["delta_sp"] for r in rows)),
-              "delta_buffer": int(tot_buf),
-              "delta_qp": int(fam1 - fam0)}
+    totals = {
+        "delta_sp": int(sum(r["delta_sp"] for r in rows)),
+        "delta_buffer": int(tot_buf),
+        "delta_qp": int(fam1 - fam0)
+    }
 
+    # Trade-created fragile firsts
     def _created_fragile_firsts(det_before, det_after, buffers, restrict_players: Optional[Set[str]]):
         alerts: List[str] = []
         for acct in FAMILY_ACCOUNTS:
@@ -861,6 +897,7 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
         "total_changes": totals,
         "fragility_alerts": frag_list,
         "fragility_notes": frag_note,
+        "ownership_warnings": ownership_warnings,
         "verdict": verdict
     }
 
@@ -964,7 +1001,6 @@ def family_safe_sell_report_by_urls(req: FamilySafeSellReq):
             })
 
     items.sort(key=lambda d: (-d["distance_to_rank3"], -d["sp_owned"], d["player"].lower()))
-
     per_acct: Dict[str, List[Dict[str, Any]]] = {a: [] for a in FAMILY_ACCOUNTS}
     for it in items:
         per_acct[it["account"]].append(it)
