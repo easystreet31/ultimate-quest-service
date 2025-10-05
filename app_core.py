@@ -1,20 +1,22 @@
 # app_core.py — Ultimate Quest Service (Small-Payload API)
-# Version: 4.9.0
+# Version: 4.9.1
 #
-# 4.9.0 (new):
-# - players_blacklist supported on /family_trade_plus_counter_by_urls (like collection review).
-# - NEW endpoint /family_safe_sell_report_by_urls:
-#   Lists players each family account can safely sell (no QP risk), with per-account SP owned
-#   and distance to Rank 3; supports a min_distance_to_rank3 filter & (optional) whitelist/blacklist.
+# 4.9.1 (fix):
+# - PLAYER IMPACT now reports SP as FAMILY TOTAL (sum across E31/DC/FE) for each touched player,
+#   not family max. This makes GET/GIVE effects visible even when they don't alter the best-holder.
+#   Buffer/QP logic unchanged; buffer shown is TOTAL cushion for the best family holder when rank is 1/2.
 #
-# 4.8.0 (kept):
-# - SP-Budget Counter knobs for trade+counter (target/mode/tolerance) with a greedy budget stop.
+# 4.9.0 (prev):
+# - players_blacklist supported on trade+counter; Safe‑Sell endpoint added.
 #
-# 4.7.1 (kept):
+# 4.8.0 (prev):
+# - SP-Budget Counter knobs (target/mode/tolerance) with greedy budget stop.
+#
+# 4.7.1 (prev):
 # - BUFFER_SHORE assigns only to post-buy holder and requires cushion improvement.
 #
-# 4.6.x (kept):
-# - Full-scan collection review; time budget (soft); player-from-title fallback.
+# 4.6.x (prev):
+# - Full-scan collection review; soft time budget; player-from-title fallback.
 #
 # Stack: FastAPI + pandas + openpyxl + requests (Python 3.11.9).
 
@@ -30,7 +32,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-APP_VERSION = "4.9.0"
+APP_VERSION = "4.9.1"
 APP_TITLE = "Ultimate Quest Service (Small-Payload API)"
 
 FAMILY_ACCOUNTS = ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn"]
@@ -400,7 +402,7 @@ class FamilyTradePlusCounterReq(BaseModel):
     exclude_trade_get_players: bool = True
 
     players_whitelist: Optional[List[str]] = None
-    players_blacklist: Optional[List[str]] = None  # NEW
+    players_blacklist: Optional[List[str]] = None
     scan_top_candidates: int = 0
     max_each: int = 60
     max_multiples_per_card: int = 3
@@ -436,8 +438,8 @@ class FamilySafeSellReq(BaseModel):
     holdings_fe_url: Optional[str] = None
     players_whitelist: Optional[List[str]] = None
     players_blacklist: Optional[List[str]] = None
-    include_top3: bool = False  # by default we only list players outside Top-3 (to avoid any QP loss)
-    min_distance_to_rank3: int = 6  # hide players that are within this many SP of entering Top-3
+    include_top3: bool = False
+    min_distance_to_rank3: int = 6
     exclude_accounts: Optional[List[Literal["Easystreet31","DusterCrusher","FinkleIsEinhorn"]]] = None
 
 class LeaderboardDeltaReq(BaseModel):
@@ -798,9 +800,11 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
 
     rows=[]; tot_sp=0; tot_buf=0
     for pl in sorted(touched):
-        sp_b = max(accounts_before.get(a, {}).get(pl, 0) for a in FAMILY_ACCOUNTS)
-        sp_a = max(cur.get(a, {}).get(pl, 0) for a in FAMILY_ACCOUNTS)
+        # --- FIX: family TOTAL SP (sum across family), not max ---
+        sp_b = sum(accounts_before.get(a, {}).get(pl, 0) for a in FAMILY_ACCOUNTS)
+        sp_a = sum(cur.get(a, {}).get(pl, 0) for a in FAMILY_ACCOUNTS)
         d_sp = sp_a - sp_b
+
         ctx_b = _rank_context_smallset(pl, leader, accounts_before)
         ctx_a = _rank_context_smallset(pl, leader, cur)
         r_b, r_a = ctx_b["best_rank"], ctx_a["best_rank"]
@@ -808,6 +812,7 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
         d_buf = (buf_a or 0) - (buf_b or 0) if (buf_b is not None or buf_a is not None) else None
         qp_b, qp_a = ctx_b["family_qp_player"], ctx_a["family_qp_player"]
         d_qp = qp_a - qp_b
+
         rows.append({
             "player": pl,
             "sp_before": int(sp_b), "sp_after": int(sp_a), "delta_sp": int(d_sp),
@@ -936,18 +941,16 @@ def family_safe_sell_report_by_urls(req: FamilySafeSellReq):
             if not _passes_lists(player, wl, bl): continue
 
             rows = _smallset_entries_for_player(player, leader, accounts)
-            if not rows:  # extremely rare
+            if not rows:
                 continue
             ordered, rank_by_key = _dedup_and_rank(rows)
             r, s = rank_by_key.get(_canon_user_strong(acct), (9999, 0))
-            # Skip Top-3 unless include_top3 is true (selling from Top-3 can cost QP)
             if not req.include_top3 and r <= 3:
                 continue
 
             third_sp = ordered[2][2] if len(ordered) > 2 else (ordered[1][2] if len(ordered) > 1 else 0)
             distance_to_rank3 = max((third_sp + 1) - s, 0)
 
-            # Hide players too close to a QP entry (within slider X)
             if distance_to_rank3 < int(req.min_distance_to_rank3):
                 continue
 
@@ -960,10 +963,8 @@ def family_safe_sell_report_by_urls(req: FamilySafeSellReq):
                 "distance_to_rank3": int(distance_to_rank3)
             })
 
-    # Sort by "safest" (furthest from Top-3), then by SP held, then name
     items.sort(key=lambda d: (-d["distance_to_rank3"], -d["sp_owned"], d["player"].lower()))
 
-    # Group by account for readability
     per_acct: Dict[str, List[Dict[str, Any]]] = {a: [] for a in FAMILY_ACCOUNTS}
     for it in items:
         per_acct[it["account"]].append(it)
