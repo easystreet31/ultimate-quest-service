@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = core_app
 
+# Wide-open CORS so Swagger, GPT Actions, and curl work from anywhere.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -13,4 +14,4 @@ app.add_middleware(
 
 @app.get("/info")
 def info():
-    return {"ok": True, "title": app.title, "version": app.version}
+    return {"ok": True, "title": getattr(app, "title", "Quest Service"), "version": getattr(app, "version", "unknown")}
