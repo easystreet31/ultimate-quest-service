@@ -2,29 +2,43 @@ services:
   - type: web
     name: ultimate-quest-service
     env: python
-    plan: pro   # <— avoid free plan resets
+    plan: pro
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      # Defaults you set in Render’s dashboard may remain there; these are safe to keep here too:
+
+      # === Default sheet links ===
       - key: DEFAULT_LEADERBOARD_URL
         value: https://docs.google.com/spreadsheets/d/1aRBznhcgaw8wCYaYAsdC14JxC3DwJJzB/export?format=xlsx
       - key: DEFAULT_LEADERBOARD_YDAY_URL
         value: https://docs.google.com/spreadsheets/d/1MRpJWiO9qBPuz5CGfLXgS8t4DWooyeN2/export?format=xlsx
+
       - key: DEFAULT_HOLDINGS_E31_URL
         value: https://docs.google.com/spreadsheets/d/1J3jf8c5M0oYbhStLLOS-ItRSAvOTvfkS5ggp0yl5XgY/export?format=xlsx
       - key: DEFAULT_HOLDINGS_DC_URL
         value: https://docs.google.com/spreadsheets/d/1OTGjLHXzMeYP7H0bzWtLQZ-3qRF1DXRSIvDzHVUcROM/export?format=xlsx
       - key: DEFAULT_HOLDINGS_FE_URL
         value: https://docs.google.com/spreadsheets/d/1qCvE5lN4LJsaG_bsCWaxJ1cYVSc3eSR7D2UKA6dLdHs/export?format=xlsx
+      - key: DEFAULT_HOLDINGS_UD_URL
+        value: https://docs.google.com/spreadsheets/d/REPLACE-HOLDINGS-UD/export?format=xlsx
+
       - key: DEFAULT_COLLECTION_E31_URL
         value: https://docs.google.com/spreadsheets/d/1C6sW2VTE0ezuPNxYv4l-lTJ_wGl1HE-7wBveTslVrUs/export?format=xlsx
       - key: DEFAULT_COLLECTION_DC_URL
         value: https://docs.google.com/spreadsheets/d/1_hx66ZDPOO6a2RVOOLbuaxqPknBomdDkkX2S4WLj7yg/export?format=xlsx
       - key: DEFAULT_COLLECTION_FE_URL
         value: https://docs.google.com/spreadsheets/d/1YAGAiyy9V7NdoUP0M2885pxOh_asWn3JPl9sjvjfqFk/export?format=xlsx
+      - key: DEFAULT_COLLECTION_UD_URL
+        value: https://docs.google.com/spreadsheets/d/REPLACE-COLLECTION-UD/export?format=xlsx
+
       - key: DEFAULT_POOL_COLLECTION_URL
         value: https://docs.google.com/spreadsheets/d/1tto_9aow568dSm-3Wqk-S-YaCh7tQg_UmFJEyIjL6DQ/export?format=xlsx
+
+      # === Player tag workbook (Legends/ANA/DAL/LAK/PIT) ===
+      - key: PLAYER_TAGS_URL
+        value: https://docs.google.com/spreadsheets/d/1vBhI26s97eoob1w1gd0IZlb0-z2m4m-aj5AhZkpqt9Q/export?format=xlsx
+
+      # === Behavior knobs (existing) ===
       - key: DEFAULT_TARGET_RIVALS
         value: chfkyle,Tfunite,FireRanger,VJV5,Erikk,tommyknockrs76
       - key: DEFAULT_DEFEND_BUFFER_ALL
@@ -33,5 +47,6 @@ services:
         value: trade_delta (strict; traded players only)
       - key: FORCE_FAMILY_URLS
         value: "true"
+
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
