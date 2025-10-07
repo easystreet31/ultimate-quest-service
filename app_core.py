@@ -23,10 +23,10 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-APP_VERSION = "4.10.0"
+APP_VERSION = "4.11.0"
 APP_TITLE = "Ultimate Quest Service (Small-Payload API)"
 
-FAMILY_ACCOUNTS = ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn"]
+FAMILY_ACCOUNTS = ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn", "UpperDuck"]
 
 # Soft compute budget (ms) — applies to greedy planners (not All‑In)
 EVAL_TIME_BUDGET_MS = int(os.getenv("EVAL_TIME_BUDGET_MS", "23000"))
@@ -42,6 +42,9 @@ DEFAULT_LINKS = {
     "collection_dc":  os.getenv("DEFAULT_COLLECTION_DC_URL", ""),
     "collection_fe":  os.getenv("DEFAULT_COLLECTION_FE_URL", ""),
     "pool_collection": os.getenv("DEFAULT_POOL_COLLECTION_URL", ""),
+    "holdings_ud": os.getenv("DEFAULT_HOLDINGS_UD_URL", ""),
+    "collection_ud": os.getenv("DEFAULT_COLLECTION_UD_URL", ""),
+    "player_tags": os.getenv("PLAYER_TAGS_URL", ""),
 }
 DEFAULT_RIVALS = [u.strip() for u in (os.getenv("DEFAULT_TARGET_RIVALS", "") or
                                       "chfkyle,Tfunite,FireRanger,VJV5,Erikk,tommyknockrs76").split(",") if u.strip()]
@@ -394,7 +397,8 @@ class FamilyEvaluateTradeReq(BaseModel):
     holdings_e31_url: Optional[str] = None
     holdings_dc_url: Optional[str] = None
     holdings_fe_url: Optional[str] = None
-    trade_account: Literal["Easystreet31","DusterCrusher","FinkleIsEinhorn"]
+    holdings_ud_url: Optional[str] = None
+    trade_account: Literal["Easystreet31","DusterCrusher","FinkleIsEinhorn","UpperDuck"]
     trade: List[TradeLine]
     multi_subject_rule: Literal["full_each_unique"] = "full_each_unique"
     fragility_mode: Literal["trade_delta","none"] = "trade_delta"
@@ -404,6 +408,7 @@ class FamilyEvaluateTradeReq(BaseModel):
         "FinkleIsEinhorn": DEFAULT_DEFEND_BUFFER
     })
     players_whitelist: Optional[List[str]] = None
+    player_tags_url: Optional[str] = None
 
 class FamilyTradePlusCounterReq(BaseModel):
     prefer_env_defaults: bool = True
@@ -411,8 +416,9 @@ class FamilyTradePlusCounterReq(BaseModel):
     holdings_e31_url: Optional[str] = None
     holdings_dc_url: Optional[str] = None
     holdings_fe_url: Optional[str] = None
+    holdings_ud_url: Optional[str] = None
     collection_pool_url: Optional[str] = None
-    trade_account: Literal["Easystreet31","DusterCrusher","FinkleIsEinhorn"]
+    trade_account: Literal["Easystreet31","DusterCrusher","FinkleIsEinhorn","UpperDuck"]
     trade: List[TradeLine]
     multi_subject_rule: Literal["full_each_unique"] = "full_each_unique"
     fragility_mode: Literal["trade_delta","none"] = "trade_delta"
@@ -430,6 +436,7 @@ class FamilyTradePlusCounterReq(BaseModel):
     counter_sp_target: Optional[int] = None
     counter_sp_mode: Literal["closest","at_least","at_most"] = "closest"
     counter_sp_tolerance: int = 0
+    player_tags_url: Optional[str] = None
 
 class FamilyCollectionReviewReq(BaseModel):
     prefer_env_defaults: bool = True
@@ -437,6 +444,7 @@ class FamilyCollectionReviewReq(BaseModel):
     holdings_e31_url: Optional[str] = None
     holdings_dc_url: Optional[str] = None
     holdings_fe_url: Optional[str] = None
+    holdings_ud_url: Optional[str] = None
     collection_pool_url: Optional[str] = None
     defend_buffers: Dict[str, int] = Field(default_factory=lambda: {
         "Easystreet31": DEFAULT_DEFEND_BUFFER,
@@ -448,6 +456,7 @@ class FamilyCollectionReviewReq(BaseModel):
     scan_top_candidates: int = 0
     max_each: int = 60
     max_multiples_per_card: int = 3
+    player_tags_url: Optional[str] = None
 
 class FamilyCollectionAllInReq(BaseModel):
     prefer_env_defaults: bool = True
@@ -455,6 +464,7 @@ class FamilyCollectionAllInReq(BaseModel):
     holdings_e31_url: Optional[str] = None
     holdings_dc_url: Optional[str] = None
     holdings_fe_url: Optional[str] = None
+    holdings_ud_url: Optional[str] = None
     collection_pool_url: Optional[str] = None
     defend_buffers: Dict[str, int] = Field(default_factory=lambda: {
         "Easystreet31": DEFAULT_DEFEND_BUFFER,
@@ -465,7 +475,8 @@ class FamilyCollectionAllInReq(BaseModel):
     players_blacklist: Optional[List[str]] = None
     # How to allocate the seller’s entire pool per player
     assign_mode: Literal["best_per_player","to_account"] = "best_per_player"
-    assign_to_account: Optional[Literal["Easystreet31","DusterCrusher","FinkleIsEinhorn"]] = None
+    assign_to_account: Optional[Literal["Easystreet31","DusterCrusher","FinkleIsEinhorn","UpperDuck"]] = None
+    player_tags_url: Optional[str] = None
 
 class FamilySafeSellReq(BaseModel):
     prefer_env_defaults: bool = True
@@ -473,11 +484,13 @@ class FamilySafeSellReq(BaseModel):
     holdings_e31_url: Optional[str] = None
     holdings_dc_url: Optional[str] = None
     holdings_fe_url: Optional[str] = None
+    holdings_ud_url: Optional[str] = None
     players_whitelist: Optional[List[str]] = None
     players_blacklist: Optional[List[str]] = None
     include_top3: bool = False
     min_distance_to_rank3: int = 6
-    exclude_accounts: Optional[List[Literal["Easystreet31","DusterCrusher","FinkleIsEinhorn"]]] = None
+    exclude_accounts: Optional[List[Literal["Easystreet31","DusterCrusher","FinkleIsEinhorn","UpperDuck"]]] = None
+    player_tags_url: Optional[str] = None
 
 class LeaderboardDeltaReq(BaseModel):
     leaderboard_today_url: str
@@ -491,6 +504,7 @@ class LeaderboardDeltaEnvReq(BaseModel):
     leaderboard_yesterday_url: Optional[str] = None
     rivals: Optional[List[str]] = None
     min_sp_delta: int = 1
+    player_tags_url: Optional[str] = None
 
 class FamilyFragileWhitelistReq(BaseModel):
     prefer_env_defaults: bool = True
@@ -498,6 +512,7 @@ class FamilyFragileWhitelistReq(BaseModel):
     holdings_e31_url: Optional[str] = None
     holdings_dc_url: Optional[str] = None
     holdings_fe_url: Optional[str] = None
+    holdings_ud_url: Optional[str] = None
     defend_buffers: Dict[str, int] = Field(default_factory=lambda: {
         "Easystreet31": DEFAULT_DEFEND_BUFFER,
         "DusterCrusher": DEFAULT_DEFEND_BUFFER,
@@ -506,6 +521,7 @@ class FamilyFragileWhitelistReq(BaseModel):
     include_firsts: bool = True
     include_seconds: bool = True
     limit: int = 120
+    player_tags_url: Optional[str] = None
 
 # ---------- Helpers ----------
 def _lb_family_sp_for(leader: Dict[str, List[Dict[str, Any]]], player: str, acct: str) -> int:
@@ -515,10 +531,62 @@ def _lb_family_sp_for(leader: Dict[str, List[Dict[str, Any]]], player: str, acct
             return _as_int(e["sp"])
     return 0
 
+
+# ---------- Player tag loader (Legends/ANA/DAL/LAK/PIT) ----------
+def _norm_name(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[\.\'`’]", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def load_player_tags(url: Optional[str]) -> Dict[str, Set[str]]:
+    tags = {"LEGENDS": set(), "ANA": set(), "DAL": set(), "LAK": set(), "PIT": set()}
+    if not url:
+        url = DEFAULT_LINKS.get("player_tags") or ""
+    if not url:
+        return tags
+    try:
+        sheets = fetch_xlsx(url)
+        for tab, key in [("Legends","LEGENDS"),("ANA","ANA"),("DAL","DAL"),("LAK","LAK"),("PIT","PIT")]:
+            df = sheets.get(tab)
+            if df is not None and not df.empty:
+                col0 = df.columns[0]
+                for val in df[col0].dropna().astype(str).tolist():
+                    tags[key].add(_norm_name(val))
+        return tags
+    except Exception as e:
+        # Best-effort: if fetch fails, return empty sets (routing falls back to defaults)
+        return tags
+
+def _wingnut_sp_for(leader, player: str) -> int:
+    for e in leader.get(player, []):
+        if _canon_user_strong(str(e.get("user",""))) == _canon_user_strong("Wingnut84"):
+            return _as_int(e.get("sp",0))
+    return 0
+
+def candidate_accounts_for(player: str, leader, accounts_now, tags: Dict[str, Set[str]]) -> List[str]:
+    p = _norm_name(player)
+    # Legend → FE under Wingnut with strict cap; overflow to DC
+    if p in tags.get("LEGENDS", set()):
+        fe_sp = int(accounts_now.get("FinkleIsEinhorn", {}).get(player, 0))
+        wing_sp = _wingnut_sp_for(leader, player)
+        headroom = max((wing_sp - 1) - fe_sp, 0)  # never reach Wingnut
+        if headroom > 0:
+            return ["FinkleIsEinhorn", "DusterCrusher"]  # prefer FE, overflow to DC
+        else:
+            return ["DusterCrusher", "Easystreet31"]     # FE capped; overflow priorities
+    # Teams to DC/UD
+    if p in tags.get("ANA", set()):
+        return ["UpperDuck", "Easystreet31"]
+    if (p in tags.get("DAL", set())) or (p in tags.get("LAK", set())) or (p in tags.get("PIT", set())):
+        return ["DusterCrusher", "Easystreet31"]
+    # Default
+    return ["Easystreet31","DusterCrusher","FinkleIsEinhorn","UpperDuck","UpperDuck"]
 # ---------- Trade simulation (improved GET allocation) ----------
 def _simulate_family_trade_allocation(leader, accounts_in: Dict[str, Dict[str, int]],
                                       trade: List[TradeLine]) -> Tuple[Dict[str, Dict[str, int]], List[Dict[str, Any]]]:
     cur = {a: dict(v) for a, v in accounts_in.items()}
+    tags = load_player_tags(None)  # uses DEFAULT_LINKS.player_tags if set
     fam_base, _, _ = compute_family_qp(leader, cur)
     alloc_plan: List[Dict[str, Any]] = []
 
@@ -628,6 +696,7 @@ def _plan_collection_buys_greedy(
     budget_target: Optional[int] = None, budget_mode: str = "closest", budget_tolerance: int = 0
 ):
     start = time.monotonic()
+    tags = load_player_tags(None)
     def over_budget_time() -> bool:
         return (time.monotonic() - start) * 1000.0 > EVAL_TIME_BUDGET_MS
 
@@ -675,7 +744,7 @@ def _plan_collection_buys_greedy(
             avail = min(max(qty - used[idx], 0), max_multiples_per_card)
             if avail <= 0: continue
 
-            for acct in FAMILY_ACCOUNTS:
+            for acct in candidate_accounts_for(players[0], leader, accounts_now, tags):
                 t_candidates = _candidate_t_values(acct, players, sp, avail, leader, accounts_now, defend_buffers)
                 for t in t_candidates:
                     if over_budget_time(): break
@@ -920,7 +989,7 @@ def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
     ))
 
     leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
-    accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
+    accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults, req.holdings_ud_url)
 
     cur, _ = _simulate_family_trade_allocation(leader, accounts, req.trade)
     for line in [l for l in req.trade if l.side == "GIVE"]:
@@ -947,7 +1016,7 @@ def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
 @app.post("/family_collection_review_by_urls")
 def family_collection_review_by_urls(req: FamilyCollectionReviewReq):
     leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
-    accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
+    accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults, req.holdings_ud_url)
     pool_df  = parse_collection_pool(req.prefer_env_defaults, req.collection_pool_url)
     review = _plan_collection_buys_greedy(
         leader, accounts, pool_df, req.defend_buffers, req.scan_top_candidates, req.max_each, req.max_multiples_per_card,
@@ -959,7 +1028,7 @@ def family_collection_review_by_urls(req: FamilyCollectionReviewReq):
 @app.post("/family_collection_all_in_by_urls")
 def family_collection_all_in_by_urls(req: FamilyCollectionAllInReq):
     leader   = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
-    accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
+    accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults, req.holdings_ud_url)
     pool_df  = parse_collection_pool(req.prefer_env_defaults, req.collection_pool_url)
 
     wl = set([(p or "").lower() for p in (req.players_whitelist or [])])
@@ -1077,7 +1146,7 @@ def family_collection_all_in_by_urls(req: FamilyCollectionAllInReq):
 @app.post("/family_safe_sell_report_by_urls")
 def family_safe_sell_report_by_urls(req: FamilySafeSellReq):
     leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
-    accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
+    accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults, req.holdings_ud_url)
 
     wl = set([(p or "").lower() for p in (req.players_whitelist or [])])
     bl = set([(p or "").lower() for p in (req.players_blacklist or [])])
@@ -1186,7 +1255,7 @@ def leaderboard_delta(req: LeaderboardDeltaEnvReq):
 @app.post("/family_fragile_whitelist_by_urls")
 def family_fragile_whitelist_by_urls(req: FamilyFragileWhitelistReq):
     leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
-    accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults)
+    accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults, req.holdings_ud_url)
 
     fragile_firsts: List[Dict[str, Any]] = []
     fragile_seconds: List[Dict[str, Any]] = []
