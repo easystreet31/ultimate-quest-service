@@ -1,9 +1,12 @@
 from app_core import app as core_app
 from fastapi.middleware.cors import CORSMiddleware
 
+# Import our routing middleware
+from baseline_gets_filter import BaselineGetsFilter
+
 app = core_app
 
-# Wide-open CORS so Swagger, GPT Actions, and curl work from anywhere.
+# CORS for swagger, GPT actions, curl, etc.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -12,6 +15,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add the post-routing middleware for evaluate endpoint
+app.add_middleware(BaselineGetsFilter)
+
 @app.get("/info")
 def info():
-    return {"ok": True, "title": getattr(app, "title", "Quest Service"), "version": getattr(app, "version", "unknown")}
+    return {
+        "ok": True,
+        "title": getattr(app, "title", "Quest Service"),
+        "version": getattr(app, "version", "unknown")
+    }
