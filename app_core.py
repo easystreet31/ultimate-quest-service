@@ -32,20 +32,20 @@ FAMILY_ACCOUNTS = ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn", "UpperDuc
 EVAL_TIME_BUDGET_MS = int(os.getenv("EVAL_TIME_BUDGET_MS", "23000"))
 
 # ---------- Defaults (ENV) ----------
+# ---------- Defaults (ENV) ----------
 DEFAULT_LINKS = {
     "leaderboard": os.getenv("DEFAULT_LEADERBOARD_URL", ""),
     "leaderboard_yday": os.getenv("DEFAULT_LEADERBOARD_YDAY_URL", ""),
     "holdings_e31": os.getenv("DEFAULT_HOLDINGS_E31_URL", ""),
     "holdings_dc":  os.getenv("DEFAULT_HOLDINGS_DC_URL", ""),
     "holdings_fe":  os.getenv("DEFAULT_HOLDINGS_FE_URL", ""),
+    "holdings_ud":  os.getenv("DEFAULT_HOLDINGS_UD_URL", ""),
     "collection_e31": os.getenv("DEFAULT_COLLECTION_E31_URL", ""),
     "collection_dc":  os.getenv("DEFAULT_COLLECTION_DC_URL", ""),
     "collection_fe":  os.getenv("DEFAULT_COLLECTION_FE_URL", ""),
+    "collection_ud":  os.getenv("DEFAULT_COLLECTION_UD_URL", ""),
     "pool_collection": os.getenv("DEFAULT_POOL_COLLECTION_URL", ""),
-,
-    "holdings_ud": os.getenv("DEFAULT_HOLDINGS_UD_URL", ""),
-    "collection_ud": os.getenv("DEFAULT_COLLECTION_UD_URL", ""),
-    "player_tags": os.getenv("PLAYER_TAGS_URL", "")
+    "player_tags": os.getenv("PLAYER_TAGS_URL", ""),
 }
 DEFAULT_RIVALS = [u.strip() for u in (os.getenv("DEFAULT_TARGET_RIVALS", "") or
                                       "chfkyle,Tfunite,FireRanger,VJV5,Erikk,tommyknockrs76").split(",") if u.strip()]
