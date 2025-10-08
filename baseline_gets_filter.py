@@ -182,6 +182,10 @@ class BaselineGetsFilter(BaseHTTPMiddleware):
         response = await call_next(request)
 
         # Only adjust evaluate route JSON
+        # Feature flag: optionally disable middleware re-routing (backend now enforces routing)
+        if (os.getenv('EVALUATE_MIDDLEWARE_REROUTE','false').lower() not in ('1','true','yes')):
+            return response
+
         path = request.url.path
         method = request.method.upper()
         content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
