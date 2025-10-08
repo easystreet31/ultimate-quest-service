@@ -2,7 +2,6 @@ import os
 from app_core import app as core_app
 from fastapi.middleware.cors import CORSMiddleware
 
-# Import our routing middleware
 from baseline_gets_filter import BaselineGetsFilter
 
 app = core_app
@@ -16,9 +15,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Only add the post-routing middleware if enabled via env flag
-if str(os.getenv("EVALUATE_MIDDLEWARE_REROUTE", "false")).lower() in ("1", "true", "yes", "y", "on"):
-    app.add_middleware(BaselineGetsFilter)
+# You can add unconditionally; the middleware itself checks the env and no-ops if disabled.
+app.add_middleware(BaselineGetsFilter)
 
 @app.get("/info")
 def info():
@@ -26,4 +24,5 @@ def info():
         "ok": True,
         "title": getattr(app, "title", "Quest Service"),
         "version": getattr(app, "version", "unknown"),
+        "middleware_reroute_enabled": str(os.getenv("EVALUATE_MIDDLEWARE_REROUTE", "")).lower() in ("1","true","yes","y","on"),
     }
