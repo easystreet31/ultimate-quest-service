@@ -23,7 +23,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-APP_VERSION = "4.11.1"
+APP_VERSION = "4.12.0"
 APP_TITLE = "Ultimate Quest Service (Small-Payload API)"
 
 FAMILY_ACCOUNTS = ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn", "UpperDuck"]
@@ -48,7 +48,7 @@ DEFAULT_LINKS = {
     "player_tags": os.getenv("PLAYER_TAGS_URL", ""),
 }
 DEFAULT_RIVALS = [u.strip() for u in (os.getenv("DEFAULT_TARGET_RIVALS", "") or
-                                      "chfkyle,Tfunite,FireRanger,VJV5,Erikk,tommyknockrs76").split(",") if u.strip()]
+                                      "chfkyle,VjV5,FireRanger,Tfunite,Ovi8").split(",") if u.strip()]
 DEFAULT_DEFEND_BUFFER = int(os.getenv("DEFAULT_DEFEND_BUFFER_ALL", "15"))
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
@@ -575,30 +575,51 @@ def _wingnut_headroom_for_player(player: str, leader, accounts_map: Dict[str, Di
                  int(accounts_map.get("FinkleIsEinhorn", {}).get(player, 0)))
     return max((wing - 1) - fe_eff, 0)
 
+
 def _allowed_accounts_order(players: List[str], leader, accounts_map: Dict[str, Dict[str,int]], tags: Dict[str, Set[str]]) -> List[str]:
-    prefs_per_player = []
+    """
+    Return a preference-ordered list of family accounts for routing a GET covering `players`.
+    Priority:
+      - Legends: FE if headroom to trail Wingnut84; else FE last (overflow path)
+      - ANA: UD
+      - DAL/LAK/PIT: DC
+      - No tag: highest-current family holder first (per player), then the rest
+    For multi-player lines, preferences are aggregated across players by summing list positions.
+    """
+    prefs_per_player: List[List[str]] = []
     for p in players:
         p2 = _norm_player(p)
-        if p2 in tags.get("LEGENDS", set()):
+        if p2 in (tags.get("LEGENDS", set()) if tags else set()):
             head = _wingnut_headroom_for_player(p2, leader, accounts_map)
             if head > 0:
                 prefs = ["FinkleIsEinhorn","DusterCrusher","Easystreet31","UpperDuck"]
             else:
+                # FE cannot take if it would pass Wingnut84 — push FE to the end (overflow)
                 prefs = ["DusterCrusher","Easystreet31","UpperDuck","FinkleIsEinhorn"]
-        elif p2 in tags.get("ANA", set()):
+        elif p2 in (tags.get("ANA", set()) if tags else set()):
             prefs = ["UpperDuck","Easystreet31","DusterCrusher","FinkleIsEinhorn"]
-        elif p2 in tags.get("DAL", set()) or p2 in tags.get("LAK", set()) or p2 in tags.get("PIT", set()):
+        elif (p2 in (tags.get("DAL", set()) if tags else set())
+              or p2 in (tags.get("LAK", set()) if tags else set())
+              or p2 in (tags.get("PIT", set()) if tags else set())):
             prefs = ["DusterCrusher","Easystreet31","FinkleIsEinhorn","UpperDuck"]
         else:
-            prefs = ["Easystreet31","DusterCrusher","FinkleIsEinhorn","UpperDuck"]
+            # Fallback: prefer the current best family holder for this player
+            best_acct, best_sp = None, -1
+            for a in FAMILY_ACCOUNTS:
+                s = int(accounts_map.get(a, {}).get(p2, 0))
+                if s > best_sp:
+                    best_acct, best_sp = a, s
+            if best_acct is None:
+                prefs = FAMILY_ACCOUNTS[:]
+            else:
+                prefs = [best_acct] + [a for a in FAMILY_ACCOUNTS if a != best_acct]
         prefs_per_player.append(prefs)
+
     scores = {a: 0 for a in FAMILY_ACCOUNTS}
     for prefs in prefs_per_player:
         for idx, a in enumerate(prefs):
             scores[a] += idx
     return sorted(FAMILY_ACCOUNTS, key=lambda a: (scores.get(a, 9999), FAMILY_ACCOUNTS.index(a)))
-
-# ---------- Trade simulation (improved GET allocation) ----------
 def _simulate_family_trade_allocation(leader, accounts_in: Dict[str, Dict[str, int]],
                                       trade: List[TradeLine], tags: Optional[Dict[str, Set[str]]] = None) -> Tuple[Dict[str, Dict[str, int]], List[Dict[str, Any]]]:
     cur = {a: dict(v) for a, v in accounts_in.items()}
@@ -617,7 +638,19 @@ def _simulate_family_trade_allocation(leader, accounts_in: Dict[str, Dict[str, i
         if not players or line.sp <= 0:
             continue
         best_tuple = None; best_snapshot = None; best_meta = None
-        for acct in FAMILY_ACCOUNTS:
+        
+        # Candidate accounts based on tags/rolebook (tags-first; else best-current-holder fallback)
+        order = _allowed_accounts_order(players, leader, cur, tags or {"LEGENDS":set(),"ANA":set(),"DAL":set(),"LAK":set(),"PIT":set()})
+        # Detect if any player in this line carries a tag
+        has_tag = any((_norm_player(p) in (tags or {}).get("LEGENDS", set()) or
+                       _norm_player(p) in (tags or {}).get("ANA", set()) or
+                       _norm_player(p) in (tags or {}).get("DAL", set()) or
+                       _norm_player(p) in (tags or {}).get("LAK", set()) or
+                       _norm_player(p) in (tags or {}).get("PIT", set()))
+                       for p in players)
+        acct_candidates = [order[0]] if (order and has_tag) else (order or FAMILY_ACCOUNTS)
+        for acct in acct_candidates:
+
             sim = {a: dict(v) for a, v in cur.items()}
             for p in _unique_preserve(players):
                 sim[acct][p] = sim[acct].get(p, 0) + line.sp
@@ -640,6 +673,7 @@ def _simulate_family_trade_allocation(leader, accounts_in: Dict[str, Dict[str, i
             if (best_tuple is None) or (score > best_tuple):
                 best_tuple, best_snapshot = score, sim
                 best_meta = {"to": acct, "players": players, "sp": int(line.sp), "family_qp_gain": int(fam_gain),
+                             "routing_trace": {"policy": ("tag_first" if has_tag else "best_holder_fallback"), "order": order},
                              "score_breakdown": {"buffer_gain": int(sum_buf_gain),
                                                  "rank_gain": int(sum_rank_gain),
                                                  "keep_holder_votes": int(keep_holder_votes)}}
@@ -932,7 +966,7 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
         hold_b = {a: int(accounts_before.get(a, {}).get(pl, 0)) for a in FAMILY_ACCOUNTS}
         eff_b = {a: max(lb_base[a], hold_b[a]) for a in FAMILY_ACCOUNTS}
         eff_a = {a: eff_b[a] + d_by_acct[a] for a in FAMILY_ACCOUNTS}
-        sp_b = sum(eff_b.values()); sp_a = sum(eff_a.values()); d_sp = sp_a - sp_b
+        sp_b = sum(eff_b.values()); sp_a = sp_b + int(inc_sp); d_sp = int(inc_sp)
         eff_before_map = {a: {pl: eff_b[a]} for a in FAMILY_ACCOUNTS}
         eff_after_map  = {a: {pl: eff_a[a]} for a in FAMILY_ACCOUNTS}
         ctx_b = _rank_context_smallset(pl, leader, eff_before_map)
@@ -1009,7 +1043,7 @@ def family_trade_plus_counter_by_urls(req: FamilyTradePlusCounterReq):
     leader = normalize_leaderboard(fetch_xlsx(_pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)))
     accounts = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url, req.prefer_env_defaults, req.holdings_ud_url)
 
-    cur, _ = _simulate_family_trade_allocation(leader, accounts, req.trade)
+    cur, _ = _simulate_family_trade_allocation(leader, accounts, req.trade, tags_map)
     for line in [l for l in req.trade if l.side == "GIVE"]:
         players = split_multi_subject_players(line.players)
         if not players or line.sp <= 0: continue
@@ -1125,7 +1159,7 @@ def family_collection_all_in_by_urls(req: FamilyCollectionAllInReq):
         if inc_sp <= 0: continue
         eff_b = _eff_map(player, accounts)
         eff_a = _eff_map(player, accounts_after)
-        sp_b = sum(eff_b.values()); sp_a = sum(eff_a.values()); d_sp = sp_a - sp_b
+        sp_b = sum(eff_b.values()); sp_a = sp_b + int(inc_sp); d_sp = int(inc_sp)
 
         ctx_b = _rank_context_smallset(player, leader, {a: {player: eff_b.get(a,0)} for a in FAMILY_ACCOUNTS})
         ctx_a = _rank_context_smallset(player, leader, {a: {player: eff_a.get(a,0)} for a in FAMILY_ACCOUNTS})
