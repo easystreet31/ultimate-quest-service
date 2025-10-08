@@ -1,12 +1,11 @@
 import os
 from app_core import app as core_app
 from fastapi.middleware.cors import CORSMiddleware
-
 from baseline_gets_filter import BaselineGetsFilter
 
 app = core_app
 
-# CORS for swagger, GPT actions, curl, etc.
+# CORS for swagger, curl, etc.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,7 +14,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# You can add unconditionally; the middleware itself checks the env and no-ops if disabled.
+# Safe JSON middleware (sanitizes NaN/Inf -> null, fixes content-length)
+# It runs only when EVALUATE_MIDDLEWARE_REROUTE is truthy.
 app.add_middleware(BaselineGetsFilter)
 
 @app.get("/info")
