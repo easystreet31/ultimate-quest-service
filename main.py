@@ -1,3 +1,4 @@
+import os
 from app_core import app as core_app
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -15,13 +16,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Add the post-routing middleware for evaluate endpoint
-app.add_middleware(BaselineGetsFilter)
+# Only add the post-routing middleware if enabled via env flag
+if str(os.getenv("EVALUATE_MIDDLEWARE_REROUTE", "false")).lower() in ("1", "true", "yes", "y", "on"):
+    app.add_middleware(BaselineGetsFilter)
 
 @app.get("/info")
 def info():
     return {
         "ok": True,
         "title": getattr(app, "title", "Quest Service"),
-        "version": getattr(app, "version", "unknown")
+        "version": getattr(app, "version", "unknown"),
     }
