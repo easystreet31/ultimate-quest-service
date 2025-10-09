@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field, validator
 
 app = FastAPI(
     title="Ultimate Quest Service (Small-Payload API)",
-    version=os.getenv("APP_VERSION", "4.12.3"),
+    version=os.getenv("APP_VERSION", "4.12.4"),
 )
 
 # --------------------------------------------------------------------------------------
@@ -69,7 +69,7 @@ class FamilyEvaluateTradeReq(BaseModel):
         return v
 
 # --------------------------------------------------------------------------------------
-# /defaults  (simple env projection used by clients)
+# /defaults (simple env projection used by clients)
 # --------------------------------------------------------------------------------------
 
 def _env(k: str, default: t.Optional[str] = None) -> t.Optional[str]:
@@ -98,7 +98,7 @@ def defaults():
         "rivals": list(SYNDICATE),
         "defend_buffer_all": int(os.getenv("DEFAULT_DEFEND_BUFFER_ALL", "15")),
         "fragility_default": os.getenv("TRADE_FRAGILITY_DEFAULT", "trade_delta"),
-        "force_family_urls": os.getenv("FORCE_FAMILY_URLS", "true").lower() in ("1","true","yes","y","on"),
+        "force_family_urls": os.getenv("FORCE_FAMILY_URLS", "true").lower() in ("1", "true", "yes", "y", "on"),
     }
 
 # --------------------------------------------------------------------------------------
@@ -193,9 +193,9 @@ def normalize_leaderboard(sheets: t.Dict[str, pd.DataFrame]) -> _Leader:
     name = next(iter(sheets))
     df = sheets[name].copy()
 
-    col_player = _detect_col(df, ["player", "players", "subject", "name"])
+    col_player  = _detect_col(df, ["player", "players", "subject", "name"])
     col_account = _detect_col(df, ["account", "username", "user", "owner", "handle"])
-    col_sp = _detect_col(df, ["sp", "score", "points"])
+    col_sp      = _detect_col(df, ["sp", "score", "points"])
 
     col_qp = None
     for cand in ("qp", "quest", "quest_points"):
@@ -211,13 +211,13 @@ def normalize_leaderboard(sheets: t.Dict[str, pd.DataFrame]) -> _Leader:
         except KeyError:
             continue
 
-    df[col_player] = df[col_player].map(_norm_name)
+    df[col_player]  = df[col_player].map(_norm_name)
     df[col_account] = df[col_account].map(_norm_name)
-    df[col_sp] = pd.to_numeric(df[col_sp], errors="coerce").fillna(0).astype(int)
+    df[col_sp]      = pd.to_numeric(df[col_sp], errors="coerce").fillna(0).astype(int)
     if col_qp:
-        df[col_qp] = pd.to_numeric(df[col_qp], errors="coerce").fillna(0).astype(int)
+        df[col_qp]  = pd.to_numeric(df[col_qp], errors="coerce").fillna(0).astype(int)
     if col_rank:
-        df[col_rank] = pd.to_numeric(df[col_rank], errors="coerce").fillna(0).astype(int)
+        df[col_rank]= pd.to_numeric(df[col_rank], errors="coerce").fillna(0).astype(int)
 
     by_player: t.Dict[str, t.List[_Row]] = defaultdict(list)
     sp_map: t.Dict[str, t.Dict[str, int]] = defaultdict(dict)
@@ -329,7 +329,7 @@ def _rank_and_buffer_full_leader(
 
     best_nonfamily_sp = 0
     for acc, v in combined.items():
-        if acc in _FAMILY_KEYS:  # skip family
+        if acc in _FAMILY_KEYS:
             continue
         best_nonfamily_sp = max(best_nonfamily_sp, int(v))
 
@@ -344,12 +344,14 @@ def _rank_context_smallset(player: str, leader: "_Leader", eff_map: t.Dict[str, 
     qp = 1 if (r is not None and r == 1) else 0
     return {"family_qp_player": qp, "rank": r}
 
-def compute_family_qp(leader: "_Leader", accounts: t.Dict[str, t.Dict[str, int]]) -> t.Tuple[int, t.Dict[str, int], t.Dict[str, t.Any]]:
+def compute_family_qp(
+    leader: "_Leader", accounts: t.Dict[str, t.Dict[str, int]]
+) -> t.Tuple[int, t.Dict[str, int], t.Dict[str, t.Any]]:
     """
     Leaderboard-QP semantics:
       Sum the leaderboard 'qp' for all rows where the account belongs to the family.
-      (This is stable across short simulations; evaluate deltas remain 0 unless the
-      leaderboard changes.)
+      (This mirrors the earlier probe that showed a large family total; deltas in
+       evaluate will typically remain 0 unless the leaderboard itself changes.)
     """
     total_qp = 0
     per_acct_qp = {a: 0 for a in FAMILY_ACCOUNTS}
@@ -360,10 +362,10 @@ def compute_family_qp(leader: "_Leader", accounts: t.Dict[str, t.Dict[str, int]]
             qp = int(r.get("qp") or 0)
             if acc in _FAMILY_KEYS:
                 total_qp += qp
-                # Map lowercase back to display name by membership
-                for display in FAMILY_ACCOUNTS:
-                    if display.lower() == acc:
-                        per_acct_qp[display] += qp
+                # attribute to display name (case-insensitive)
+                for disp in FAMILY_ACCOUNTS:
+                    if disp.lower() == acc:
+                        per_acct_qp[disp] += qp
                         break
 
     details: t.Dict[str, t.Any] = {"source": "leaderboard_qp_sum", "per_account_qp": per_acct_qp}
