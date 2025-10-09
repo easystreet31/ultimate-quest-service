@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, validator
 
 app = FastAPI(
     title="Ultimate Quest Service (Small-Payload API)",
-    version=os.getenv("APP_VERSION", "4.12.10"),
+    version=os.getenv("APP_VERSION", "4.12.11"),
 )
 
 # ======================================================================================
@@ -56,7 +56,7 @@ SYNDICATE: t.Set[str] = set(
 )
 
 # ======================================================================================
-# Models that other modules import/use
+# Models used elsewhere
 # ======================================================================================
 
 class TradeLine(BaseModel):
@@ -200,15 +200,16 @@ def _detect_col_qp(df: pd.DataFrame) -> t.Optional[str]:
 # ======================================================================================
 
 class _Row(t.TypedDict, total=False):
-    account: str
+    account: str       # canonical key
     sp: int
     qp: int
     rank: t.Optional[int]
 
 class _Leader(t.TypedDict):
     by_player: t.Dict[str, t.List[_Row]]
-    sp_map: t.Dict[str, t.Dict[str, int]]
-    display_names: t.Dict[str, str]
+    sp_map: t.Dict[str, t.Dict[str, int]]          # player -> {account_canon: sp}
+    display_names: t.Dict[str, str]                # player_key -> display player name
+    account_display: t.Dict[str, str]              # account_canon -> display username
 
 def normalize_leaderboard(sheets: t.Dict[str, pd.DataFrame]) -> _Leader:
     name = next(iter(sheets))
@@ -236,21 +237,31 @@ def normalize_leaderboard(sheets: t.Dict[str, pd.DataFrame]) -> _Leader:
 
     by_player: t.Dict[str, t.List[_Row]] = defaultdict(list)
     sp_map: t.Dict[str, t.Dict[str, int]] = defaultdict(dict)
-    display: t.Dict[str, str] = {}
+    display_player: t.Dict[str, str] = {}
+    account_display: t.Dict[str, str] = {}
 
     for _, r in df.iterrows():
         disp_p = _norm_name(r[col_player])
         p = _norm_key(disp_p)
-        a_canon = _canon_key(r[col_account])
+        acc_disp = _norm_name(r[col_account])
+        acc_canon = _canon_key(acc_disp)
         sp = int(r[col_sp]) if pd.notna(r[col_sp]) else 0
         qp = int(r[col_qp]) if col_qp and pd.notna(r[col_qp]) else 0
         rk = int(r[col_rank]) if col_rank and pd.notna(r[col_rank]) else None
-        display.setdefault(p, disp_p)
-        by_player[p].append(_Row(account=a_canon, sp=sp, qp=qp, rank=rk))
-        prev = int(sp_map[p].get(a_canon, 0))
-        sp_map[p][a_canon] = max(prev, sp)
 
-    return t.cast(_Leader, {"by_player": dict(by_player), "sp_map": dict(sp_map), "display_names": display})
+        display_player.setdefault(p, disp_p)
+        account_display.setdefault(acc_canon, acc_disp)
+
+        by_player[p].append(_Row(account=acc_canon, sp=sp, qp=qp, rank=rk))
+        prev = int(sp_map[p].get(acc_canon, 0))
+        sp_map[p][acc_canon] = max(prev, sp)
+
+    return t.cast(_Leader, {
+        "by_player": dict(by_player),
+        "sp_map": dict(sp_map),
+        "display_names": display_player,
+        "account_display": account_display,
+    })
 
 # ======================================================================================
 # Holdings & player tags
@@ -363,12 +374,6 @@ def _rank_and_buffer_full_leader(player: str, leader: "_Leader", family_eff: t.D
     buffer = fam_best_sp - best_nonfamily_sp
     return rank, buffer, fam_best_acct_disp, fam_best_sp
 
-def _rank_context_smallset(player: str, leader: "_Leader", eff_map: t.Dict[str, t.Dict[str, int]]) -> t.Dict[str, t.Any]:
-    fam_eff = {a: int(eff_map.get(a, {}).get(player, 0)) for a in FAMILY_ACCOUNTS}
-    r, _buf, _acct, _sp = _rank_and_buffer_full_leader(player, leader, fam_eff)
-    qp = 1 if (r is not None and r == 1) else 0
-    return {"family_qp_player": qp, "rank": r}
-
 def compute_family_qp(
     leader: "_Leader", accounts: t.Dict[str, t.Dict[str, int]]
 ) -> t.Tuple[int, t.Dict[str, int], t.Dict[str, t.Any]]:
@@ -430,7 +435,7 @@ def compute_family_qp(
     return int(derived_total), derived_per_acct, details
 
 # ======================================================================================
-# Leaderboard Delta — JSON + Export
+# Leaderboard Delta — core + JSON + Export
 # ======================================================================================
 
 def _delta_rows(today: "_Leader", yday: "_Leader",
@@ -460,6 +465,7 @@ def _delta_rows(today: "_Leader", yday: "_Leader",
             continue
         rows.append({
             "player": disp,
+            "player_key": p,
             "family_before": {"account": a1, "sp": sp1, "rank": r1, "buffer": b1},
             "family_after":  {"account": a2, "sp": sp2, "rank": r2, "buffer": b2},
             "delta_sp": d_sp,
@@ -513,6 +519,48 @@ def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
         "players": rows[:MAX_JSON_ROWS]
     }
 
+# ---------- helpers for per-account movement lists (display names) ----------
+
+def _per_account_movement_lists(
+    player_key: str,
+    today: _Leader,
+    yday: _Leader,
+    rivals_canon: t.Set[str]
+) -> t.Tuple[str, str]:
+    """
+    Return (accounts_gained, accounts_lost) as display-name lists with deltas,
+    e.g. "userA(+7); userB(+3)" and "userC(-5)".
+    """
+    t_map = today["sp_map"].get(player_key, {})
+    y_map = yday["sp_map"].get(player_key, {})
+    acc_disp = today["account_display"] or {}
+    # include any display name only known yesterday
+    for k, v in yday["account_display"].items():
+        acc_disp.setdefault(k, v)
+
+    all_acc = set(t_map.keys()) | set(y_map.keys())
+    gains: t.List[t.Tuple[int, str]] = []
+    losses: t.List[t.Tuple[int, str]] = []
+
+    for a in all_acc:
+        before = int(y_map.get(a, 0))
+        after = int(t_map.get(a, 0))
+        d = after - before
+        if d == 0:
+            continue
+        name = acc_disp.get(a) or _FAMILY_CANON_TO_DISPLAY.get(a) or a
+        if d > 0:
+            gains.append((d, f"{name}(+{d})"))
+        else:
+            losses.append((-d, f"{name}(-{abs(d)})"))
+
+    # sort by magnitude desc, then name
+    gains.sort(key=lambda x: (-x[0], x[1].lower()))
+    losses.sort(key=lambda x: (-x[0], x[1].lower()))
+    return "; ".join(g for _, g in gains), "; ".join(l for _, l in losses)
+
+# ---------- export (CSV/XLSX) with accounts_gained / accounts_lost ----------
+
 @app.get("/leaderboard_delta_export")
 def leaderboard_delta_export(
     prefer_env_defaults: bool = Query(True),
@@ -540,10 +588,13 @@ def leaderboard_delta_export(
     rivals_canon: t.Set[str] = set(_canon_key(_strip_user_suffix(r)) for r in rival_list)
     rows = _delta_rows(today, yday, rivals_canon, min_sp_delta)
 
-    # Flatten for table
+    # Flatten for table and add per-account movement display lists
     flat = []
     for r in rows:
         fb = r["family_before"]; fa = r["family_after"]
+        pkey = r["player_key"]
+        acc_gain_str, acc_loss_str = _per_account_movement_lists(pkey, today, yday, rivals_canon)
+
         flat.append({
             "player": r["player"],
             "family_before_account": fb["account"],
@@ -559,10 +610,13 @@ def leaderboard_delta_export(
             "delta_buffer": r["delta_buffer"],
             "rivals_sp_before": r["rivals_sp_before"],
             "rivals_sp_after": r["rivals_sp_after"],
-            "delta_rivals_sp": r["delta_rivals_sp"]
+            "delta_rivals_sp": r["delta_rivals_sp"],
+            # NEW columns:
+            "accounts_gained": acc_gain_str,
+            "accounts_lost": acc_loss_str,
         })
-    df = pd.DataFrame(flat)
 
+    df = pd.DataFrame(flat)
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     fname = f"leaderboard_delta_{ts}.{format}"
 
