@@ -958,37 +958,71 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
                 "note": "GIVE exceeds owned SP; family total may not drop as expected."
             })
 
-    # Player changes — effective SP against FULL leaderboard
-    rows=[]; tot_buf=0
-    for pl in sorted(touched):
-        d_by_acct = {a: int(cur.get(a, {}).get(pl, 0) - accounts_before.get(a, {}).get(pl, 0)) for a in FAMILY_ACCOUNTS}
-        lb_base = {a: _lb_family_sp_for(leader, pl, a) for a in FAMILY_ACCOUNTS}
-        hold_b = {a: int(accounts_before.get(a, {}).get(pl, 0)) for a in FAMILY_ACCOUNTS}
-        eff_b = {a: max(lb_base[a], hold_b[a]) for a in FAMILY_ACCOUNTS}
-        eff_a = {a: eff_b[a] + d_by_acct[a] for a in FAMILY_ACCOUNTS}
-        sp_b = sum(eff_b.values()); sp_a = sp_b + int(inc_sp); d_sp = int(inc_sp)
-        eff_before_map = {a: {pl: eff_b[a]} for a in FAMILY_ACCOUNTS}
-        eff_after_map  = {a: {pl: eff_a[a]} for a in FAMILY_ACCOUNTS}
-        ctx_b = _rank_context_smallset(pl, leader, eff_before_map)
-        ctx_a = _rank_context_smallset(pl, leader, eff_after_map)
-        d_qp = ctx_a["family_qp_player"] - ctx_b["family_qp_player"]
-        r_b_full, buf_b_full, _, _ = _rank_and_buffer_full_leader(pl, leader, {a: eff_b[a] for a in FAMILY_ACCOUNTS})
-        r_a_full, buf_a_full, _, _ = _rank_and_buffer_full_leader(pl, leader, {a: eff_a[a] for a in FAMILY_ACCOUNTS})
-        d_buf = None if (buf_b_full is None and buf_a_full is None) else ( (buf_a_full or 0) - (buf_b_full or 0) )
-        if d_buf is not None: tot_buf += d_buf
-        rows.append({
-            "player": pl, "sp_before": int(sp_b), "sp_after": int(sp_a), "delta_sp": int(d_sp),
-            "per_account_sp_before": eff_b, "per_account_sp_after": eff_a, "per_account_sp_delta": d_by_acct,
-            "best_rank_before": r_b_full, "best_rank_after": r_a_full,
-            "best_rank_before_label": _rank_label(r_b_full), "best_rank_after_label": _rank_label(r_a_full),
-            "buffer_before": None if buf_b_full is None else int(buf_b_full),
-            "buffer_after":  None if buf_a_full is None else int(buf_a_full),
-            "delta_buffer":   None if d_buf is None else int(d_buf),
-            "qp_before": int(ctx_b["family_qp_player"]), "qp_after": int(ctx_a["family_qp_player"]), "delta_qp": int(d_qp)
-        })
+ # Player changes — effective SP against FULL leaderboard
+rows = []
+tot_buf = 0
+for pl in sorted(touched):
+    # Delta per family account for this player (after allocation + GIVEs)
+    d_by_acct = {
+        a: int(cur.get(a, {}).get(pl, 0) - accounts_before.get(a, {}).get(pl, 0))
+        for a in FAMILY_ACCOUNTS
+    }
 
-    rows.sort(key=lambda r: (-r["delta_qp"], -r["delta_sp"], r["player"].lower()))
-    totals = {"delta_sp": int(sum(r["delta_sp"] for r in rows)), "delta_buffer": int(tot_buf), "delta_qp": int(fam1 - fam0)}
+    # Effective SP before/after = max(leaderboard SP, holdings SP), then apply delta
+    lb_base = {a: _lb_family_sp_for(leader, pl, a) for a in FAMILY_ACCOUNTS}
+    hold_b = {a: int(accounts_before.get(a, {}).get(pl, 0)) for a in FAMILY_ACCOUNTS}
+    eff_b  = {a: max(lb_base[a], hold_b[a]) for a in FAMILY_ACCOUNTS}
+    eff_a  = {a: eff_b[a] + d_by_acct[a]   for a in FAMILY_ACCOUNTS}
+
+    # FIX: derive the total change from the delta map (was: NameError on inc_sp)
+    inc_sp = int(sum(d_by_acct.values()))
+    sp_b   = int(sum(eff_b.values()))
+    sp_a   = sp_b + inc_sp
+    d_sp   = inc_sp
+
+    # Rank/QP context (smallset for this player) for before/after snapshots
+    eff_before_map = {a: {pl: eff_b[a]} for a in FAMILY_ACCOUNTS}
+    eff_after_map  = {a: {pl: eff_a[a]} for a in FAMILY_ACCOUNTS}
+    ctx_b = _rank_context_smallset(pl, leader, eff_before_map)
+    ctx_a = _rank_context_smallset(pl, leader, eff_after_map)
+
+    d_qp = int(ctx_a["family_qp_player"] - ctx_b["family_qp_player"])
+
+    # Full-leaderboard rank/buffer for explanatory fields
+    r_b_full, buf_b_full, _, _ = _rank_and_buffer_full_leader(pl, leader, {a: eff_b[a] for a in FAMILY_ACCOUNTS})
+    r_a_full, buf_a_full, _, _ = _rank_and_buffer_full_leader(pl, leader, {a: eff_a[a] for a in FAMILY_ACCOUNTS})
+
+    d_buf = None if (buf_b_full is None and buf_a_full is None) else int((buf_a_full or 0) - (buf_b_full or 0))
+    if d_buf is not None:
+        tot_buf += d_buf
+
+    rows.append({
+        "player": pl,
+        "sp_before": sp_b,
+        "sp_after":  sp_a,
+        "delta_sp":  d_sp,
+        "per_account_sp_before": eff_b,
+        "per_account_sp_after":  eff_a,
+        "per_account_sp_delta":  d_by_acct,
+        "best_rank_before": r_b_full,
+        "best_rank_after":  r_a_full,
+        "best_rank_before_label": _rank_label(r_b_full),
+        "best_rank_after_label":  _rank_label(r_a_full),
+        "buffer_before": None if buf_b_full is None else int(buf_b_full),
+        "buffer_after":  None if buf_a_full is None else int(buf_a_full),
+        "delta_buffer":  None if d_buf is None else int(d_buf),
+        "qp_before": int(ctx_b["family_qp_player"]),
+        "qp_after":  int(ctx_a["family_qp_player"]),
+        "delta_qp":  d_qp
+    })
+
+# Sort and totals (unchanged intent)
+rows.sort(key=lambda r: (-r["delta_qp"], -r["delta_sp"], r["player"].lower()))
+totals = {
+    "delta_sp":     int(sum(r["delta_sp"] for r in rows)),
+    "delta_buffer": int(tot_buf),
+    "delta_qp":     int(fam1 - fam0),
+}
 
     # Fragility (trade-created only)
     def _created_fragile_firsts(det_before, det_after, buffers, restrict_players: Optional[Set[str]]):
