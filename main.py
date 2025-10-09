@@ -152,7 +152,7 @@ def _wingnut_guard_allows_fe(players: List[str], add_sp: int, leader, accounts: 
         # Wingnut SP from leaderboard
         wingnut_sp = 0
         for r in rows:
-            if str(r.get("account", "")).lower() == wingnut_key:
+            if str(r.get("account", "")) == "wingnut84":
                 wingnut_sp = int(r.get("sp") or 0)
                 break
 
@@ -167,7 +167,6 @@ def _wingnut_guard_allows_fe(players: List[str], add_sp: int, leader, accounts: 
         # FE effective SP for this player BEFORE the GET
         fe_lb = _lb_family_sp_for(leader, p, "FinkleIsEinhorn")
         fe_hold = int(accounts.get("FinkleIsEinhorn", {}).get(p, 0))
-        fe_eff_before = max(fe_lb, fe_hold)
 
         # AFTER adding this GET
         fe_eff_after = max(fe_lb, fe_hold + int(add_sp))
@@ -201,7 +200,6 @@ def _apply_trade_allocation(leader, accounts_before, trade: List, tags: Dict[str
             guard_info = {"wingnut_guard_applied": True, "allowed": allowed}
             if not allowed:
                 # Overflow for Legends when guard blocks FE
-                # Prefer DC (consistent with rolebook overflow), else E31
                 to_acct = "DusterCrusher"
 
         # No-tag case: prefer current best holder
@@ -242,7 +240,7 @@ def _effective_maps_for_player(leader, p: str, accounts_before, cur):
     return eff_b, eff_a
 
 
-# ---------- Probe (diagnostic) route restored ----------
+# ---------- Probe (diagnostic) route ----------
 
 @app.post("/__probe_evaluate")
 def probe_family_evaluate(req: Dict[str, Any]):
@@ -304,10 +302,15 @@ def probe_family_evaluate(req: Dict[str, Any]):
         _add("load_player_tags", ok=False, error=_exc_dict(e))
         return {"ok": False, "steps": steps}
 
-    # 6) Compute baseline family QP (leaderboard-QP semantics)
+    # 6) Compute baseline family QP (hybrid semantics)
     try:
         fam_qp, per_qp, details = compute_family_qp(leader, accounts_before)
-        _add("compute_family_qp", ok=True, family_qp_total=int(fam_qp), per_account_qp=per_qp, method=details.get("source"))
+        _add("compute_family_qp", ok=True,
+             family_qp_total=int(fam_qp),
+             per_account_qp=per_qp,
+             method=details.get("source"),
+             lb_qp_sum=details.get("lb_qp_sum"),
+             derived_rank1_count=details.get("derived_rank1_count"))
     except Exception as e:
         _add("compute_family_qp", ok=False, error=_exc_dict(e))
         return {"ok": False, "steps": steps}
