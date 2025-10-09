@@ -11,12 +11,12 @@ from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel, Field, validator
 
 # ======================================================================================
-# FastAPI app
+# FastAPI app metadata
 # ======================================================================================
 
 app = FastAPI(
     title="Ultimate Quest Service (Small-Payload API)",
-    version=os.getenv("APP_VERSION", "4.12.12"),
+    version=os.getenv("APP_VERSION", "4.12.13"),
 )
 
 # ======================================================================================
@@ -91,7 +91,7 @@ class LeaderboardDeltaReq(BaseModel):
     min_sp_delta: int = Field(default=1, ge=0)
 
 # ======================================================================================
-# /info (handy)
+# /info
 # ======================================================================================
 
 @app.get("/info")
@@ -221,7 +221,7 @@ class _Leader(t.TypedDict):
     display_names: t.Dict[str, str]
     account_display: t.Dict[str, str]
 
-def normalize_leaderboard(sheets: t.Dict[str, pd.DataFrame]) -> _Leader:
+def normalize_leaderboard(sheets: t.Dict[str, pd.DataFrame]) -> "_Leader":
     name = next(iter(sheets))
     df = sheets[name].copy()
     df.columns = [str(c).strip() for c in df.columns]
@@ -375,61 +375,27 @@ def _rank_and_buffer_full_leader(player: str, leader: "_Leader", family_eff: t.D
     buffer = fam_best_sp - best_nonfamily_sp
     return rank, buffer, fam_best_acct_disp, fam_best_sp
 
-def compute_family_qp(
-    leader: "_Leader", accounts: t.Dict[str, t.Dict[str, int]]
-) -> t.Tuple[int, t.Dict[str, int], t.Dict[str, t.Any]]:
-    # (1) Leaderboard-QP sum
-    lb_total = 0
-    lb_per_acct = {a: 0 for a in FAMILY_ACCOUNTS}
+# ======================================================================================
+# Family QP
+# ======================================================================================
+
+def compute_family_qp_from_leader(leader: "_Leader") -> t.Tuple[int, t.Dict[str, int]]:
+    """Sum leaderboard QP (snapshot)."""
+    total = 0
+    per_acct = {a: 0 for a in FAMILY_ACCOUNTS}
     for rows in leader["by_player"].values():
         for r in rows:
             acc_canon = str(r.get("account") or "")
             qp = int(r.get("qp") or 0)
             if acc_canon in _FAMILY_KEYS:
-                lb_total += qp
+                total += qp
                 disp = _FAMILY_CANON_TO_DISPLAY.get(acc_canon)
                 if disp:
-                    lb_per_acct[disp] += qp
-
-    if lb_total > 0:
-        details: t.Dict[str, t.Any] = {
-            "source": "leaderboard_qp_sum",
-            "lb_qp_sum": int(lb_total),
-            "derived_rank1_count": None,
-            "per_account_qp": lb_per_acct,
-        }
-        return int(lb_total), lb_per_acct, details
-
-    # (2) Derived QP: count family Rank-1s
-    derived_total = 0
-    derived_per_acct = {a: 0 for a in FAMILY_ACCOUNTS}
-
-    all_players: t.Set[str] = set(leader["by_player"].keys())
-    for a in FAMILY_ACCOUNTS:
-        all_players.update(_norm_key(p) for p in accounts.get(a, {}).keys())
-
-    for p in all_players:
-        fam_eff = {}
-        for a in FAMILY_ACCOUNTS:
-            lb = _lb_family_sp_for(leader, p, a)
-            hold = int(accounts.get(a, {}).get(p, 0))
-            fam_eff[a] = max(lb, hold)
-
-        r, _buf, best_a, _sp = _rank_and_buffer_full_leader(p, leader, fam_eff)
-        if r is not None and r == 1 and best_a:
-            derived_total += 1
-            derived_per_acct[best_a] += 1
-
-    details = {
-        "source": "derived_rank1_count",
-        "lb_qp_sum": int(lb_total),
-        "derived_rank1_count": int(derived_total),
-        "per_account_qp": derived_per_acct,
-    }
-    return int(derived_total), derived_per_acct, details
+                    per_acct[disp] += qp
+    return int(total), per_acct
 
 # ======================================================================================
-# Leaderboard Delta — core + JSON + Export (kept)
+# Leaderboard Delta — JSON + Export
 # ======================================================================================
 
 def _delta_rows(today: "_Leader", yday: "_Leader",
@@ -599,7 +565,7 @@ def leaderboard_delta_export(
     return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
 
 # ======================================================================================
-# Evaluate Trade — restored route
+# Evaluate Trade — restored route with QP deltas
 # ======================================================================================
 
 def _route_order_for(tag: t.Optional[str]) -> t.List[str]:
@@ -618,11 +584,9 @@ def _detect_tag(player_key: str, tags: t.Dict[str, t.Set[str]]) -> t.Optional[st
     return None
 
 def _wingnut_guard_meta(leader: _Leader, player_key: str) -> t.Dict[str, t.Any]:
-    # purely informational trace; no enforcement here
     rows = leader["sp_map"].get(player_key, {})
     if not rows:
         return {"wingnut_guard_applied": False, "allowed": True}
-    # rank Wingnut84 if present
     sorted_rows = sorted([(acc, sp) for acc, sp in rows.items()], key=lambda x: -int(x[1]))
     rank = None
     for i, (acc, _sp) in enumerate(sorted_rows, start=1):
@@ -654,11 +618,10 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
 
     try:
         tags = _load_player_tags(req.prefer_env_defaults, tags_url)
-    except Exception as e:
-        # Non-fatal: just proceed with empty tags
+    except Exception:
         tags = {"LEGENDS": set(), "ANA": set(), "DAL": set(), "LAK": set(), "PIT": set()}
 
-    # Build family SP before (effective = max(leaderboard, holdings))
+    # Family SP before (effective = max(leaderboard, holdings))
     fam_before: t.Dict[str, t.Dict[str, int]] = {a: {} for a in FAMILY_ACCOUNTS}
     all_players: t.Set[str] = set(leader["sp_map"].keys())
     for a in FAMILY_ACCOUNTS:
@@ -688,7 +651,6 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
     for pkey, add_sp in get_add.items():
         tag = _detect_tag(pkey, tags)
         order = _route_order_for(tag)
-        # best-holder fallback if no tag: pick family account with max current SP
         to = None
         if tag is None:
             best_sp = -1
@@ -719,12 +681,13 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
     for pkey, sub_sp in give_subtract.items():
         fam_after[req.trade_account][pkey] = int(fam_after[req.trade_account].get(pkey, 0)) - int(sub_sp)
         if fam_after[req.trade_account][pkey] < 0:
-            fam_after[req.trade_account][pkey] = 0  # clamp at zero for display
+            fam_after[req.trade_account][pkey] = 0  # clamp
 
-    # Compute player changes for touched players
+    # Compute player changes for touched players, including QP
     touched = set(get_add.keys()) | set(give_subtract.keys())
     player_changes: t.List[t.Dict[str, t.Any]] = []
 
+    total_qp_delta = 0
     for pkey in sorted(touched):
         disp = leader["display_names"].get(pkey, pkey)
         per_before = {a: int(fam_before[a].get(pkey, 0)) for a in FAMILY_ACCOUNTS}
@@ -735,6 +698,11 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
 
         r1, b1, _a1, _sp1 = _rank_and_buffer_full_leader(pkey, leader, per_before)
         r2, b2, _a2, _sp2 = _rank_and_buffer_full_leader(pkey, leader, per_after)
+
+        qp_before = 1 if (r1 == 1) else 0
+        qp_after  = 1 if (r2 == 1) else 0
+        d_qp = qp_after - qp_before
+        total_qp_delta += d_qp
 
         change = {
             "player": disp,
@@ -749,14 +717,15 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
             "best_rank_after_label": str(r2) if r2 is not None else "—",
             "buffer_before": b1, "buffer_after": b2,
             "delta_buffer": (b2 - b1) if (b1 is not None and b2 is not None) else None,
-            "qp_before": 0, "qp_after": 0, "delta_qp": 0,
+            "qp_before": qp_before, "qp_after": qp_after, "delta_qp": d_qp,
         }
         player_changes.append(change)
 
     # Totals & verdict
     total_sp = sum(int(p["delta_sp"] or 0) for p in player_changes)
     total_buf = sum(int(p["delta_buffer"] or 0) for p in player_changes if p["delta_buffer"] is not None)
-    total_qp = sum(int(p["delta_qp"] or 0) for p in player_changes)
+    total_qp = int(total_qp_delta)
+
     if total_qp > 0:
         verdict = "APPROVE"
     elif total_qp == 0:
@@ -764,9 +733,9 @@ def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
     else:
         verdict = "DECLINE"
 
-    # Family QP snapshot (before/after) — from leaderboard semantics
-    fam_qp_before, _, _ = compute_family_qp(leader, fam_before)
-    fam_qp_after,  _, _ = compute_family_qp(leader, fam_after)
+    # Family QP snapshot (before from leaderboard; after = before + simulated ΔQP)
+    fam_qp_before, _ = compute_family_qp_from_leader(leader)
+    fam_qp_after = int(fam_qp_before + total_qp)
 
     return {
         "ok": True,
