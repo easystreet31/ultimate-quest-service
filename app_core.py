@@ -5,7 +5,7 @@ from collections import defaultdict
 
 import pandas as pd
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, validator
 
 # --------------------------------------------------------------------------------------
@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field, validator
 
 app = FastAPI(
     title="Ultimate Quest Service (Small-Payload API)",
-    version=os.getenv("APP_VERSION", "4.12.7"),
+    version=os.getenv("APP_VERSION", "4.12.8"),
 )
 
 # --------------------------------------------------------------------------------------
@@ -171,7 +171,6 @@ def fetch_xlsx(url: str) -> t.Dict[str, pd.DataFrame]:
         sheets = {}
         for name in xf.sheet_names:
             df = xf.parse(name)
-            # keep original header spellings; normalize later
             df.columns = [str(c).strip() for c in df.columns]
             sheets[name] = df
         return sheets
@@ -201,17 +200,12 @@ def _detect_col(df: pd.DataFrame, candidates: t.Iterable[str]) -> str:
     raise KeyError(f"Missing required column (tried {list(candidates)}) in columns: {list(df.columns)}")
 
 def _detect_col_qp(df: pd.DataFrame) -> t.Optional[str]:
-    """
-    Fuzzy detector for QP column. Accepts: 'qp', 'QP', 'quest', 'quest_points',
-    'quest points', 'questpoints', 'quest total', 'quest_total', etc.
-    """
-    # First try the exact names
+    """Fuzzy detector for QP-like columns."""
     for base in ("qp", "quest", "quest_points"):
         try:
             return _detect_col(df, [base])
         except KeyError:
             pass
-    # Fuzzy contains
     for c in df.columns:
         cl = str(c).lower().strip()
         if cl == "qp":
@@ -223,7 +217,7 @@ def _detect_col_qp(df: pd.DataFrame) -> t.Optional[str]:
     return None
 
 # --------------------------------------------------------------------------------------
-# Leaderboard normalization (store *canonical* account keys)
+# Leaderboard normalization
 # --------------------------------------------------------------------------------------
 
 class _Row(t.TypedDict, total=False):
@@ -235,6 +229,7 @@ class _Row(t.TypedDict, total=False):
 class _Leader(t.TypedDict):
     by_player: t.Dict[str, t.List[_Row]]
     sp_map: t.Dict[str, t.Dict[str, int]]  # {player_key: {account_canon: sp}}
+    display_names: t.Dict[str, str]        # {player_key: "Display Name"}
 
 def normalize_leaderboard(sheets: t.Dict[str, pd.DataFrame]) -> _Leader:
     name = next(iter(sheets))
@@ -263,20 +258,22 @@ def normalize_leaderboard(sheets: t.Dict[str, pd.DataFrame]) -> _Leader:
 
     by_player: t.Dict[str, t.List[_Row]] = defaultdict(list)
     sp_map: t.Dict[str, t.Dict[str, int]] = defaultdict(dict)
+    display: t.Dict[str, str] = {}
 
     for _, row in df.iterrows():
-        p = _norm_key(row[col_player])
+        disp_player = _norm_name(row[col_player])
+        p = _norm_key(disp_player)
         a_canon = _canon_key(row[col_account])
         sp = int(row[col_sp]) if pd.notna(row[col_sp]) else 0
         qp = int(row[col_qp]) if col_qp and pd.notna(row[col_qp]) else 0
         rk = int(row[col_rank]) if col_rank and pd.notna(row[col_rank]) else None
 
+        display.setdefault(p, disp_player)
         by_player[p].append(_Row(account=a_canon, sp=sp, qp=qp, rank=rk))
-        # Record the max SP seen for (player, account)
         prev = int(sp_map[p].get(a_canon, 0))
         sp_map[p][a_canon] = max(prev, sp)
 
-    return t.cast(_Leader, {"by_player": dict(by_player), "sp_map": dict(sp_map)})
+    return t.cast(_Leader, {"by_player": dict(by_player), "sp_map": dict(sp_map), "display_names": display})
 
 # --------------------------------------------------------------------------------------
 # Holdings & tags loaders
@@ -402,10 +399,9 @@ def compute_family_qp(
 ) -> t.Tuple[int, t.Dict[str, int], t.Dict[str, t.Any]]:
     """
     Hybrid QP semantics:
-      1) Try leaderboard-QP sum (sum 'qp' for rows whose account belongs to the family
-         after canonicalizing/cleaning usernames).
+      1) Leaderboard-QP sum (sum 'qp' where account is in family after canonicalization).
       2) If that total is 0, fall back to derived QP = number of players where the family
-         holds Rank-1 (credit the point to the best family account).
+         holds Rank-1 (credit to the best family account).
     """
     # (1) Leaderboard-QP sum
     lb_total = 0
@@ -459,5 +455,93 @@ def compute_family_qp(
     return int(derived_total), derived_per_acct, details
 
 # --------------------------------------------------------------------------------------
-# (Endpoints are in main.py; we only expose /defaults + helpers here)
+# NEW: Leaderboard delta endpoint (today vs yesterday)
+# --------------------------------------------------------------------------------------
+
+class LeaderboardDeltaReq(BaseModel):
+    prefer_env_defaults: bool = True
+    leaderboard_today_url: t.Optional[str] = None
+    leaderboard_yesterday_url: t.Optional[str] = None
+    rivals: t.Optional[t.List[str]] = None
+    min_sp_delta: int = Field(default=1, ge=0)
+
+@app.post("/leaderboard_delta_by_urls")
+def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
+    try:
+        today_url = req.leaderboard_today_url or _pick_url(None, "leaderboard", req.prefer_env_defaults)
+        yday_url  = req.leaderboard_yesterday_url or _pick_url(None, "leaderboard_yday", req.prefer_env_defaults)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"missing_urls: {e}")
+
+    try:
+        today = normalize_leaderboard(fetch_xlsx(today_url))
+        yday  = normalize_leaderboard(fetch_xlsx(yday_url))
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"download_failed: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"parse_failed: {e}")
+
+    rivals_canon: t.Set[str] = set(_canon_key(_strip_user_suffix(r)) for r in (req.rivals or list(SYNDICATE)))
+
+    def rival_sum(leader: _Leader, p: str) -> int:
+        sm = leader["sp_map"].get(p, {})
+        return int(sum(int(sm.get(rv, 0)) for rv in rivals_canon))
+
+    players = set(today["sp_map"].keys()) | set(yday["sp_map"].keys())
+    rows: t.List[t.Dict[str, t.Any]] = []
+
+    for p in players:
+        fam_eff_before = {a: int(yday["sp_map"].get(p, {}).get(_canon_key(a), 0)) for a in FAMILY_ACCOUNTS}
+        fam_eff_after  = {a: int(today["sp_map"].get(p, {}).get(_canon_key(a), 0)) for a in FAMILY_ACCOUNTS}
+
+        r1, b1, a1, sp1 = _rank_and_buffer_full_leader(p, yday, fam_eff_before)
+        r2, b2, a2, sp2 = _rank_and_buffer_full_leader(p, today, fam_eff_after)
+
+        rv1 = rival_sum(yday, p)
+        rv2 = rival_sum(today, p)
+
+        d_sp = (sp2 or 0) - (sp1 or 0)
+        d_buf = (b2 - b1) if (b1 is not None and b2 is not None) else None
+        d_rank = (r2 - r1) if (r1 is not None and r2 is not None) else None
+        d_rival = rv2 - rv1
+
+        disp = today["display_names"].get(p) or yday["display_names"].get(p) or p
+
+        moved = abs(d_sp) >= int(req.min_sp_delta) or (d_rank not in (None, 0)) or (d_rival != 0)
+        if not moved:
+            continue
+
+        rows.append({
+            "player": disp,
+            "family_before": {"account": a1, "sp": sp1, "rank": r1, "buffer": b1},
+            "family_after":  {"account": a2, "sp": sp2, "rank": r2, "buffer": b2},
+            "delta_sp": d_sp,
+            "delta_rank": d_rank,
+            "delta_buffer": d_buf,
+            "rivals_sp_before": rv1,
+            "rivals_sp_after": rv2,
+            "delta_rivals_sp": d_rival
+        })
+
+    # Sort by largest absolute family SP change, then buffer change
+    rows.sort(key=lambda r: (abs(int(r.get("delta_sp") or 0)), abs(int(r.get("delta_buffer") or 0))), reverse=True)
+
+    return {
+        "ok": True,
+        "leaderboard_today_url": today_url,
+        "leaderboard_yesterday_url": yday_url,
+        "params": {
+            "rivals": sorted(list(rivals_canon)),
+            "min_sp_delta": int(req.min_sp_delta),
+            "source": "defaults" if (not req.leaderboard_today_url and not req.leaderboard_yesterday_url) else "explicit"
+        },
+        "summary": {
+            "players_scanned": len(players),
+            "players_reported": len(rows),
+        },
+        "players": rows[:1000]  # bound payload
+    }
+
+# --------------------------------------------------------------------------------------
+# (Endpoints are in main.py; we expose /defaults, /leaderboard_delta_by_urls + helpers here)
 # --------------------------------------------------------------------------------------
