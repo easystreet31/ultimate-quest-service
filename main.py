@@ -147,7 +147,6 @@ def _wingnut_guard_allows_fe(players: List[str], add_sp: int, leader, accounts: 
         pk = _norm(p)
         rows = leader["by_player"].get(pk, [])
         if not rows:
-            # No leaderboard for this player → nothing to guard
             continue
 
         # Wingnut SP from leaderboard
@@ -158,10 +157,8 @@ def _wingnut_guard_allows_fe(players: List[str], add_sp: int, leader, accounts: 
                 break
 
         if wingnut_sp <= 0:
-            # Not present → not Top-3
             continue
 
-        # Determine Wingnut rank among leaderboard rows only
         higher = sum(1 for r in rows if int(r.get("sp") or 0) > wingnut_sp)
         wingnut_rank = 1 + higher
         if wingnut_rank > 3:
@@ -177,7 +174,7 @@ def _wingnut_guard_allows_fe(players: List[str], add_sp: int, leader, accounts: 
 
         # Must remain strictly below Wingnut's SP
         if fe_eff_after >= wingnut_sp:
-            return False  # guard blocks routing to FE for this line
+            return False
     return True
 
 def _apply_trade_allocation(leader, accounts_before, trade: List, tags: Dict[str, Set[str]]):
@@ -243,6 +240,82 @@ def _effective_maps_for_player(leader, p: str, accounts_before, cur):
     eff_b  = {a: max(lb_base[a], hold_b[a]) for a in FAMILY_ACCOUNTS}
     eff_a  = {a: int(cur.get(a, {}).get(p, 0)) for a in FAMILY_ACCOUNTS}
     return eff_b, eff_a
+
+
+# ---------- Probe (diagnostic) route restored ----------
+
+@app.post("/__probe_evaluate")
+def probe_family_evaluate(req: Dict[str, Any]):
+    """
+    Lightweight diagnostic that runs the same inputs pipeline as evaluate(),
+    step-by-step, and reports where it fails.
+    """
+    steps: List[Dict[str, Any]] = []
+    prefer = bool(req.get("prefer_env_defaults", True))
+
+    def _add(step: str, **kw):
+        d = {"step": step, **kw}
+        steps.append(d)
+        return d
+
+    # 1) Resolve leaderboard URL
+    try:
+        url_lb = _pick_url(req.get("leaderboard_url"), "leaderboard", prefer)
+        _add("pick_leaderboard_url", ok=True, url=url_lb)
+    except Exception as e:
+        _add("pick_leaderboard_url", ok=False, error=_exc_dict(e))
+        return {"ok": False, "steps": steps}
+
+    # 2) Fetch leaderboard XLSX
+    try:
+        lb_sheets = fetch_xlsx(url_lb)
+        _add("fetch_leaderboard_xlsx", ok=True, sheet_count=len(lb_sheets), sheet_names=list(lb_sheets.keys())[:5])
+    except Exception as e:
+        _add("fetch_leaderboard_xlsx", ok=False, error=_exc_dict(e))
+        return {"ok": False, "steps": steps}
+
+    # 3) Normalize leaderboard
+    try:
+        leader = normalize_leaderboard(lb_sheets)
+        _add("normalize_leaderboard", ok=True, players=len(leader["by_player"]))
+    except Exception as e:
+        _add("normalize_leaderboard", ok=False, error=_exc_dict(e))
+        return {"ok": False, "steps": steps}
+
+    # 4) Load holdings for all family accounts
+    try:
+        accounts_before = holdings_from_urls(
+            req.get("holdings_e31_url"),
+            req.get("holdings_dc_url"),
+            req.get("holdings_fe_url"),
+            prefer,
+            req.get("holdings_ud_url"),
+        )
+        _add("holdings_from_urls", ok=True, counts={k: len(v) for k, v in accounts_before.items()})
+    except Exception as e:
+        _add("holdings_from_urls", ok=False, error=_exc_dict(e))
+        return {"ok": False, "steps": steps}
+
+    # 5) Load tag sheet
+    try:
+        tags = _load_player_tags(prefer, req.get("player_tags_url"))
+        _add("load_player_tags", ok=True, tag_sizes={k: len(v) for k, v in tags.items()})
+    except Exception as e:
+        _add("load_player_tags", ok=False, error=_exc_dict(e))
+        return {"ok": False, "steps": steps}
+
+    # 6) Compute baseline family QP (leaderboard-QP semantics)
+    try:
+        fam_qp, per_qp, details = compute_family_qp(leader, accounts_before)
+        _add("compute_family_qp", ok=True, family_qp_total=int(fam_qp), per_account_qp=per_qp, method=details.get("source"))
+    except Exception as e:
+        _add("compute_family_qp", ok=False, error=_exc_dict(e))
+        return {"ok": False, "steps": steps}
+
+    return {"ok": True, "steps": steps}
+
+
+# ---------- Evaluate route (with Wingnut guard) ----------
 
 # Remove existing route if present (avoid double handlers)
 for i, r in list(enumerate(app.router.routes)):
