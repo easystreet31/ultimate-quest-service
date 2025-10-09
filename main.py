@@ -93,16 +93,21 @@ for route in list(app.routes):
 
 # ---------- JSON error handlers (jq-parsable failures) ----------
 
+@app.exception_handler(HTTPException)
+async def http_exc_handler(request: Request, exc: HTTPException):
+    base = {"error": "http_error", "status": exc.status_code}
+    base["detail"] = exc.detail if not isinstance(exc.detail, str) else exc.detail
+    return SafeJSONResponse(status_code=exc.status_code, content=base)
+
 @app.exception_handler(Exception)
 async def unhandled_exc_handler(request: Request, exc: Exception):
-    # Avoid HTML – return structured JSON with error type/message
     return SafeJSONResponse(
         status_code=500,
         content={"error": "internal_error", "status": 500, "detail": _exc_dict(exc)},
     )
 
 
-# ---------- Replace /family_evaluate_trade_by_urls with a safe implementation ----------
+# ---------- Evaluate helpers (rolebook + Wingnut guard) ----------
 
 def _norm(s: str) -> str:
     return (s or "").strip().lower()
@@ -132,6 +137,49 @@ def _best_holder_acct(players: List[str], leader, accounts: Dict[str, Dict[str, 
     order = ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn", "UpperDuck"]
     return max(order, key=lambda a: (totals[a], -order.index(a)))
 
+def _wingnut_guard_allows_fe(players: List[str], add_sp: int, leader, accounts: Dict[str, Dict[str, int]]) -> bool:
+    """
+    Enforce: for any Legends-tagged player where Wingnut84 is Top-3 on the *leaderboard*,
+    FE must remain strictly behind Wingnut84 after this GET.
+    """
+    wingnut_key = "wingnut84"  # case-insensitive
+    for p in players:
+        pk = _norm(p)
+        rows = leader["by_player"].get(pk, [])
+        if not rows:
+            # No leaderboard for this player → nothing to guard
+            continue
+
+        # Wingnut SP from leaderboard
+        wingnut_sp = 0
+        for r in rows:
+            if str(r.get("account", "")).lower() == wingnut_key:
+                wingnut_sp = int(r.get("sp") or 0)
+                break
+
+        if wingnut_sp <= 0:
+            # Not present → not Top-3
+            continue
+
+        # Determine Wingnut rank among leaderboard rows only
+        higher = sum(1 for r in rows if int(r.get("sp") or 0) > wingnut_sp)
+        wingnut_rank = 1 + higher
+        if wingnut_rank > 3:
+            continue  # guard only applies when Wingnut is Top-3
+
+        # FE effective SP for this player BEFORE the GET
+        fe_lb = _lb_family_sp_for(leader, p, "FinkleIsEinhorn")
+        fe_hold = int(accounts.get("FinkleIsEinhorn", {}).get(p, 0))
+        fe_eff_before = max(fe_lb, fe_hold)
+
+        # AFTER adding this GET
+        fe_eff_after = max(fe_lb, fe_hold + int(add_sp))
+
+        # Must remain strictly below Wingnut's SP
+        if fe_eff_after >= wingnut_sp:
+            return False  # guard blocks routing to FE for this line
+    return True
+
 def _apply_trade_allocation(leader, accounts_before, trade: List, tags: Dict[str, Set[str]]):
     cur = {a: dict(v) for a, v in accounts_before.items()}
     alloc_plan = []
@@ -140,27 +188,46 @@ def _apply_trade_allocation(leader, accounts_before, trade: List, tags: Dict[str
     for line in [l for l in trade if l.side == "GET"]:
         players = split_multi_subject_players(line.players)
         order = _account_order_for_players(players, tags)
-        # tags-first (Wingnut trailing guard can be added later; minimal safe version here)
+
+        # Determine tag presence
+        has_legends = any(_norm(p) in tags.get("LEGENDS", set()) for p in players)
+        has_ana = any(_norm(p) in tags.get("ANA", set()) for p in players)
+        has_team_dc = any(_norm(p) in tags.get(k, set()) for k in ("DAL", "LAK", "PIT") for p in players)
+
+        # Default account based on tag priority
         to_acct = order[0]
 
-        # For no-tag case, prefer current best holder
-        if not any((_norm(p) in tags.get("LEGENDS", set())
-                    or _norm(p) in tags.get("ANA", set())
-                    or _norm(p) in tags.get("DAL", set())
-                    or _norm(p) in tags.get("LAK", set())
-                    or _norm(p) in tags.get("PIT", set())) for p in players):
+        # Legends: Wingnut84 guard
+        guard_info: Dict[str, Any] = {}
+        if has_legends and to_acct == "FinkleIsEinhorn":
+            allowed = _wingnut_guard_allows_fe(players, int(line.sp), leader, cur)
+            guard_info = {"wingnut_guard_applied": True, "allowed": allowed}
+            if not allowed:
+                # Overflow for Legends when guard blocks FE
+                # Prefer DC (consistent with rolebook overflow), else E31
+                to_acct = "DusterCrusher"
+
+        # No-tag case: prefer current best holder
+        if not (has_legends or has_ana or has_team_dc):
             to_acct = _best_holder_acct(players, leader, cur)
 
+        # Apply the GET
         for p in players:
             cur[to_acct][p] = int(cur[to_acct].get(p, 0)) + int(line.sp)
 
-        alloc_plan.append({
+        meta = {
             "type": "GET",
             "to": to_acct,
             "players": players,
             "sp": int(line.sp),
-            "routing_trace": {"policy": "tag_first_or_best_holder", "order": order}
-        })
+            "routing_trace": {
+                "policy": "tag_first_or_best_holder_with_wingnut_guard",
+                "order": order,
+            }
+        }
+        if guard_info:
+            meta["routing_trace"]["wingnut_guard"] = guard_info
+        alloc_plan.append(meta)
 
     # GIVEs: subtract from trade_account (clamped at 0)
     for line in [l for l in trade if l.side == "GIVE"]:
@@ -198,7 +265,7 @@ def family_evaluate_trade_by_urls_safe(req: FamilyEvaluateTradeReq):
         for p in split_multi_subject_players(line.players):
             give_requested[p] += int(line.sp)
 
-    # 2) Allocation (rolebook)
+    # 2) Allocation (rolebook + Wingnut guard)
     cur, alloc_plan = _apply_trade_allocation(leader, accounts_before, req.trade, tags_map)
 
     # 3) Apply GIVEs to trade_account (ensure clamped non-negative)
