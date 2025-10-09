@@ -22,7 +22,7 @@ services:
       - key: DEFAULT_HOLDINGS_FE_URL
         value: https://docs.google.com/spreadsheets/d/1qCvE5lN4LJsaG_bsCWaxJ1cYVSc3eSR7D2UKA6dLdHs/export?format=xlsx
       - key: DEFAULT_HOLDINGS_UD_URL
-        value: https://docs.google.com/spreadsheets/d/1YlF_yvcEfghvW3jmiklKH9Yh9xHNSworR626SZ8_cJ8/export?format=xlsx  # <-- set a real URL
+        value: https://docs.google.com/spreadsheets/d/1YlF_yvcEfghvW3jmiklKH9Yh9xHNSworR626SZ8_cJ8/export?format=xlsx
 
       # === Collections (family) ===
       - key: DEFAULT_COLLECTION_E31_URL
@@ -32,7 +32,7 @@ services:
       - key: DEFAULT_COLLECTION_FE_URL
         value: https://docs.google.com/spreadsheets/d/1YAGAiyy9V7NdoUP0M2885pxOh_asWn3JPl9sjvjfqFk/export?format=xlsx
       - key: DEFAULT_COLLECTION_UD_URL
-        value: https://docs.google.com/spreadsheets/d/1pD69dGxTPVhLfjX7eNspeXyXdEmHh6h7TPNJobdNE_c/export?format=xlsx  # <-- set a real URL
+        value: https://docs.google.com/spreadsheets/d/1pD69dGxTPVhLfjX7eNspeXyXdEmHh6h7TPNJobdNE_c/export?format=xlsx
 
       # === Pool collection (seller pool / others collection) ===
       - key: DEFAULT_POOL_COLLECTION_URL
@@ -51,8 +51,6 @@ services:
         value: trade_delta
       - key: FORCE_FAMILY_URLS
         value: "true"
-      - key: EVALUATE_MIDDLEWARE_REROUTE
-        value: "false"
 
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
