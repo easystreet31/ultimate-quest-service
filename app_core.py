@@ -11,16 +11,16 @@ from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel, Field, validator
 
 # ======================================================================================
-# FastAPI app (imported by main.py as "app")
+# FastAPI app
 # ======================================================================================
 
 app = FastAPI(
     title="Ultimate Quest Service (Small-Payload API)",
-    version=os.getenv("APP_VERSION", "4.12.11"),
+    version=os.getenv("APP_VERSION", "4.12.12"),
 )
 
 # ======================================================================================
-# Family accounts & canonicalization
+# Family accounts, rivals, helpers
 # ======================================================================================
 
 FAMILY_ACCOUNTS: t.List[str] = [
@@ -31,24 +31,24 @@ FAMILY_ACCOUNTS: t.List[str] = [
 ]
 
 def _strip_user_suffix(s: t.Any) -> str:
-    """
-    Leaderboard usernames sometimes look like 'Handle\\n(1234)'.
-    Keep only the base handle.
-    """
     s = str(s or "")
     s = s.split("\n", 1)[0]
     s = s.split("(", 1)[0]
     return s.strip()
 
 def _canon_key(s: t.Any) -> str:
-    """Lowercase alphanumeric key for matching accounts/usernames."""
     raw = "".join(ch for ch in str(s or "") if ch.isalnum())
     return raw.lower()
+
+def _norm_name(s: t.Any) -> str:
+    return str(s or "").strip()
+
+def _norm_key(s: t.Any) -> str:
+    return _norm_name(s).lower()
 
 _FAMILY_CANON_TO_DISPLAY: t.Dict[str, str] = { _canon_key(a): a for a in FAMILY_ACCOUNTS }
 _FAMILY_KEYS: t.Set[str] = set(_FAMILY_CANON_TO_DISPLAY.keys())
 
-# Rivals (env default)
 SYNDICATE: t.Set[str] = set(
     (os.getenv("DEFAULT_TARGET_RIVALS") or "chfkyle,VjV5,FireRanger,Tfunite,Ovi8")
     .lower()
@@ -56,7 +56,7 @@ SYNDICATE: t.Set[str] = set(
 )
 
 # ======================================================================================
-# Models used elsewhere
+# Models (Evaluate + Delta)
 # ======================================================================================
 
 class TradeLine(BaseModel):
@@ -83,8 +83,28 @@ class FamilyEvaluateTradeReq(BaseModel):
             raise ValueError("trade must contain at least one line")
         return v
 
+class LeaderboardDeltaReq(BaseModel):
+    prefer_env_defaults: bool = True
+    leaderboard_today_url: t.Optional[str] = None
+    leaderboard_yesterday_url: t.Optional[str] = None
+    rivals: t.Optional[t.List[str]] = None
+    min_sp_delta: int = Field(default=1, ge=0)
+
 # ======================================================================================
-# /defaults  (env projection)
+# /info (handy)
+# ======================================================================================
+
+@app.get("/info")
+def info():
+    return {
+        "ok": True,
+        "title": app.title,
+        "version": app.version,
+        "default_response_class": "SafeJSONResponse",
+    }
+
+# ======================================================================================
+# Defaults / HTTP / XLSX helpers
 # ======================================================================================
 
 def _env(k: str, default: t.Optional[str] = None) -> t.Optional[str]:
@@ -111,10 +131,6 @@ def defaults():
         "fragility_default": os.getenv("TRADE_FRAGILITY_DEFAULT", "trade_delta"),
         "force_family_urls": os.getenv("FORCE_FAMILY_URLS", "true").lower() in ("1","true","yes","y","on"),
     }
-
-# ======================================================================================
-# HTTP & XLSX helpers
-# ======================================================================================
 
 def _pick_url(explicit: t.Optional[str], kind: str, prefer_env_defaults: bool) -> str:
     if explicit and explicit.strip():
@@ -159,12 +175,6 @@ def fetch_xlsx(url: str) -> t.Dict[str, pd.DataFrame]:
             sheets[name] = df
         return sheets
 
-def _norm_name(s: t.Any) -> str:
-    return str(s or "").strip()
-
-def _norm_key(s: t.Any) -> str:
-    return _norm_name(s).lower()
-
 def _detect_col(df: pd.DataFrame, candidates: t.Iterable[str]) -> str:
     lower_map = {str(c).lower(): str(c) for c in df.columns}
     for want in candidates:
@@ -200,16 +210,16 @@ def _detect_col_qp(df: pd.DataFrame) -> t.Optional[str]:
 # ======================================================================================
 
 class _Row(t.TypedDict, total=False):
-    account: str       # canonical key
+    account: str
     sp: int
     qp: int
     rank: t.Optional[int]
 
 class _Leader(t.TypedDict):
     by_player: t.Dict[str, t.List[_Row]]
-    sp_map: t.Dict[str, t.Dict[str, int]]          # player -> {account_canon: sp}
-    display_names: t.Dict[str, str]                # player_key -> display player name
-    account_display: t.Dict[str, str]              # account_canon -> display username
+    sp_map: t.Dict[str, t.Dict[str, int]]
+    display_names: t.Dict[str, str]
+    account_display: t.Dict[str, str]
 
 def normalize_leaderboard(sheets: t.Dict[str, pd.DataFrame]) -> _Leader:
     name = next(iter(sheets))
@@ -291,9 +301,9 @@ def holdings_from_urls(e31: t.Optional[str], dc: t.Optional[str], fe: t.Optional
                        prefer_env_defaults: bool, ud: t.Optional[str]) -> t.Dict[str, t.Dict[str, int]]:
     urls = {
         "Easystreet31": _pick_url(e31, "holdings_e31", prefer_env_defaults),
-        "DusterCrusher": _pick_url(dc,  "holdings_dc",  prefer_env_defaults),
-        "FinkleIsEinhorn": _pick_url(fe,  "holdings_fe",  prefer_env_defaults),
-        "UpperDuck": _pick_url(ud,  "holdings_ud",  prefer_env_defaults),
+        "DusterCrusher": _pick_url(dc, "holdings_dc",  prefer_env_defaults),
+        "FinkleIsEinhorn": _pick_url(fe, "holdings_fe",  prefer_env_defaults),
+        "UpperDuck": _pick_url(ud, "holdings_ud",  prefer_env_defaults),
     }
     out: t.Dict[str, t.Dict[str, int]] = {a: {} for a in FAMILY_ACCOUNTS}
     for acct, url in urls.items():
@@ -304,10 +314,6 @@ def holdings_from_urls(e31: t.Optional[str], dc: t.Optional[str], fe: t.Optional
     return out
 
 def _load_player_tags(prefer_env_defaults: bool, player_tags_url: t.Optional[str]) -> t.Dict[str, t.Set[str]]:
-    """
-    Load the tag workbook (tabs: Legends, ANA, DAL, LAK, PIT) into a dict
-    of normalized player-name sets keyed by tag.
-    """
     url = _pick_url(player_tags_url, "player_tags", prefer_env_defaults)
     raw = _http_get_bytes(url)
     tags: t.Dict[str, t.Set[str]] = {"LEGENDS": set(), "ANA": set(), "DAL": set(), "LAK": set(), "PIT": set()}
@@ -338,10 +344,6 @@ def split_multi_subject_players(players_field: str) -> t.List[str]:
 
 def _rank_and_buffer_full_leader(player: str, leader: "_Leader", family_eff: t.Dict[str, int]
 ) -> t.Tuple[t.Optional[int], t.Optional[int], t.Optional[str], t.Optional[int]]:
-    """
-    Compute best family rank among ALL accounts on leaderboard + the buffer vs best non-family.
-    Accounts in 'leader' are canonical; we compare against canonical family keys.
-    """
     p = _norm_key(player)
     rows = leader["by_player"].get(p, [])
     if not rows and all(v <= 0 for v in family_eff.values()):
@@ -353,7 +355,6 @@ def _rank_and_buffer_full_leader(player: str, leader: "_Leader", family_eff: t.D
     for a_disp, sp in family_eff.items():
         combined[_canon_key(a_disp)] = int(max(0, sp))
 
-    # Determine best family & best rival
     fam_best_acct_disp = None
     fam_best_sp = -1
     for a_disp in FAMILY_ACCOUNTS:
@@ -377,12 +378,6 @@ def _rank_and_buffer_full_leader(player: str, leader: "_Leader", family_eff: t.D
 def compute_family_qp(
     leader: "_Leader", accounts: t.Dict[str, t.Dict[str, int]]
 ) -> t.Tuple[int, t.Dict[str, int], t.Dict[str, t.Any]]:
-    """
-    Hybrid QP semantics:
-      1) Leaderboard-QP sum (sum 'qp' where account is in family after canonicalization).
-      2) If that total is 0, fall back to derived QP = number of players where the family
-         holds Rank-1 (credit to the best family account).
-    """
     # (1) Leaderboard-QP sum
     lb_total = 0
     lb_per_acct = {a: 0 for a in FAMILY_ACCOUNTS}
@@ -409,7 +404,6 @@ def compute_family_qp(
     derived_total = 0
     derived_per_acct = {a: 0 for a in FAMILY_ACCOUNTS}
 
-    # Build 'effective' family SP map for each player (max of LB vs holdings)
     all_players: t.Set[str] = set(leader["by_player"].keys())
     for a in FAMILY_ACCOUNTS:
         all_players.update(_norm_key(p) for p in accounts.get(a, {}).keys())
@@ -435,7 +429,7 @@ def compute_family_qp(
     return int(derived_total), derived_per_acct, details
 
 # ======================================================================================
-# Leaderboard Delta — core + JSON + Export
+# Leaderboard Delta — core + JSON + Export (kept)
 # ======================================================================================
 
 def _delta_rows(today: "_Leader", yday: "_Leader",
@@ -478,13 +472,6 @@ def _delta_rows(today: "_Leader", yday: "_Leader",
     rows.sort(key=lambda r: (abs(int(r.get("delta_sp") or 0)), abs(int(r.get("delta_buffer") or 0))), reverse=True)
     return rows
 
-class LeaderboardDeltaReq(BaseModel):
-    prefer_env_defaults: bool = True
-    leaderboard_today_url: t.Optional[str] = None
-    leaderboard_yesterday_url: t.Optional[str] = None
-    rivals: t.Optional[t.List[str]] = None
-    min_sp_delta: int = Field(default=1, ge=0)
-
 @app.post("/leaderboard_delta_by_urls")
 def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
     try:
@@ -509,32 +496,16 @@ def leaderboard_delta_by_urls(req: LeaderboardDeltaReq):
         "ok": True,
         "leaderboard_today_url": today_url,
         "leaderboard_yesterday_url": yday_url,
-        "params": {
-            "rivals": sorted(list(rivals_canon)),
-            "min_sp_delta": int(req.min_sp_delta),
-            "source": "defaults" if (not req.leaderboard_today_url and not req.leaderboard_yesterday_url) else "explicit"
-        },
+        "params": {"rivals": sorted(list(rivals_canon)), "min_sp_delta": int(req.min_sp_delta)},
         "summary": {"players_scanned": len(set(today['sp_map'].keys()) | set(yday['sp_map'].keys())),
                     "players_reported": min(len(rows), MAX_JSON_ROWS)},
         "players": rows[:MAX_JSON_ROWS]
     }
 
-# ---------- helpers for per-account movement lists (display names) ----------
-
-def _per_account_movement_lists(
-    player_key: str,
-    today: _Leader,
-    yday: _Leader,
-    rivals_canon: t.Set[str]
-) -> t.Tuple[str, str]:
-    """
-    Return (accounts_gained, accounts_lost) as display-name lists with deltas,
-    e.g. "userA(+7); userB(+3)" and "userC(-5)".
-    """
+def _per_account_movement_lists(player_key: str, today: _Leader, yday: _Leader) -> t.Tuple[str, str]:
     t_map = today["sp_map"].get(player_key, {})
     y_map = yday["sp_map"].get(player_key, {})
-    acc_disp = today["account_display"] or {}
-    # include any display name only known yesterday
+    acc_disp = dict(today["account_display"])
     for k, v in yday["account_display"].items():
         acc_disp.setdefault(k, v)
 
@@ -554,19 +525,16 @@ def _per_account_movement_lists(
         else:
             losses.append((-d, f"{name}(-{abs(d)})"))
 
-    # sort by magnitude desc, then name
     gains.sort(key=lambda x: (-x[0], x[1].lower()))
     losses.sort(key=lambda x: (-x[0], x[1].lower()))
     return "; ".join(g for _, g in gains), "; ".join(l for _, l in losses)
-
-# ---------- export (CSV/XLSX) with accounts_gained / accounts_lost ----------
 
 @app.get("/leaderboard_delta_export")
 def leaderboard_delta_export(
     prefer_env_defaults: bool = Query(True),
     leaderboard_today_url: t.Optional[str] = None,
     leaderboard_yesterday_url: t.Optional[str] = None,
-    rivals: t.Optional[str] = None,  # comma list
+    rivals: t.Optional[str] = None,
     min_sp_delta: int = Query(1, ge=0),
     format: t.Literal["csv","xlsx"] = Query("csv")
 ):
@@ -588,12 +556,11 @@ def leaderboard_delta_export(
     rivals_canon: t.Set[str] = set(_canon_key(_strip_user_suffix(r)) for r in rival_list)
     rows = _delta_rows(today, yday, rivals_canon, min_sp_delta)
 
-    # Flatten for table and add per-account movement display lists
     flat = []
     for r in rows:
         fb = r["family_before"]; fa = r["family_after"]
         pkey = r["player_key"]
-        acc_gain_str, acc_loss_str = _per_account_movement_lists(pkey, today, yday, rivals_canon)
+        acc_gain_str, acc_loss_str = _per_account_movement_lists(pkey, today, yday)
 
         flat.append({
             "player": r["player"],
@@ -611,7 +578,6 @@ def leaderboard_delta_export(
             "rivals_sp_before": r["rivals_sp_before"],
             "rivals_sp_after": r["rivals_sp_after"],
             "delta_rivals_sp": r["delta_rivals_sp"],
-            # NEW columns:
             "accounts_gained": acc_gain_str,
             "accounts_lost": acc_loss_str,
         })
@@ -625,10 +591,190 @@ def leaderboard_delta_export(
         headers = {"Content-Disposition": f'attachment; filename="{fname}"'}
         return Response(content=csv_bytes, media_type="text/csv; charset=utf-8", headers=headers)
 
-    # xlsx
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="delta")
     bio.seek(0)
     headers = {"Content-Disposition": f'attachment; filename="{fname}"'}
     return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
+
+# ======================================================================================
+# Evaluate Trade — restored route
+# ======================================================================================
+
+def _route_order_for(tag: t.Optional[str]) -> t.List[str]:
+    if tag == "LEGENDS":
+        return ["FinkleIsEinhorn", "DusterCrusher", "Easystreet31", "UpperDuck"]
+    if tag == "ANA":
+        return ["UpperDuck", "Easystreet31", "DusterCrusher", "FinkleIsEinhorn"]
+    if tag in ("DAL", "LAK", "PIT"):
+        return ["DusterCrusher", "Easystreet31", "FinkleIsEinhorn", "UpperDuck"]
+    return ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn", "UpperDuck"]
+
+def _detect_tag(player_key: str, tags: t.Dict[str, t.Set[str]]) -> t.Optional[str]:
+    for k in ("LEGENDS","ANA","DAL","LAK","PIT"):
+        if player_key in tags.get(k, set()):
+            return k
+    return None
+
+def _wingnut_guard_meta(leader: _Leader, player_key: str) -> t.Dict[str, t.Any]:
+    # purely informational trace; no enforcement here
+    rows = leader["sp_map"].get(player_key, {})
+    if not rows:
+        return {"wingnut_guard_applied": False, "allowed": True}
+    # rank Wingnut84 if present
+    sorted_rows = sorted([(acc, sp) for acc, sp in rows.items()], key=lambda x: -int(x[1]))
+    rank = None
+    for i, (acc, _sp) in enumerate(sorted_rows, start=1):
+        if acc == _canon_key("Wingnut84"):
+            rank = i
+            break
+    if rank is None:
+        return {"wingnut_guard_applied": False, "allowed": True}
+    return {"wingnut_guard_applied": True, "allowed": True, "wingnut_rank": rank}
+
+@app.post("/family_evaluate_trade_by_urls")
+def family_evaluate_trade_by_urls(req: FamilyEvaluateTradeReq):
+    # Resolve URLs
+    try:
+        lb_url = _pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)
+        tags_url = _pick_url(req.player_tags_url, "player_tags", req.prefer_env_defaults)
+        holds = holdings_from_urls(req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url,
+                                   req.prefer_env_defaults, req.holdings_ud_url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"missing_urls: {e}")
+
+    # Load leaderboard + tags
+    try:
+        leader = normalize_leaderboard(fetch_xlsx(lb_url))
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"download_failed: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"parse_failed: {e}")
+
+    try:
+        tags = _load_player_tags(req.prefer_env_defaults, tags_url)
+    except Exception as e:
+        # Non-fatal: just proceed with empty tags
+        tags = {"LEGENDS": set(), "ANA": set(), "DAL": set(), "LAK": set(), "PIT": set()}
+
+    # Build family SP before (effective = max(leaderboard, holdings))
+    fam_before: t.Dict[str, t.Dict[str, int]] = {a: {} for a in FAMILY_ACCOUNTS}
+    all_players: t.Set[str] = set(leader["sp_map"].keys())
+    for a in FAMILY_ACCOUNTS:
+        all_players.update(_norm_key(k) for k in holds.get(a, {}).keys())
+
+    for p in all_players:
+        for a in FAMILY_ACCOUNTS:
+            lb = _lb_family_sp_for(leader, p, a)
+            hold = int(holds.get(a, {}).get(p, 0))
+            fam_before[a][p] = max(lb, hold)
+
+    # Accumulate intended GET and GIVE by player
+    get_add: t.Dict[str, int] = defaultdict(int)
+    give_subtract: t.Dict[str, int] = defaultdict(int)
+    for line in req.trade:
+        subjects = split_multi_subject_players(line.players) if req.multi_subject_rule == "full_each_unique" else [line.players]
+        for subj in subjects:
+            pkey = _norm_key(subj)
+            if line.side == "GET":
+                get_add[pkey] += int(line.sp)
+            else:
+                give_subtract[pkey] += int(line.sp)
+
+    # Decide routing for GETs
+    allocation_plan: t.List[t.Dict[str, t.Any]] = []
+    routed_to: t.Dict[str, t.Tuple[str,int]] = {}  # player_key -> (account, add_sp)
+    for pkey, add_sp in get_add.items():
+        tag = _detect_tag(pkey, tags)
+        order = _route_order_for(tag)
+        # best-holder fallback if no tag: pick family account with max current SP
+        to = None
+        if tag is None:
+            best_sp = -1
+            for a in FAMILY_ACCOUNTS:
+                cur = int(fam_before[a].get(pkey, 0))
+                if cur > best_sp or (cur == best_sp and to is not None and order.index(a) < order.index(to)):
+                    best_sp = cur
+                    to = a
+            if to is None:
+                to = order[0]
+        else:
+            to = order[0]
+
+        routed_to[pkey] = (to, add_sp)
+        trace = {
+            "policy": "tag_first_or_best_holder_with_wingnut_guard",
+            "order": order,
+            "wingnut_guard": _wingnut_guard_meta(leader, pkey),
+        }
+        allocation_plan.append({"type":"GET","to":to,"players":[leader["display_names"].get(pkey, pkey)],"sp":int(add_sp),"routing_trace":trace})
+
+    # Apply deltas to produce fam_after
+    fam_after: t.Dict[str, t.Dict[str, int]] = {a: dict(spmap) for a, spmap in fam_before.items()}
+    # GET adds
+    for pkey, (to, add_sp) in routed_to.items():
+        fam_after[to][pkey] = int(fam_after[to].get(pkey, 0)) + int(add_sp)
+    # GIVE subtracts (always on trade_account)
+    for pkey, sub_sp in give_subtract.items():
+        fam_after[req.trade_account][pkey] = int(fam_after[req.trade_account].get(pkey, 0)) - int(sub_sp)
+        if fam_after[req.trade_account][pkey] < 0:
+            fam_after[req.trade_account][pkey] = 0  # clamp at zero for display
+
+    # Compute player changes for touched players
+    touched = set(get_add.keys()) | set(give_subtract.keys())
+    player_changes: t.List[t.Dict[str, t.Any]] = []
+
+    for pkey in sorted(touched):
+        disp = leader["display_names"].get(pkey, pkey)
+        per_before = {a: int(fam_before[a].get(pkey, 0)) for a in FAMILY_ACCOUNTS}
+        per_after  = {a: int(fam_after[a].get(pkey, 0)) for a in FAMILY_ACCOUNTS}
+        sp_before = sum(per_before.values())
+        sp_after  = sum(per_after.values())
+        delta_sp = sp_after - sp_before
+
+        r1, b1, _a1, _sp1 = _rank_and_buffer_full_leader(pkey, leader, per_before)
+        r2, b2, _a2, _sp2 = _rank_and_buffer_full_leader(pkey, leader, per_after)
+
+        change = {
+            "player": disp,
+            "sp_before": sp_before,
+            "sp_after": sp_after,
+            "delta_sp": delta_sp,
+            "per_account_sp_before": per_before,
+            "per_account_sp_after": per_after,
+            "per_account_sp_delta": {a: per_after[a]-per_before[a] for a in FAMILY_ACCOUNTS},
+            "best_rank_before": r1, "best_rank_after": r2,
+            "best_rank_before_label": str(r1) if r1 is not None else "—",
+            "best_rank_after_label": str(r2) if r2 is not None else "—",
+            "buffer_before": b1, "buffer_after": b2,
+            "delta_buffer": (b2 - b1) if (b1 is not None and b2 is not None) else None,
+            "qp_before": 0, "qp_after": 0, "delta_qp": 0,
+        }
+        player_changes.append(change)
+
+    # Totals & verdict
+    total_sp = sum(int(p["delta_sp"] or 0) for p in player_changes)
+    total_buf = sum(int(p["delta_buffer"] or 0) for p in player_changes if p["delta_buffer"] is not None)
+    total_qp = sum(int(p["delta_qp"] or 0) for p in player_changes)
+    if total_qp > 0:
+        verdict = "APPROVE"
+    elif total_qp == 0:
+        verdict = "CAUTION"
+    else:
+        verdict = "DECLINE"
+
+    # Family QP snapshot (before/after) — from leaderboard semantics
+    fam_qp_before, _, _ = compute_family_qp(leader, fam_before)
+    fam_qp_after,  _, _ = compute_family_qp(leader, fam_after)
+
+    return {
+        "ok": True,
+        "allocation_plan": allocation_plan,
+        "player_changes": player_changes,
+        "total_changes": {"delta_sp": total_sp, "delta_buffer": total_buf, "delta_qp": total_qp},
+        "verdict": verdict,
+        "ownership_warnings": [],
+        "family_qp_before": int(fam_qp_before),
+        "family_qp_after": int(fam_qp_after),
+    }
