@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field, validator
 
 app = FastAPI(
     title="Ultimate Quest Service (Small-Payload API)",
-    version=os.getenv("APP_VERSION", "4.12.6"),
+    version=os.getenv("APP_VERSION", "4.12.7"),
 )
 
 # --------------------------------------------------------------------------------------
@@ -28,12 +28,20 @@ FAMILY_ACCOUNTS: t.List[str] = [
     "UpperDuck",
 ]
 
+def _strip_user_suffix(s: t.Any) -> str:
+    """
+    Leaderboard usernames sometimes look like 'Handle\\n(1234)'.
+    We want the base handle only: strip at the first '(' and the first newline.
+    """
+    s = str(s or "")
+    s = s.split("\n", 1)[0]
+    s = s.split("(", 1)[0]
+    return s.strip()
+
 def _canon_key(s: t.Any) -> str:
     """
-    Canonicalize account identifiers so leaderboard usernames like
-    'Finkle Is Einhorn' match 'FinkleIsEinhorn':
-      - lowercase
-      - remove all non-alphanumeric characters
+    Canonicalize account identifiers so 'Finkle Is Einhorn' and 'FinkleIsEinhorn'
+    both match: lowercase + remove all non-alphanumeric.
     """
     raw = "".join(ch for ch in str(s or "") if ch.isalnum())
     return raw.lower()
@@ -195,7 +203,7 @@ def _detect_col(df: pd.DataFrame, candidates: t.Iterable[str]) -> str:
 def _detect_col_qp(df: pd.DataFrame) -> t.Optional[str]:
     """
     Fuzzy detector for QP column. Accepts: 'qp', 'QP', 'quest', 'quest_points',
-    'quest points', 'questpoints', 'quest total', etc.
+    'quest points', 'questpoints', 'quest total', 'quest_total', etc.
     """
     # First try the exact names
     for base in ("qp", "quest", "quest_points"):
@@ -244,8 +252,9 @@ def normalize_leaderboard(sheets: t.Dict[str, pd.DataFrame]) -> _Leader:
         except KeyError:
             continue
 
+    # Clean values
     df[col_player]  = df[col_player].map(_norm_name)
-    df[col_account] = df[col_account].map(_norm_name)
+    df[col_account] = df[col_account].map(_strip_user_suffix).map(_norm_name)
     df[col_sp]      = pd.to_numeric(df[col_sp], errors="coerce").fillna(0).astype(int)
     if col_qp:
         df[col_qp]   = pd.to_numeric(df[col_qp], errors="coerce").fillna(0).astype(int)
@@ -393,11 +402,10 @@ def compute_family_qp(
 ) -> t.Tuple[int, t.Dict[str, int], t.Dict[str, t.Any]]:
     """
     Hybrid QP semantics:
-      1) Try leaderboard-QP sum (sum 'qp' for rows whose account belongs to the family,
-         after canonicalizing account names).
+      1) Try leaderboard-QP sum (sum 'qp' for rows whose account belongs to the family
+         after canonicalizing/cleaning usernames).
       2) If that total is 0, fall back to derived QP = number of players where the family
          holds Rank-1 (credit the point to the best family account).
-    Returns: (family_qp_total, per_account_qp_map, details)
     """
     # (1) Leaderboard-QP sum
     lb_total = 0
@@ -451,5 +459,5 @@ def compute_family_qp(
     return int(derived_total), derived_per_acct, details
 
 # --------------------------------------------------------------------------------------
-# (The rest of your endpoints live in main.py; we only expose /defaults + helpers here)
+# (Endpoints are in main.py; we only expose /defaults + helpers here)
 # --------------------------------------------------------------------------------------
