@@ -1,6 +1,5 @@
 import io
 import os
-import math
 import typing as t
 from collections import defaultdict
 
@@ -15,11 +14,11 @@ from pydantic import BaseModel, Field, validator
 
 app = FastAPI(
     title="Ultimate Quest Service (Small-Payload API)",
-    version=os.getenv("APP_VERSION", "4.12.4"),
+    version=os.getenv("APP_VERSION", "4.12.5"),
 )
 
 # --------------------------------------------------------------------------------------
-# Constants / family
+# Family accounts (display names) and canonicalization
 # --------------------------------------------------------------------------------------
 
 FAMILY_ACCOUNTS: t.List[str] = [
@@ -28,7 +27,24 @@ FAMILY_ACCOUNTS: t.List[str] = [
     "FinkleIsEinhorn",
     "UpperDuck",
 ]
-_FAMILY_KEYS = {a.lower() for a in FAMILY_ACCOUNTS}
+
+def _canon_key(s: t.Any) -> str:
+    """
+    Canonicalize account identifiers so leaderboard usernames like
+    'Finkle Is Einhorn' match 'FinkleIsEinhorn':
+      - lowercase
+      - remove all non-alphanumeric characters
+    """
+    raw = "".join(ch for ch in str(s or "") if ch.isalnum())
+    return raw.lower()
+
+# Canon sets/maps for fast lookup and stable display mapping
+_FAMILY_CANON_TO_DISPLAY: t.Dict[str, str] = { _canon_key(a): a for a in FAMILY_ACCOUNTS }
+_FAMILY_KEYS: t.Set[str] = set(_FAMILY_CANON_TO_DISPLAY.keys())
+
+# --------------------------------------------------------------------------------------
+# Rivals (from env)
+# --------------------------------------------------------------------------------------
 
 SYNDICATE: t.Set[str] = set(
     (os.getenv("DEFAULT_TARGET_RIVALS") or "chfkyle,VjV5,FireRanger,Tfunite,Ovi8")
@@ -69,7 +85,7 @@ class FamilyEvaluateTradeReq(BaseModel):
         return v
 
 # --------------------------------------------------------------------------------------
-# /defaults (simple env projection used by clients)
+# /defaults  (simple env projection used by clients)
 # --------------------------------------------------------------------------------------
 
 def _env(k: str, default: t.Optional[str] = None) -> t.Optional[str]:
@@ -98,7 +114,7 @@ def defaults():
         "rivals": list(SYNDICATE),
         "defend_buffer_all": int(os.getenv("DEFAULT_DEFEND_BUFFER_ALL", "15")),
         "fragility_default": os.getenv("TRADE_FRAGILITY_DEFAULT", "trade_delta"),
-        "force_family_urls": os.getenv("FORCE_FAMILY_URLS", "true").lower() in ("1", "true", "yes", "y", "on"),
+        "force_family_urls": os.getenv("FORCE_FAMILY_URLS", "true").lower() in ("1","true","yes","y","on"),
     }
 
 # --------------------------------------------------------------------------------------
@@ -148,6 +164,7 @@ def fetch_xlsx(url: str) -> t.Dict[str, pd.DataFrame]:
         sheets = {}
         for name in xf.sheet_names:
             df = xf.parse(name)
+            # keep original header spellings; normalize later
             df.columns = [str(c).strip() for c in df.columns]
             sheets[name] = df
         return sheets
@@ -176,18 +193,18 @@ def _detect_col(df: pd.DataFrame, candidates: t.Iterable[str]) -> str:
     raise KeyError(f"Missing required column (tried {list(candidates)}) in columns: {list(df.columns)}")
 
 # --------------------------------------------------------------------------------------
-# Leaderboard normalization
+# Leaderboard normalization (store *canonical* account keys)
 # --------------------------------------------------------------------------------------
 
 class _Row(t.TypedDict, total=False):
-    account: str
+    account: str   # canonical key (alnum-only, lowercase)
     sp: int
     qp: int
     rank: t.Optional[int]
 
 class _Leader(t.TypedDict):
     by_player: t.Dict[str, t.List[_Row]]
-    sp_map: t.Dict[str, t.Dict[str, int]]
+    sp_map: t.Dict[str, t.Dict[str, int]]  # {player_key: {account_canon: sp}}
 
 def normalize_leaderboard(sheets: t.Dict[str, pd.DataFrame]) -> _Leader:
     name = next(iter(sheets))
@@ -215,21 +232,24 @@ def normalize_leaderboard(sheets: t.Dict[str, pd.DataFrame]) -> _Leader:
     df[col_account] = df[col_account].map(_norm_name)
     df[col_sp]      = pd.to_numeric(df[col_sp], errors="coerce").fillna(0).astype(int)
     if col_qp:
-        df[col_qp]  = pd.to_numeric(df[col_qp], errors="coerce").fillna(0).astype(int)
+        df[col_qp]   = pd.to_numeric(df[col_qp], errors="coerce").fillna(0).astype(int)
     if col_rank:
-        df[col_rank]= pd.to_numeric(df[col_rank], errors="coerce").fillna(0).astype(int)
+        df[col_rank] = pd.to_numeric(df[col_rank], errors="coerce").fillna(0).astype(int)
 
     by_player: t.Dict[str, t.List[_Row]] = defaultdict(list)
     sp_map: t.Dict[str, t.Dict[str, int]] = defaultdict(dict)
 
     for _, row in df.iterrows():
         p = _norm_key(row[col_player])
-        a = _norm_key(row[col_account])
+        a_canon = _canon_key(row[col_account])
         sp = int(row[col_sp]) if pd.notna(row[col_sp]) else 0
         qp = int(row[col_qp]) if col_qp and pd.notna(row[col_qp]) else 0
         rk = int(row[col_rank]) if col_rank and pd.notna(row[col_rank]) else None
-        by_player[p].append(t.cast(_Row, {"account": a, "sp": sp, "qp": qp, "rank": rk}))
-        sp_map[p][a] = max(int(sp_map[p].get(a, 0)), sp)
+
+        by_player[p].append(_Row(account=a_canon, sp=sp, qp=qp, rank=rk))
+        # Record the max SP seen for (player, account)
+        prev = int(sp_map[p].get(a_canon, 0))
+        sp_map[p][a_canon] = max(prev, sp)
 
     return t.cast(_Leader, {"by_player": dict(by_player), "sp_map": dict(sp_map)})
 
@@ -295,11 +315,12 @@ def _load_player_tags(prefer_env_defaults: bool, player_tags_url: t.Optional[str
     return tags
 
 # --------------------------------------------------------------------------------------
-# Rank/buffer/QP helpers
+# Rank/buffer/QP helpers  (use canonical keys for accounts)
 # --------------------------------------------------------------------------------------
 
 def _lb_family_sp_for(leader: "_Leader", player: str, account: str) -> int:
-    p = _norm_key(player); a = _norm_key(account)
+    p = _norm_key(player)
+    a = _canon_key(account)
     return int(leader["sp_map"].get(p, {}).get(a, 0))
 
 def split_multi_subject_players(players_field: str) -> t.List[str]:
@@ -309,6 +330,10 @@ def split_multi_subject_players(players_field: str) -> t.List[str]:
 def _rank_and_buffer_full_leader(
     player: str, leader: "_Leader", family_eff: t.Dict[str, int]
 ) -> t.Tuple[t.Optional[int], t.Optional[int], t.Optional[str], t.Optional[int]]:
+    """
+    Compute best family rank among ALL accounts on leaderboard + the buffer vs best non-family.
+    Accounts in 'leader' are canonical; we compare against canonical family keys.
+    """
     p = _norm_key(player)
     rows = leader["by_player"].get(p, [])
     if not rows and all(v <= 0 for v in family_eff.values()):
@@ -316,16 +341,19 @@ def _rank_and_buffer_full_leader(
 
     combined: t.Dict[str, int] = {}
     for r in rows:
-        combined[r["account"]] = max(int(combined.get(r["account"], 0)), int(r["sp"] or 0))
-    for a, sp in family_eff.items():
-        combined[_norm_key(a)] = int(max(0, sp))
+        combined[str(r["account"])] = max(int(combined.get(str(r["account"]), 0)), int(r["sp"] or 0))
+    for a_disp, sp in family_eff.items():
+        combined[_canon_key(a_disp)] = int(max(0, sp))
 
-    fam_best_acct = None
+    # Determine best family & best rival
+    fam_best_acct_disp = None
     fam_best_sp = -1
-    for a in FAMILY_ACCOUNTS:
-        k = _norm_key(a); v = int(combined.get(k, 0))
-        if v > fam_best_sp or (v == fam_best_sp and fam_best_acct is not None and FAMILY_ACCOUNTS.index(a) < FAMILY_ACCOUNTS.index(fam_best_acct)):
-            fam_best_sp, fam_best_acct = v, a
+    for a_disp in FAMILY_ACCOUNTS:
+        k = _canon_key(a_disp)
+        v = int(combined.get(k, 0))
+        if v > fam_best_sp or (v == fam_best_sp and fam_best_acct_disp is not None and FAMILY_ACCOUNTS.index(a_disp) < FAMILY_ACCOUNTS.index(fam_best_acct_disp)):
+            fam_best_sp = v
+            fam_best_acct_disp = a_disp
 
     best_nonfamily_sp = 0
     for acc, v in combined.items():
@@ -336,7 +364,7 @@ def _rank_and_buffer_full_leader(
     higher = sum(1 for v in combined.values() if v > fam_best_sp)
     rank = 1 + higher
     buffer = fam_best_sp - best_nonfamily_sp
-    return rank, buffer, fam_best_acct, fam_best_sp
+    return rank, buffer, fam_best_acct_disp, fam_best_sp
 
 def _rank_context_smallset(player: str, leader: "_Leader", eff_map: t.Dict[str, t.Dict[str, int]]) -> t.Dict[str, t.Any]:
     fam_eff = {a: int(eff_map.get(a, {}).get(player, 0)) for a in FAMILY_ACCOUNTS}
@@ -349,24 +377,21 @@ def compute_family_qp(
 ) -> t.Tuple[int, t.Dict[str, int], t.Dict[str, t.Any]]:
     """
     Leaderboard-QP semantics:
-      Sum the leaderboard 'qp' for all rows where the account belongs to the family.
-      (This mirrors the earlier probe that showed a large family total; deltas in
-       evaluate will typically remain 0 unless the leaderboard itself changes.)
+      Sum the leaderboard 'qp' for all rows where the account belongs to the family
+      (account matching is canonicalized to ignore spaces/punctuation/case).
     """
     total_qp = 0
     per_acct_qp = {a: 0 for a in FAMILY_ACCOUNTS}
 
     for rows in leader["by_player"].values():
         for r in rows:
-            acc = str(r.get("account") or "").lower()
+            acc_canon = str(r.get("account") or "")
             qp = int(r.get("qp") or 0)
-            if acc in _FAMILY_KEYS:
+            if acc_canon in _FAMILY_KEYS:
                 total_qp += qp
-                # attribute to display name (case-insensitive)
-                for disp in FAMILY_ACCOUNTS:
-                    if disp.lower() == acc:
-                        per_acct_qp[disp] += qp
-                        break
+                disp = _FAMILY_CANON_TO_DISPLAY.get(acc_canon)
+                if disp:
+                    per_acct_qp[disp] += qp
 
     details: t.Dict[str, t.Any] = {"source": "leaderboard_qp_sum", "per_account_qp": per_acct_qp}
     return int(total_qp), per_acct_qp, details
