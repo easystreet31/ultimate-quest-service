@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field, validator
 
 app = FastAPI(
     title="Ultimate Quest Service (Small-Payload API)",
-    version=os.getenv("APP_VERSION", "4.12.5"),
+    version=os.getenv("APP_VERSION", "4.12.6"),
 )
 
 # --------------------------------------------------------------------------------------
@@ -38,7 +38,6 @@ def _canon_key(s: t.Any) -> str:
     raw = "".join(ch for ch in str(s or "") if ch.isalnum())
     return raw.lower()
 
-# Canon sets/maps for fast lookup and stable display mapping
 _FAMILY_CANON_TO_DISPLAY: t.Dict[str, str] = { _canon_key(a): a for a in FAMILY_ACCOUNTS }
 _FAMILY_KEYS: t.Set[str] = set(_FAMILY_CANON_TO_DISPLAY.keys())
 
@@ -176,14 +175,15 @@ def _norm_key(s: t.Any) -> str:
     return _norm_name(s).lower()
 
 def _detect_col(df: pd.DataFrame, candidates: t.Iterable[str]) -> str:
+    """Exact match (case-insensitive) for common column names."""
     lower_map = {str(c).lower(): str(c) for c in df.columns}
     for want in candidates:
         lw = want.lower()
         if lw in lower_map:
             return lower_map[lw]
-    # heuristics for common aliases (username/handle/account_name/etc.)
+    # heuristics for 'user'/'account' family
     for c in df.columns:
-        cl = str(c).lower()
+        cl = str(c).lower().strip()
         if any(tok in cl for tok in ("username", "user_name")) and "user" in [w.lower() for w in candidates]:
             return c
         if any(tok in cl for tok in ("handle",)) and "user" in [w.lower() for w in candidates]:
@@ -191,6 +191,28 @@ def _detect_col(df: pd.DataFrame, candidates: t.Iterable[str]) -> str:
         if any(tok in cl for tok in ("account_name", "acct", "acct_name")) and "account" in [w.lower() for w in candidates]:
             return c
     raise KeyError(f"Missing required column (tried {list(candidates)}) in columns: {list(df.columns)}")
+
+def _detect_col_qp(df: pd.DataFrame) -> t.Optional[str]:
+    """
+    Fuzzy detector for QP column. Accepts: 'qp', 'QP', 'quest', 'quest_points',
+    'quest points', 'questpoints', 'quest total', etc.
+    """
+    # First try the exact names
+    for base in ("qp", "quest", "quest_points"):
+        try:
+            return _detect_col(df, [base])
+        except KeyError:
+            pass
+    # Fuzzy contains
+    for c in df.columns:
+        cl = str(c).lower().strip()
+        if cl == "qp":
+            return c
+        if "quest" in cl and ("point" in cl or "total" in cl or "qp" in cl):
+            return c
+        if "qp" in cl:
+            return c
+    return None
 
 # --------------------------------------------------------------------------------------
 # Leaderboard normalization (store *canonical* account keys)
@@ -213,13 +235,7 @@ def normalize_leaderboard(sheets: t.Dict[str, pd.DataFrame]) -> _Leader:
     col_player  = _detect_col(df, ["player", "players", "subject", "name"])
     col_account = _detect_col(df, ["account", "username", "user", "owner", "handle"])
     col_sp      = _detect_col(df, ["sp", "score", "points"])
-
-    col_qp = None
-    for cand in ("qp", "quest", "quest_points"):
-        try:
-            col_qp = _detect_col(df, [cand]); break
-        except KeyError:
-            continue
+    col_qp      = _detect_col_qp(df)
 
     col_rank = None
     for cand in ("rank", "position"):
@@ -376,25 +392,63 @@ def compute_family_qp(
     leader: "_Leader", accounts: t.Dict[str, t.Dict[str, int]]
 ) -> t.Tuple[int, t.Dict[str, int], t.Dict[str, t.Any]]:
     """
-    Leaderboard-QP semantics:
-      Sum the leaderboard 'qp' for all rows where the account belongs to the family
-      (account matching is canonicalized to ignore spaces/punctuation/case).
+    Hybrid QP semantics:
+      1) Try leaderboard-QP sum (sum 'qp' for rows whose account belongs to the family,
+         after canonicalizing account names).
+      2) If that total is 0, fall back to derived QP = number of players where the family
+         holds Rank-1 (credit the point to the best family account).
+    Returns: (family_qp_total, per_account_qp_map, details)
     """
-    total_qp = 0
-    per_acct_qp = {a: 0 for a in FAMILY_ACCOUNTS}
-
+    # (1) Leaderboard-QP sum
+    lb_total = 0
+    lb_per_acct = {a: 0 for a in FAMILY_ACCOUNTS}
     for rows in leader["by_player"].values():
         for r in rows:
             acc_canon = str(r.get("account") or "")
             qp = int(r.get("qp") or 0)
             if acc_canon in _FAMILY_KEYS:
-                total_qp += qp
+                lb_total += qp
                 disp = _FAMILY_CANON_TO_DISPLAY.get(acc_canon)
                 if disp:
-                    per_acct_qp[disp] += qp
+                    lb_per_acct[disp] += qp
 
-    details: t.Dict[str, t.Any] = {"source": "leaderboard_qp_sum", "per_account_qp": per_acct_qp}
-    return int(total_qp), per_acct_qp, details
+    if lb_total > 0:
+        details: t.Dict[str, t.Any] = {
+            "source": "leaderboard_qp_sum",
+            "lb_qp_sum": int(lb_total),
+            "derived_rank1_count": None,
+            "per_account_qp": lb_per_acct,
+        }
+        return int(lb_total), lb_per_acct, details
+
+    # (2) Derived QP: count family Rank-1s
+    derived_total = 0
+    derived_per_acct = {a: 0 for a in FAMILY_ACCOUNTS}
+
+    # Build 'effective' family SP map for each player (max of LB vs holdings)
+    all_players: t.Set[str] = set(leader["by_player"].keys())
+    for a in FAMILY_ACCOUNTS:
+        all_players.update(_norm_key(p) for p in accounts.get(a, {}).keys())
+
+    for p in all_players:
+        fam_eff = {}
+        for a in FAMILY_ACCOUNTS:
+            lb = _lb_family_sp_for(leader, p, a)
+            hold = int(accounts.get(a, {}).get(p, 0))
+            fam_eff[a] = max(lb, hold)
+
+        r, _buf, best_a, _sp = _rank_and_buffer_full_leader(p, leader, fam_eff)
+        if r is not None and r == 1 and best_a:
+            derived_total += 1
+            derived_per_acct[best_a] += 1
+
+    details = {
+        "source": "derived_rank1_count",
+        "lb_qp_sum": int(lb_total),
+        "derived_rank1_count": int(derived_total),
+        "per_account_qp": derived_per_acct,
+    }
+    return int(derived_total), derived_per_acct, details
 
 # --------------------------------------------------------------------------------------
 # (The rest of your endpoints live in main.py; we only expose /defaults + helpers here)
