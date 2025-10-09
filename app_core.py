@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field, validator
 
 app = FastAPI(
     title="Ultimate Quest Service (Small-Payload API)",
-    version=os.getenv("APP_VERSION", "4.12.2"),
+    version=os.getenv("APP_VERSION", "4.12.3"),
 )
 
 # --------------------------------------------------------------------------------------
@@ -28,6 +28,7 @@ FAMILY_ACCOUNTS: t.List[str] = [
     "FinkleIsEinhorn",
     "UpperDuck",
 ]
+_FAMILY_KEYS = {a.lower() for a in FAMILY_ACCOUNTS}
 
 SYNDICATE: t.Set[str] = set(
     (os.getenv("DEFAULT_TARGET_RIVALS") or "chfkyle,VjV5,FireRanger,Tfunite,Ovi8")
@@ -105,9 +106,6 @@ def defaults():
 # --------------------------------------------------------------------------------------
 
 def _pick_url(explicit: t.Optional[str], kind: str, prefer_env_defaults: bool) -> str:
-    """
-    Choose an explicit URL if provided; otherwise fall back to env defaults by kind.
-    """
     if explicit and explicit.strip():
         return explicit.strip()
 
@@ -145,15 +143,11 @@ def _http_get_bytes(url: str) -> bytes:
     return r.content
 
 def fetch_xlsx(url: str) -> t.Dict[str, pd.DataFrame]:
-    """
-    Download a Google Sheets 'export?format=xlsx' file and return a dict of sheetname->DataFrame.
-    """
     raw = _http_get_bytes(url)
     with pd.ExcelFile(io.BytesIO(raw)) as xf:
         sheets = {}
         for name in xf.sheet_names:
             df = xf.parse(name)
-            # Normalize column names to strings (keep original case for content)
             df.columns = [str(c).strip() for c in df.columns]
             sheets[name] = df
         return sheets
@@ -165,19 +159,17 @@ def _norm_key(s: t.Any) -> str:
     return _norm_name(s).lower()
 
 def _detect_col(df: pd.DataFrame, candidates: t.Iterable[str]) -> str:
-    """
-    Find the first matching column from candidates (case-insensitive).
-    Raises KeyError if none found.
-    """
     lower_map = {str(c).lower(): str(c) for c in df.columns}
     for want in candidates:
         lw = want.lower()
         if lw in lower_map:
             return lower_map[lw]
-    # try prefix/contains heuristics for 'user'/'acct' variants (e.g., 'username')
+    # heuristics for common aliases (username/handle/account_name/etc.)
     for c in df.columns:
         cl = str(c).lower()
         if any(tok in cl for tok in ("username", "user_name")) and "user" in [w.lower() for w in candidates]:
+            return c
+        if any(tok in cl for tok in ("handle",)) and "user" in [w.lower() for w in candidates]:
             return c
         if any(tok in cl for tok in ("account_name", "acct", "acct_name")) and "account" in [w.lower() for w in candidates]:
             return c
@@ -187,42 +179,38 @@ def _detect_col(df: pd.DataFrame, candidates: t.Iterable[str]) -> str:
 # Leaderboard normalization
 # --------------------------------------------------------------------------------------
 
+class _Row(t.TypedDict, total=False):
+    account: str
+    sp: int
+    qp: int
+    rank: t.Optional[int]
+
 class _Leader(t.TypedDict):
-    # per-player -> list of (account, sp, qp, rank) rows from the sheet
-    by_player: t.Dict[str, t.List[t.Dict[str, t.Any]]]
-    # quick lookup: per-player -> {account_lower: sp}
+    by_player: t.Dict[str, t.List[_Row]]
     sp_map: t.Dict[str, t.Dict[str, int]]
 
 def normalize_leaderboard(sheets: t.Dict[str, pd.DataFrame]) -> _Leader:
-    """
-    Accepts the dict returned by fetch_xlsx and builds a structure suitable
-    for rank/buffer/QP computations. We are defensive on column names.
-    """
-    # Pick the first sheet (your export usually has a single sheet named "subject_leaderboards.csv")
     name = next(iter(sheets))
     df = sheets[name].copy()
 
-    # Detect columns (accept common aliases)
     col_player = _detect_col(df, ["player", "players", "subject", "name"])
     col_account = _detect_col(df, ["account", "username", "user", "owner", "handle"])
     col_sp = _detect_col(df, ["sp", "score", "points"])
-    # Optional columns
+
     col_qp = None
     for cand in ("qp", "quest", "quest_points"):
         try:
-            col_qp = _detect_col(df, [cand])
-            break
-        except KeyError:
-            continue
-    col_rank = None
-    for cand in ("rank", "position"):
-        try:
-            col_rank = _detect_col(df, [cand])
-            break
+            col_qp = _detect_col(df, [cand]); break
         except KeyError:
             continue
 
-    # Clean & coerce
+    col_rank = None
+    for cand in ("rank", "position"):
+        try:
+            col_rank = _detect_col(df, [cand]); break
+        except KeyError:
+            continue
+
     df[col_player] = df[col_player].map(_norm_name)
     df[col_account] = df[col_account].map(_norm_name)
     df[col_sp] = pd.to_numeric(df[col_sp], errors="coerce").fillna(0).astype(int)
@@ -231,7 +219,7 @@ def normalize_leaderboard(sheets: t.Dict[str, pd.DataFrame]) -> _Leader:
     if col_rank:
         df[col_rank] = pd.to_numeric(df[col_rank], errors="coerce").fillna(0).astype(int)
 
-    by_player: t.Dict[str, t.List[t.Dict[str, t.Any]]] = defaultdict(list)
+    by_player: t.Dict[str, t.List[_Row]] = defaultdict(list)
     sp_map: t.Dict[str, t.Dict[str, int]] = defaultdict(dict)
 
     for _, row in df.iterrows():
@@ -240,10 +228,8 @@ def normalize_leaderboard(sheets: t.Dict[str, pd.DataFrame]) -> _Leader:
         sp = int(row[col_sp]) if pd.notna(row[col_sp]) else 0
         qp = int(row[col_qp]) if col_qp and pd.notna(row[col_qp]) else 0
         rk = int(row[col_rank]) if col_rank and pd.notna(row[col_rank]) else None
-        by_player[p].append({"account": a, "sp": sp, "qp": qp, "rank": rk})
-        # Record the max SP seen for (player, account)
-        prev = int(sp_map[p].get(a, 0))
-        sp_map[p][a] = max(prev, sp)
+        by_player[p].append(t.cast(_Row, {"account": a, "sp": sp, "qp": qp, "rank": rk}))
+        sp_map[p][a] = max(int(sp_map[p].get(a, 0)), sp)
 
     return t.cast(_Leader, {"by_player": dict(by_player), "sp_map": dict(sp_map)})
 
@@ -252,21 +238,14 @@ def normalize_leaderboard(sheets: t.Dict[str, pd.DataFrame]) -> _Leader:
 # --------------------------------------------------------------------------------------
 
 def _frame_to_holdings(df: pd.DataFrame) -> t.Dict[str, int]:
-    """
-    Accepts a sheet with (player, sp or count) and returns {player_name: sp}.
-    We'll prefer 'sp' if present; otherwise use 'count' as SP.
-    """
-    # Try to detect the two main columns
     col_player = _detect_col(df, ["player", "players", "subject", "name"])
     col_sp = None
     for c in ("sp", "score", "points", "count", "qty", "quantity"):
         try:
-            col_sp = _detect_col(df, [c])
-            break
+            col_sp = _detect_col(df, [c]); break
         except KeyError:
             continue
     if not col_sp:
-        # Fallback: any numeric column
         numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
         if not numeric_cols:
             return {}
@@ -285,10 +264,6 @@ def holdings_from_urls(
     prefer_env_defaults: bool,
     holdings_ud_url: t.Optional[str],
 ) -> t.Dict[str, t.Dict[str, int]]:
-    """
-    Load four account holdings from explicit urls or env defaults.
-    Returns: {account: {player_name: sp}}
-    """
     urls = {
         "Easystreet31": _pick_url(holdings_e31_url, "holdings_e31", prefer_env_defaults),
         "DusterCrusher": _pick_url(holdings_dc_url,  "holdings_dc",  prefer_env_defaults),
@@ -299,32 +274,23 @@ def holdings_from_urls(
     for acct, url in urls.items():
         raw = _http_get_bytes(url)
         with pd.ExcelFile(io.BytesIO(raw)) as xf:
-            # Use the first sheet by convention
             df = xf.parse(xf.sheet_names[0])
             out[acct] = _frame_to_holdings(df)
     return out
 
 def _load_player_tags(prefer_env_defaults: bool, player_tags_url: t.Optional[str]) -> t.Dict[str, t.Set[str]]:
-    """
-    Load tags workbook (tabs: Legends, ANA, DAL, LAK, PIT).
-    Returns lower-cased player name sets per tag.
-    """
     url = _pick_url(player_tags_url, "player_tags", prefer_env_defaults)
     raw = _http_get_bytes(url)
     tags: t.Dict[str, t.Set[str]] = {"LEGENDS": set(), "ANA": set(), "DAL": set(), "LAK": set(), "PIT": set()}
     with pd.ExcelFile(io.BytesIO(raw)) as xf:
-        for tab, key in [
-            ("Legends", "LEGENDS"),
-            ("ANA", "ANA"), ("DAL", "DAL"), ("LAK", "LAK"), ("PIT", "PIT")
-        ]:
+        for tab, key in [("Legends", "LEGENDS"), ("ANA", "ANA"), ("DAL", "DAL"), ("LAK", "LAK"), ("PIT", "PIT")]:
             if tab not in xf.sheet_names:
                 continue
             df = xf.parse(tab)
             if df.empty:
                 continue
-            # First non-empty column
             col = df.columns[0]
-            vals = [ _norm_key(v) for v in list(df[col].astype(str)) if str(v).strip() ]
+            vals = [_norm_key(v) for v in list(df[col].astype(str)) if str(v).strip()]
             tags[key] |= set(vals)
     return tags
 
@@ -333,104 +299,76 @@ def _load_player_tags(prefer_env_defaults: bool, player_tags_url: t.Optional[str
 # --------------------------------------------------------------------------------------
 
 def _lb_family_sp_for(leader: "_Leader", player: str, account: str) -> int:
-    """SP of (player, account) from the leaderboard rows (max if dup)."""
-    p = _norm_key(player)
-    a = _norm_key(account)
+    p = _norm_key(player); a = _norm_key(account)
     return int(leader["sp_map"].get(p, {}).get(a, 0))
 
 def split_multi_subject_players(players_field: str) -> t.List[str]:
-    """Split 'A/B/C' or single name into a clean list of player names (original casing kept)."""
     parts = [p.strip() for p in str(players_field or "").split("/") if str(p).strip()]
     return parts if parts else []
 
-def _rank_and_buffer_full_leader(player: str, leader: "_Leader", family_eff: t.Dict[str, int]) -> t.Tuple[t.Optional[int], t.Optional[int], t.Optional[str], t.Optional[int]]:
-    """
-    Compute best family rank among ALL accounts on leaderboard + the buffer vs best non-family.
-    - rank: 1 = top; None if player absent.
-    - buffer: best_family_sp - best_nonfamily_sp (can be negative).
-    - best_family_account: which family account holds best_family_sp (by value, tie-broken by FAMILY_ACCOUNTS order).
-    - best_family_sp: returned as the 4th value for convenience.
-    """
+def _rank_and_buffer_full_leader(
+    player: str, leader: "_Leader", family_eff: t.Dict[str, int]
+) -> t.Tuple[t.Optional[int], t.Optional[int], t.Optional[str], t.Optional[int]]:
     p = _norm_key(player)
     rows = leader["by_player"].get(p, [])
     if not rows and all(v <= 0 for v in family_eff.values()):
         return None, None, None, None
 
-    # Build combined map of account->sp (family overlay on top of leaderboard rows)
     combined: t.Dict[str, int] = {}
     for r in rows:
         combined[r["account"]] = max(int(combined.get(r["account"], 0)), int(r["sp"] or 0))
     for a, sp in family_eff.items():
         combined[_norm_key(a)] = int(max(0, sp))
 
-    # Determine best family & best rival
     fam_best_acct = None
     fam_best_sp = -1
     for a in FAMILY_ACCOUNTS:
-        k = _norm_key(a)
-        v = int(combined.get(k, 0))
+        k = _norm_key(a); v = int(combined.get(k, 0))
         if v > fam_best_sp or (v == fam_best_sp and fam_best_acct is not None and FAMILY_ACCOUNTS.index(a) < FAMILY_ACCOUNTS.index(fam_best_acct)):
-            fam_best_sp = v
-            fam_best_acct = a
+            fam_best_sp, fam_best_acct = v, a
 
     best_nonfamily_sp = 0
-    fam_keys = { _norm_key(a) for a in FAMILY_ACCOUNTS }
     for acc, v in combined.items():
-        if acc in fam_keys:
+        if acc in _FAMILY_KEYS:  # skip family
             continue
         best_nonfamily_sp = max(best_nonfamily_sp, int(v))
 
-    # Rank = 1 + number of accounts strictly above best_family_sp
     higher = sum(1 for v in combined.values() if v > fam_best_sp)
     rank = 1 + higher
     buffer = fam_best_sp - best_nonfamily_sp
     return rank, buffer, fam_best_acct, fam_best_sp
 
 def _rank_context_smallset(player: str, leader: "_Leader", eff_map: t.Dict[str, t.Dict[str, int]]) -> t.Dict[str, t.Any]:
-    """
-    Minimal per-player context used by main.py:
-    - family_qp_player: 1 if family holds rank 1 after considering eff_map, else 0
-    """
     fam_eff = {a: int(eff_map.get(a, {}).get(player, 0)) for a in FAMILY_ACCOUNTS}
     r, _buf, _acct, _sp = _rank_and_buffer_full_leader(player, leader, fam_eff)
     qp = 1 if (r is not None and r == 1) else 0
-    return {
-        "family_qp_player": qp,
-        "rank": r,
-    }
+    return {"family_qp_player": qp, "rank": r}
 
 def compute_family_qp(leader: "_Leader", accounts: t.Dict[str, t.Dict[str, int]]) -> t.Tuple[int, t.Dict[str, int], t.Dict[str, t.Any]]:
     """
-    Very small, deterministic QP definition:
-      For each player, if family's best rank is 1 -> +1 QP; else 0.
-      Attribute the point to the best family account (tie-broken by FAMILY_ACCOUNTS order).
-    Returns: (family_qp_total, per_account_qp_map, details)
+    Leaderboard-QP semantics:
+      Sum the leaderboard 'qp' for all rows where the account belongs to the family.
+      (This is stable across short simulations; evaluate deltas remain 0 unless the
+      leaderboard changes.)
     """
     total_qp = 0
     per_acct_qp = {a: 0 for a in FAMILY_ACCOUNTS}
-    details: t.Dict[str, t.Any] = {}
 
-    # Build 'effective' family SP map for each player
-    # effective SP = max(leaderboard SP, holdings SP)
-    all_players: t.Set[str] = set(leader["by_player"].keys())
-    for a in FAMILY_ACCOUNTS:
-        all_players.update(_norm_key(p) for p in accounts.get(a, {}).keys())
+    for rows in leader["by_player"].values():
+        for r in rows:
+            acc = str(r.get("account") or "").lower()
+            qp = int(r.get("qp") or 0)
+            if acc in _FAMILY_KEYS:
+                total_qp += qp
+                # Map lowercase back to display name by membership
+                for display in FAMILY_ACCOUNTS:
+                    if display.lower() == acc:
+                        per_acct_qp[display] += qp
+                        break
 
-    for p in all_players:
-        fam_eff = {}
-        for a in FAMILY_ACCOUNTS:
-            lb = _lb_family_sp_for(leader, p, a)
-            hold = int(accounts.get(a, {}).get(p, 0))
-            fam_eff[a] = max(lb, hold)
-
-        r, _buf, best_a, _sp = _rank_and_buffer_full_leader(p, leader, fam_eff)
-        if r is not None and r == 1 and best_a:
-            total_qp += 1
-            per_acct_qp[best_a] += 1
-
-    details["per_account_qp"] = per_acct_qp
+    details: t.Dict[str, t.Any] = {"source": "leaderboard_qp_sum", "per_account_qp": per_acct_qp}
     return int(total_qp), per_acct_qp, details
 
 # --------------------------------------------------------------------------------------
-# (The rest of your endpoints stay in main.py; we only expose /defaults here)
+# (The rest of your endpoints live in main.py; we only expose /defaults + helpers here)
 # --------------------------------------------------------------------------------------
