@@ -1,34 +1,42 @@
-# main.py
-# Ultimate Quest Service — FastAPI app (v4.12.16)
-#
-# Full file — copy/paste to replace your current main.py.
-# - Registers ALL public routes (incl. Safe‑Sell + Delta Export).
-# - Thin controller: forwards to functions in app_core.
-# - Safe‑Sell now has a built‑in FALLBACK implementation if app_core lacks it.
-#
+# main.py (v5.0)
+"""
+Ultimate Quest Service - FastAPI Entry Point
+Standardized error responses, simplified middleware, improved health checks.
+"""
+
 from __future__ import annotations
 
 import io
 import os
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse, Response
+from fastapi.responses import JSONResponse, StreamingResponse, Response
+from pydantic import ValidationError
 
-# Import your core logic
-import app_core as _core  # type: ignore
+import config
+import logging_utils as log_util
+import cache_utils
+import app_core
 
-__VERSION__ = "4.12.16"
+# Initialize logging
+log_util.setup_logging()
+logger = log_util.get_logger("main")
+
+# ============================================================================
+# FastAPI App Setup
+# ============================================================================
 
 app = FastAPI(
-    title="Ultimate Quest Service (Small-Payload API)",
-    version=__VERSION__,
+    title=config.APP_TITLE,
+    version=config.APP_VERSION,
+    description=config.APP_DESCRIPTION,
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
-# --- CORS -------------------------------------------------------------------------------------
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,215 +44,303 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Helpers ----------------------------------------------------------------------------------
-def _first_callable(names: Sequence[str]) -> Callable[..., Any]:
-    """Return the first callable attribute from app_core whose name matches one of `names`.
-    Raise HTTP 501 if none is found."""
-    for name in names:
-        fn = getattr(_core, name, None)
-        if callable(fn):
-            return fn
-    raise HTTPException(
-        status_code=501,
-        detail=f"Server function not found. Tried: {', '.join(names)}"
+
+# ============================================================================
+# Exception Handlers (Standardized Error Responses)
+# ============================================================================
+
+@app.exception_handler(ValidationError)
+async def validation_exception_handler(request, exc):
+    """Handle Pydantic validation errors."""
+    errors = exc.errors()
+    error_details = "; ".join(
+        f"{'.'.join(str(e) for e in err.get('loc', []))}: {err.get('msg', 'unknown')}"
+        for err in errors
     )
+    response, status_code = log_util.create_error_response(
+        "validation_error",
+        f"Request validation failed: {error_details}",
+        status_code=422,
+        context={"errors": error_details}
+    )
+    return JSONResponse(content=response, status_code=status_code)
 
-def _defaults_from_env() -> Dict[str, Any]:
-    """Minimal defaults fallback if app_core doesn't provide a defaults function."""
-    def _get(key: str, default: Optional[str] = None) -> Optional[str]:
-        v = os.getenv(key, default)
-        return v.strip() if isinstance(v, str) else v
 
-    rivals = _get("DEFAULT_TARGET_RIVALS", "") or ""
-    rivals_list = [r.strip() for r in rivals.split(",") if r.strip()]
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    """Handle HTTPException with standardized format."""
+    response, _ = log_util.create_error_response(
+        "http_error",
+        detail=exc.detail,
+        status_code=exc.status_code,
+        context={"status_code": exc.status_code}
+    )
+    return JSONResponse(content=response, status_code=exc.status_code)
 
-    return {
-        "ok": True,
-        "links": {
-            "leaderboard": _get("DEFAULT_LEADERBOARD_URL"),
-            "leaderboard_yday": _get("DEFAULT_LEADERBOARD_YDAY_URL"),
-            "holdings_e31": _get("DEFAULT_HOLDINGS_E31_URL"),
-            "holdings_dc":  _get("DEFAULT_HOLDINGS_DC_URL"),
-            "holdings_fe":  _get("DEFAULT_HOLDINGS_FE_URL"),
-            "holdings_ud":  _get("DEFAULT_HOLDINGS_UD_URL"),
-            "collection_e31": _get("DEFAULT_COLLECTION_E31_URL"),
-            "collection_dc":  _get("DEFAULT_COLLECTION_DC_URL"),
-            "collection_fe":  _get("DEFAULT_COLLECTION_FE_URL"),
-            "collection_ud":  _get("DEFAULT_COLLECTION_UD_URL"),
-            "pool_collection": _get("DEFAULT_POOL_COLLECTION_URL"),
-            "player_tags": _get("PLAYER_TAGS_URL"),
-        },
-        "rivals": rivals_list,
-        "defend_buffer_default": int((_get("DEFAULT_DEFEND_BUFFER_ALL") or "15")),
-        "force_family_urls": str(_get("FORCE_FAMILY_URLS", "true")).lower() == "true",
-    }
 
-def _safe_call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    """Wrap core calls to surface readable HTTP errors."""
-    try:
-        return fn(*args, **kwargs)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={"type": type(e).__name__, "message": str(e)})
+@app.exception_handler(Exception)
+async def generic_exception_handler(request, exc):
+    """Handle unexpected errors."""
+    logger.error(
+        "Unhandled exception",
+        exc_info=True,
+        extra={"path": request.url.path, "error": str(exc)}
+    )
+    response, status_code = log_util.create_error_response(
+        "internal_error",
+        "An unexpected error occurred. Check server logs for details.",
+        status_code=500,
+        context={"error_type": type(exc).__name__}
+    )
+    return JSONResponse(content=response, status_code=status_code)
 
-# --- Health/Info ------------------------------------------------------------------------------
+
+# ============================================================================
+# Health & Info Endpoints
+# ============================================================================
+
 @app.get("/healthz")
 def healthz() -> Dict[str, Any]:
-    return {"ok": True, "status": "healthy", "version": __VERSION__}
+    """Quick liveness check."""
+    return {"ok": True, "status": "healthy", "version": config.APP_VERSION}
+
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    """Deep health check (validates external dependencies)."""
+    logger.info("Running deep health check")
+    
+    checks = {
+        "api": True,
+        "cache": True,
+        "config": True,
+    }
+    
+    # Basic checks
+    try:
+        # Verify config loads
+        _ = config.get_env_url("leaderboard")
+        checks["config"] = True
+    except Exception as e:
+        logger.error("Health check failed: config", exc_info=True)
+        checks["config"] = False
+    
+    all_healthy = all(checks.values())
+    status_code = 200 if all_healthy else 503
+    
+    return {
+        "ok": all_healthy,
+        "status": "healthy" if all_healthy else "degraded",
+        "version": config.APP_VERSION,
+        "checks": checks
+    }
+
 
 @app.get("/info")
 def info() -> Dict[str, Any]:
+    """API metadata."""
     return {
         "ok": True,
-        "title": "Ultimate Quest Service (Small-Payload API)",
-        "version": __VERSION__,
-        "default_response_class": "SafeJSONResponse",
+        "title": config.APP_TITLE,
+        "version": config.APP_VERSION,
+        "description": config.APP_DESCRIPTION,
     }
 
-# --- Defaults ---------------------------------------------------------------------------------
+
+@app.get("/")
+def root() -> Dict[str, Any]:
+    """Root endpoint."""
+    return {
+        "ok": True,
+        "message": "Ultimate Quest Service API. See /docs for OpenAPI.",
+        "version": config.APP_VERSION,
+        "endpoints": {
+            "health": "GET /health (deep checks)",
+            "healthz": "GET /healthz (quick check)",
+            "info": "GET /info (metadata)",
+            "defaults": "GET /defaults (config defaults)",
+            "cache_stats": "GET /cache/stats (cache info)",
+            "evaluate_trade": "POST /family_evaluate_trade_by_urls",
+            "leaderboard_delta": "POST /leaderboard_delta_by_urls",
+            "leaderboard_delta_export": "GET /leaderboard_delta_export",
+        }
+    }
+
+
+# ============================================================================
+# Configuration & Cache Endpoints
+# ============================================================================
+
 @app.get("/defaults")
 def get_defaults() -> Dict[str, Any]:
-    try:
-        fn = _first_callable(["get_defaults", "defaults", "load_defaults"])
-        return _safe_call(fn)
-    except HTTPException as e:
-        if e.status_code == 501:
-            return _defaults_from_env()
-        raise
+    """Return configured defaults."""
+    logger.info("Returning configuration defaults")
+    return {
+        "ok": True,
+        "defaults": {
+            "leaderboard": os.getenv("DEFAULT_LEADERBOARD_URL"),
+            "leaderboard_yday": os.getenv("DEFAULT_LEADERBOARD_YDAY_URL"),
+            "holdings_e31": os.getenv("DEFAULT_HOLDINGS_E31_URL"),
+            "holdings_dc": os.getenv("DEFAULT_HOLDINGS_DC_URL"),
+            "holdings_fe": os.getenv("DEFAULT_HOLDINGS_FE_URL"),
+            "holdings_ud": os.getenv("DEFAULT_HOLDINGS_UD_URL"),
+            "collection_e31": os.getenv("DEFAULT_COLLECTION_E31_URL"),
+            "collection_dc": os.getenv("DEFAULT_COLLECTION_DC_URL"),
+            "collection_fe": os.getenv("DEFAULT_COLLECTION_FE_URL"),
+            "collection_ud": os.getenv("DEFAULT_COLLECTION_UD_URL"),
+            "pool_collection": os.getenv("DEFAULT_POOL_COLLECTION_URL"),
+            "player_tags": os.getenv("PLAYER_TAGS_URL"),
+        },
+        "constants": {
+            "rivals": list(config.SYNDICATE),
+            "family_accounts": config.FAMILY_ACCOUNTS,
+            "primary_defense_buffer": config.PRIMARY_DEFENSE_BUFFER,
+            "secondary_defense_buffer": config.SECONDARY_DEFENSE_BUFFER,
+            "qp_scoring": config.QP_MAP,
+            "cache_ttl_seconds": config.CACHE_TTL_SECONDS,
+        }
+    }
 
-# --- Probe (diagnostic) -----------------------------------------------------------------------
-@app.post("/__probe_evaluate")
-def __probe_evaluate(payload: Dict[str, Any] = Body(default_factory=dict)) -> Dict[str, Any]:
-    fn = _first_callable(["__probe_evaluate", "probe_evaluate", "probe_evaluate_by_urls"])
-    return _safe_call(fn, payload)
 
-# --- Evaluate trade ---------------------------------------------------------------------------
+@app.get("/cache/stats")
+def cache_stats() -> Dict[str, Any]:
+    """Get cache statistics."""
+    logger.info("Returning cache statistics")
+    return {
+        "ok": True,
+        "cache": cache_utils.cache_stats()
+    }
+
+
+@app.post("/cache/clear")
+def cache_clear() -> Dict[str, Any]:
+    """Clear cache (admin endpoint)."""
+    logger.warning("Cache cleared via admin endpoint")
+    cache_utils.cache_clear()
+    return {
+        "ok": True,
+        "message": "Cache cleared"
+    }
+
+
+# ============================================================================
+# Trade Evaluation
+# ============================================================================
+
 @app.post("/family_evaluate_trade_by_urls")
-def family_evaluate_trade_by_urls(payload: Dict[str, Any]) -> Dict[str, Any]:
-    fn = _first_callable(["family_evaluate_trade_by_urls", "evaluate_trade_by_urls", "family_evaluate_trade"])
-    return _safe_call(fn, payload)
-
-# --- Trade + Counter --------------------------------------------------------------------------
-@app.post("/family_trade_plus_counter_by_urls")
-def family_trade_plus_counter_by_urls(payload: Dict[str, Any]) -> Dict[str, Any]:
-    fn = _first_callable(["family_trade_plus_counter_by_urls", "trade_plus_counter_by_urls", "family_trade_plus_counter"])
-    return _safe_call(fn, payload)
-
-# --- Collection Review (qty-aware) ------------------------------------------------------------
-@app.post("/family_collection_review_by_urls")
-def family_collection_review_by_urls(payload: Dict[str, Any]) -> Dict[str, Any]:
-    fn = _first_callable(["family_collection_review_by_urls", "collection_review_by_urls", "family_collection_review"])
-    return _safe_call(fn, payload)
-
-# --- All-in (“own the whole sheet”) -----------------------------------------------------------
-@app.post("/family_collection_all_in_by_urls")
-def family_collection_all_in_by_urls(payload: Dict[str, Any]) -> Dict[str, Any]:
-    fn = _first_callable(["family_collection_all_in_by_urls", "collection_all_in_by_urls", "family_collection_all_in"])
-    return _safe_call(fn, payload)
-
-# --- Safe‑Sell Report (with fallback) ---------------------------------------------------------
-@app.post("/family_safe_sell_report_by_urls")
-def family_safe_sell_report_by_urls(payload: Dict[str, Any]) -> Dict[str, Any]:
+def family_evaluate_trade_by_urls(req: app_core.FamilyEvaluateTradeReq = Body(...)) -> Dict[str, Any]:
     """
-    Expects at minimum:
-      {
-        "prefer_env_defaults": true,
-        "include_top3": false,
-        "min_distance_to_rank3": 8,
-        "exclude_accounts": []
-      }
-    Optional: players_whitelist, players_blacklist, player_tags_url, leaderboard_url,
-              holdings_*_url (when not using defaults).
+    Evaluate a family trade.
+    
+    Returns verdict (APPROVE/CAUTION/DECLINE) with QP impact and rank/buffer deltas.
     """
-    # Try app_core first
     try:
-        fn = _first_callable([
-            "family_safe_sell_report_by_urls",
-            "family_safe_sell_by_urls",
-            "safe_sell_report_by_urls",
-            "family_safe_sell_report",
-        ])
-        return _safe_call(fn, payload)
-    except HTTPException as e:
-        if e.status_code != 501:
-            raise  # real error from core; bubble up
+        logger.info(
+            "Evaluating trade",
+            extra={
+                "account": req.trade_account,
+                "num_lines": len(req.trade),
+                "get_count": sum(1 for t in req.trade if t.side == "GET"),
+                "give_count": sum(1 for t in req.trade if t.side == "GIVE"),
+            }
+        )
+        
+        # Load data
+        lb_url = app_core._pick_url(req.leaderboard_url, "leaderboard", req.prefer_env_defaults)
+        tags_url = app_core._pick_url(req.player_tags_url, "player_tags", req.prefer_env_defaults)
+        
+        leader = app_core.normalize_leaderboard(app_core.fetch_xlsx(lb_url))
+        tags = app_core._load_player_tags(req.prefer_env_defaults, tags_url)
+        holds = app_core.holdings_from_urls(
+            req.holdings_e31_url, req.holdings_dc_url, req.holdings_fe_url,
+            req.prefer_env_defaults, req.holdings_ud_url
+        )
+        
+        # Evaluate
+        result = app_core.evaluate_trade_internal(req, leader, tags, holds)
+        
+        logger.info(
+            "Trade evaluation complete",
+            extra={
+                "verdict": result["verdict"],
+                "delta_qp": result["total_changes"]["delta_qp"],
+                "delta_buffer": result["total_changes"]["delta_buffer"],
+            }
+        )
+        
+        return result
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Trade evaluation failed", exc_info=True, extra={"error": str(e)})
+        response, status = log_util.create_error_response(
+            "trade_evaluation_failed",
+            f"Failed to evaluate trade: {str(e)}",
+            status_code=500
+        )
+        raise HTTPException(status_code=status, detail=response)
 
-    # ---------- Fallback implementation (uses app_core helpers) ----------
-    prefer_env_defaults = bool(payload.get("prefer_env_defaults", True))
-    include_top3 = bool(payload.get("include_top3", False))
-    min_dist = int(payload.get("min_distance_to_rank3", 6))
-    exclude_accounts: List[str] = payload.get("exclude_accounts") or []
-    wl = {str(p).lower() for p in (payload.get("players_whitelist") or [])}
-    bl = {str(p).lower() for p in (payload.get("players_blacklist") or [])}
 
-    # Load leaderboard (today) and holdings via core utilities
-    lb_url = _core._pick_url(payload.get("leaderboard_url"), "leaderboard", prefer_env_defaults)
-    leader = _core.normalize_leaderboard(_core.fetch_xlsx(lb_url))
+# ============================================================================
+# Leaderboard Delta
+# ============================================================================
 
-    accounts = _core.holdings_from_urls(
-        payload.get("holdings_e31_url"),
-        payload.get("holdings_dc_url"),
-        payload.get("holdings_fe_url"),
-        prefer_env_defaults,
-        payload.get("holdings_ud_url"),
-    )
-
-    items: List[Dict[str, Any]] = []
-    FAMILY_ACCOUNTS = getattr(_core, "FAMILY_ACCOUNTS", ["Easystreet31", "DusterCrusher", "FinkleIsEinhorn", "UpperDuck"])
-
-    for acct in FAMILY_ACCOUNTS:
-        if acct in exclude_accounts:
-            continue
-        for player, sp_owned in sorted(accounts.get(acct, {}).items()):
-            if sp_owned <= 0:
-                continue
-            p_lower = (player or "").lower()
-            if wl and p_lower not in wl:
-                continue
-            if bl and p_lower in bl:
-                continue
-
-            rows = _core._smallset_entries_for_player(player, leader, accounts)
-            if not rows:
-                continue
-            ordered, rank_by_key = _core._dedup_and_rank(rows)
-            r, s = rank_by_key.get(_core._canon_user_strong(acct), (9999, 0))
-            if (not include_top3) and r <= 3:
-                continue
-
-            # Determine the SP threshold for Rank‑3
-            if len(ordered) > 2:
-                third_sp = ordered[2][2]
-            elif len(ordered) > 1:
-                third_sp = ordered[1][2]
-            else:
-                third_sp = 0
-            distance_to_rank3 = max((third_sp + 1) - s, 0)
-
-            if distance_to_rank3 < min_dist:
-                continue
-
-            items.append({
-                "account": acct,
-                "player": player,
-                "sp_owned": int(sp_owned),
-                "best_rank": int(r),
-                "distance_to_rank3": int(distance_to_rank3),
-            })
-
-    # Sort: farthest from Rank‑3 first (safest to sell), then alpha
-    items.sort(key=lambda x: (-x["distance_to_rank3"], x["account"], x["player"].lower()))
-
-    return {"ok": True, "count": len(items), "items": items, "method": "fallback_main.py"}
-
-# --- Leaderboard Delta (JSON) -----------------------------------------------------------------
 @app.post("/leaderboard_delta_by_urls")
-def leaderboard_delta_by_urls(payload: Dict[str, Any]) -> Dict[str, Any]:
-    fn = _first_callable(["leaderboard_delta_by_urls", "leaderboard_delta", "delta_by_urls"])
-    return _safe_call(fn, payload)
+def leaderboard_delta_by_urls(req: app_core.LeaderboardDeltaReq = Body(...)) -> Dict[str, Any]:
+    """
+    Report daily leaderboard movements for the family and rivals.
+    """
+    try:
+        logger.info("Computing leaderboard delta")
+        
+        today_url = app_core._pick_url(req.leaderboard_today_url, "leaderboard", req.prefer_env_defaults)
+        yday_url = app_core._pick_url(req.leaderboard_yesterday_url, "leaderboard_yday", req.prefer_env_defaults)
+        
+        today = app_core.normalize_leaderboard(app_core.fetch_xlsx(today_url))
+        yday = app_core.normalize_leaderboard(app_core.fetch_xlsx(yday_url))
+        
+        rivals_canon = set(
+            app_core._canon_key(app_core._strip_user_suffix(r))
+            for r in (req.rivals or list(config.SYNDICATE))
+        )
+        
+        rows = app_core._delta_rows(today, yday, rivals_canon, req.min_sp_delta)
+        
+        logger.info(
+            "Leaderboard delta computed",
+            extra={"total_players": len(rows), "rivals_count": len(rivals_canon)}
+        )
+        
+        return {
+            "ok": True,
+            "data": {
+                "leaderboard_today_url": today_url,
+                "leaderboard_yesterday_url": yday_url,
+                "params": {
+                    "rivals": sorted(list(rivals_canon)),
+                    "min_sp_delta": int(req.min_sp_delta)
+                },
+                "summary": {
+                    "players_scanned": len(set(today["sp_map"].keys()) | set(yday["sp_map"].keys())),
+                    "players_moved": min(len(rows), config.MAX_DELTA_JSON_ROWS)
+                },
+                "players": rows[:config.MAX_DELTA_JSON_ROWS]
+            }
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Delta computation failed", exc_info=True, extra={"error": str(e)})
+        response, status = log_util.create_error_response(
+            "delta_computation_failed",
+            f"Failed to compute delta: {str(e)}",
+            status_code=500
+        )
+        raise HTTPException(status_code=status, detail=response)
 
-# --- Leaderboard Delta Export (CSV/XLSX) ------------------------------------------------------
+
 @app.get("/leaderboard_delta_export")
 def leaderboard_delta_export(
     prefer_env_defaults: bool = Query(True),
@@ -255,64 +351,120 @@ def leaderboard_delta_export(
     file_format: str = Query("csv", alias="format", pattern="^(csv|xlsx)$"),
 ) -> Response:
     """
-    Export the leaderboard delta as CSV/XLSX. The core may return:
-      • a Starlette Response/StreamingResponse,
-      • a dict with {'content': bytes|str, 'mime': str, 'filename': str}, or
-      • raw bytes/str (we'll wrap it).
+    Export leaderboard delta as CSV or XLSX.
     """
-    params = {
-        "prefer_env_defaults": prefer_env_defaults,
-        "leaderboard_today_url": leaderboard_today_url,
-        "leaderboard_yesterday_url": leaderboard_yesterday_url,
-        "rivals": rivals,
-        "min_sp_delta": min_sp_delta,
-        "format": file_format,
-    }
-    fn = _first_callable([
-        "leaderboard_delta_export",
-        "export_leaderboard_delta",
-        "leaderboard_delta_export_by_urls",
-    ])
-    res = _safe_call(fn, params)
+    try:
+        logger.info(
+            "Exporting leaderboard delta",
+            extra={"format": file_format, "min_sp_delta": min_sp_delta}
+        )
+        
+        today_url = app_core._pick_url(leaderboard_today_url, "leaderboard", prefer_env_defaults)
+        yday_url = app_core._pick_url(leaderboard_yesterday_url, "leaderboard_yday", prefer_env_defaults)
+        
+        today = app_core.normalize_leaderboard(app_core.fetch_xlsx(today_url))
+        yday = app_core.normalize_leaderboard(app_core.fetch_xlsx(yday_url))
+        
+        rival_list = [r.strip() for r in (rivals.split(",") if rivals else list(config.SYNDICATE)) if r.strip()]
+        rivals_canon = set(
+            app_core._canon_key(app_core._strip_user_suffix(r)) for r in rival_list
+        )
+        
+        rows = app_core._delta_rows(today, yday, rivals_canon, min_sp_delta)
+        
+        # Build flat rows for export
+        flat = []
+        for r in rows:
+            fb = r["family_before"]
+            fa = r["family_after"]
+            flat.append({
+                "player": r["player"],
+                "family_before_account": fb["account"],
+                "family_before_sp": fb["sp"],
+                "family_before_rank": fb["rank"],
+                "family_before_buffer": fb["buffer"],
+                "family_after_account": fa["account"],
+                "family_after_sp": fa["sp"],
+                "family_after_rank": fa["rank"],
+                "family_after_buffer": fa["buffer"],
+                "delta_sp": r["delta_sp"],
+                "delta_rank": r["delta_rank"],
+                "delta_buffer": r["delta_buffer"],
+                "rivals_sp_before": r["rivals_sp_before"],
+                "rivals_sp_after": r["rivals_sp_after"],
+                "delta_rivals_sp": r["delta_rivals_sp"],
+            })
+        
+        import pandas as pd
+        df = pd.DataFrame(flat)
+        fname = f"leaderboard_delta_{app_core.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.{file_format}"
+        
+        if file_format == "csv":
+            csv_bytes = df.to_csv(index=False).encode("utf-8")
+            logger.info(
+                "Delta exported as CSV",
+                extra={"filename": fname, "rows": len(flat)}
+            )
+            return Response(
+                content=csv_bytes,
+                media_type="text/csv; charset=utf-8",
+                headers={"Content-Disposition": f'attachment; filename="{fname}"'}
+            )
+        
+        else:  # xlsx
+            bio = io.BytesIO()
+            with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="delta")
+            bio.seek(0)
+            logger.info(
+                "Delta exported as XLSX",
+                extra={"filename": fname, "rows": len(flat)}
+            )
+            return StreamingResponse(
+                bio,
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Content-Disposition": f'attachment; filename="{fname}"'}
+            )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Delta export failed", exc_info=True, extra={"error": str(e)})
+        response, status = log_util.create_error_response(
+            "export_failed",
+            f"Failed to export delta: {str(e)}",
+            status_code=500
+        )
+        raise HTTPException(status_code=status, detail=response)
 
-    # If core already returns a Response (CSV/XLSX), pass it through.
-    if isinstance(res, Response):
-        return res
 
-    # Dict contract: {'content': bytes|str, 'mime': str, 'filename': str}
-    if isinstance(res, dict):
-        content = res.get("content", b"")
-        mime = res.get("mime") or ("text/csv" if file_format == "csv" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        filename = res.get("filename") or f"leaderboard_delta.{file_format}"
-        if isinstance(content, str):
-            content = content.encode("utf-8")
-        return StreamingResponse(io.BytesIO(content), media_type=mime, headers={
-            "Content-Disposition": f'attachment; filename="{filename}"'
-        })
+# ============================================================================
+# Startup & Shutdown
+# ============================================================================
 
-    # Raw bytes/str fallback
-    if isinstance(res, (bytes, bytearray, str)):
-        content_bytes = res if isinstance(res, (bytes, bytearray)) else str(res).encode("utf-8")
-        mime = "text/csv" if file_format == "csv" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        filename = f"leaderboard_delta.{file_format}"
-        return StreamingResponse(io.BytesIO(content_bytes), media_type=mime, headers={
-            "Content-Disposition": f'attachment; filename="{filename}"'
-        })
+@app.on_event("startup")
+async def startup_event():
+    """Initialize on startup."""
+    logger.info(
+        "Application starting",
+        extra={
+            "version": config.APP_VERSION,
+            "log_level": config.LOG_LEVEL,
+            "cache_ttl": config.CACHE_TTL_SECONDS,
+        }
+    )
 
-    # Anything else: return JSON so the client can see what happened
-    return JSONResponse(content={"ok": False, "detail": "Unexpected export return type", "preview": str(type(res))}, status_code=500)
 
-# --- Root -------------------------------------------------------------------------------------
-@app.get("/")
-def root() -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "title": "Ultimate Quest Service (Small-Payload API)",
-        "version": __VERSION__,
-        "message": "See /docs for OpenAPI; use POST routes for evaluate/trade/counter/review/all-in/safe-sell; GET /leaderboard_delta_export for CSV/XLSX.",
-    }
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown."""
+    logger.info("Application shutting down")
 
-# --- Local dev entrypoint ---------------------------------------------------------------------
+
+# ============================================================================
+# Local Dev
+# ============================================================================
+
 if __name__ == "__main__":
-    import uvicorn  # type: ignore
+    import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
